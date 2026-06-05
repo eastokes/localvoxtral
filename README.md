@@ -18,6 +18,15 @@ LLM Polishing connect to any OpenAI /chat/completions endpoint. The recommended 
 
 Built for Mistral AI's [Voxtral Mini 4B Realtime](https://huggingface.co/mistralai/Voxtral-Mini-4B-Realtime-2602) model, but it works with any OpenAI-compatible Realtime API backend and model.
 
+## This Fork
+
+This repo is a fork of [T0mSIlver/localvoxtral](https://github.com/T0mSIlver/localvoxtral) with a few local workflow and UX upgrades on top of upstream.
+
+- Multiple shortcut improvements, including mode-specific hotkeys and better modifier-only / `Fn` handling
+- More resilient overlay behavior, including clipping fixes, safer click handling, and `Escape` to cancel dictation cleanly
+- Accessibility permission recovery via a `PermissionResetter` flow for MacOS issues.
+- Better terminal and coding dictation defaults, including Ghostty "send now" -> <return/enter> support. This allows coding agent conversations without needing keyboard input.
+
 ## Features
 
 - Global shortcut with selectable behavior: `Toggle` (press-to-start/stop) or `Push to Talk` (hold-to-dictate)
