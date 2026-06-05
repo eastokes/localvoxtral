@@ -48,7 +48,8 @@ open ./dist/localvoxtral.app
 ## Settings
 
 - Open **Settings** from the menu bar popover to set:
-  - Dictation keyboard shortcut  
+  - Dictation keyboard shortcut
+  - Optional mode-specific shortcuts for Overlay Buffer push-to-talk and Live Auto-Paste toggle
   - Shortcut behavior (`Toggle` / `Push to Talk`)
   - Realtime endpoint (URL, model name, API key)
   - Commit interval (`vLLM`/`voxmlx`)
@@ -112,6 +113,87 @@ uvx --from "git+https://github.com/T0mSIlver/mlx-lm.git" mlx_lm.server \
 ```
 
 With the default polishing prompts, prompt processing is roughly 286 ms (~50%) faster on average on M1 Pro with my fork's enhanced prompt caching. On more powerful Apple Silicon, the absolute ms savings will likely be lower because prompt processing is faster.
+
+## Finding newer lightweight local models
+
+The recommended local defaults are deliberately small:
+
+- Realtime dictation: `T0mSIlver/Voxtral-Mini-4B-Realtime-2602-MLX-4bit`
+- LLM polishing: `mlx-community/Qwen3.5-0.8B-8bit`
+
+As newer models are released, look for replacements separately for dictation and polishing. They have different compatibility requirements.
+
+### Realtime dictation models
+
+For `voxmlx`, start with Voxtral Realtime-compatible MLX models. A newer general ASR model is not enough; it must work with the realtime backend and produce incremental text quickly enough to feel live.
+
+Good candidates usually have:
+
+- Voxtral Realtime architecture or explicit `voxmlx` compatibility
+- MLX weights or an MLX quantization
+- 4-bit or similarly compact quantization for Apple Silicon laptops
+- memory use low enough to leave room for the app and optional polishing model
+- partial transcript latency that stays comfortable during continuous speech
+
+Search places to check:
+
+- Mistral model releases for newer Voxtral Realtime models
+- Hugging Face searches for `Voxtral Realtime MLX 4bit`
+- `mlx-community` and trusted fork authors for fresh MLX quantizations
+- `voxmlx` issues, releases, and README updates for newly supported model IDs
+
+Try a candidate by swapping only the model ID first:
+
+```bash
+uvx --from "git+https://github.com/T0mSIlver/voxmlx.git[server]" \
+  voxmlx-serve --model OWNER/MODEL-NAME
+```
+
+Then test a few real dictation sessions before keeping it. Prefer the model that has the best latency/accuracy tradeoff on your machine, not the largest model that barely fits.
+
+### LLM polishing models
+
+For `mlx-lm`, use small MLX chat/instruct models that support the OpenAI `/chat/completions` flow. Polishing does not need a large model; it needs low latency, instruction following, and good punctuation/grammar judgment.
+
+Good candidates usually have:
+
+- MLX format or a well-used MLX quantization
+- chat or instruct tuning
+- roughly 0.5B to 3B parameters for lightweight local use
+- 4-bit or 8-bit quantization
+- enough context length for your default prompts plus a dictated paragraph
+- stable behavior: conservative cleanup, not broad rewriting
+
+Search places to check:
+
+- Hugging Face searches for `mlx instruct 0.5B`, `mlx instruct 1B`, `mlx chat 1.5B`, or `mlx-community 4bit instruct`
+- `mlx-community` model uploads sorted by recent activity
+- `mlx-lm` issues and examples for newly working model families
+- small-model release notes from Qwen, Gemma, Llama, SmolLM, and Phi families
+
+Try a candidate by swapping only the model ID first:
+
+```bash
+uvx --from "git+https://github.com/T0mSIlver/mlx-lm.git" mlx_lm.server \
+  --model OWNER/MODEL-NAME \
+  --prompt-cache-size 1 \
+  --prompt-cache-bytes 1GB
+```
+
+Use the same short transcript for each candidate and compare output. Reject models that add facts, paraphrase heavily, expand acronyms unnecessarily, or rewrite code-like text.
+
+### Quick benchmark checklist
+
+When comparing candidates, keep the rest of the setup unchanged and record:
+
+- cold start time
+- memory pressure in Activity Monitor
+- first-token or first-partial latency
+- sustained responsiveness during a 30-60 second dictation
+- final transcript accuracy on names, commands, acronyms, and punctuation
+- polishing latency for a typical paragraph
+
+If a newer model is only slightly better but noticeably slower, the smaller default is usually the better daily-driver choice.
 
 ## Roadmap
 

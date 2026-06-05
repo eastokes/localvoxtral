@@ -77,11 +77,26 @@ enum DictationShortcutValidation {
             return "Shortcut key is not supported."
         }
 
-        if normalizedModifierFlags(shortcut.carbonModifierFlags) == 0 {
-            return "Shortcut must include at least one modifier key."
+        if normalizedModifierFlags(shortcut.carbonModifierFlags) == 0,
+           !isFunctionKey(shortcut.keyCode)
+        {
+            return "Shortcut must include at least one modifier key unless it is a function key."
         }
 
         return nil
+    }
+
+    static func isFunctionKey(_ keyCode: UInt32) -> Bool {
+        switch keyCode {
+        case UInt32(kVK_F1), UInt32(kVK_F2), UInt32(kVK_F3), UInt32(kVK_F4),
+             UInt32(kVK_F5), UInt32(kVK_F6), UInt32(kVK_F7), UInt32(kVK_F8),
+             UInt32(kVK_F9), UInt32(kVK_F10), UInt32(kVK_F11), UInt32(kVK_F12),
+             UInt32(kVK_F13), UInt32(kVK_F14), UInt32(kVK_F15), UInt32(kVK_F16),
+             UInt32(kVK_F17), UInt32(kVK_F18), UInt32(kVK_F19), UInt32(kVK_F20):
+            return true
+        default:
+            return false
+        }
     }
 
     static func validationErrorMessage(for shortcut: DictationShortcut) -> String? {
@@ -160,6 +175,15 @@ final class SettingsStore {
         static let dictationShortcutKeyCode = "settings.dictation_shortcut_key_code"
         static let dictationShortcutCarbonModifierFlags =
             "settings.dictation_shortcut_carbon_modifiers"
+        static let overlayBufferShortcutEnabled = "settings.overlay_buffer_shortcut_enabled"
+        static let overlayBufferShortcutKeyCode = "settings.overlay_buffer_shortcut_key_code"
+        static let overlayBufferShortcutCarbonModifierFlags =
+            "settings.overlay_buffer_shortcut_carbon_modifiers"
+        static let liveAutoPasteShortcutEnabled = "settings.live_auto_paste_shortcut_enabled"
+        static let liveAutoPasteShortcutKeyCode = "settings.live_auto_paste_shortcut_key_code"
+        static let liveAutoPasteShortcutCarbonModifierFlags =
+            "settings.live_auto_paste_shortcut_carbon_modifiers"
+        static let ghosttyAgentModeEnabled = "settings.ghostty_agent_mode_enabled"
         static let llmPolishingEnabled = "settings.llm_polishing_enabled"
         static let llmPolishingEndpointURL = "settings.llm_polishing_endpoint_url"
         static let llmPolishingAPIKey = "settings.llm_polishing_api_key"
@@ -240,6 +264,42 @@ final class SettingsStore {
                 dictationShortcutCarbonModifierFlags,
                 forKey: Keys.dictationShortcutCarbonModifierFlags)
         }
+    }
+
+    var overlayBufferShortcutEnabled: Bool {
+        didSet { defaults.set(overlayBufferShortcutEnabled, forKey: Keys.overlayBufferShortcutEnabled) }
+    }
+
+    private var overlayBufferShortcutKeyCode: UInt32 {
+        didSet { defaults.set(overlayBufferShortcutKeyCode, forKey: Keys.overlayBufferShortcutKeyCode) }
+    }
+
+    private var overlayBufferShortcutCarbonModifierFlags: UInt32 {
+        didSet {
+            defaults.set(
+                overlayBufferShortcutCarbonModifierFlags,
+                forKey: Keys.overlayBufferShortcutCarbonModifierFlags)
+        }
+    }
+
+    var liveAutoPasteShortcutEnabled: Bool {
+        didSet { defaults.set(liveAutoPasteShortcutEnabled, forKey: Keys.liveAutoPasteShortcutEnabled) }
+    }
+
+    private var liveAutoPasteShortcutKeyCode: UInt32 {
+        didSet { defaults.set(liveAutoPasteShortcutKeyCode, forKey: Keys.liveAutoPasteShortcutKeyCode) }
+    }
+
+    private var liveAutoPasteShortcutCarbonModifierFlags: UInt32 {
+        didSet {
+            defaults.set(
+                liveAutoPasteShortcutCarbonModifierFlags,
+                forKey: Keys.liveAutoPasteShortcutCarbonModifierFlags)
+        }
+    }
+
+    var ghosttyAgentModeEnabled: Bool {
+        didSet { defaults.set(ghosttyAgentModeEnabled, forKey: Keys.ghosttyAgentModeEnabled) }
     }
 
     var llmPolishingEnabled: Bool {
@@ -368,6 +428,31 @@ final class SettingsStore {
         dictationShortcutKeyCode = resolvedShortcut.keyCode
         dictationShortcutCarbonModifierFlags = resolvedShortcut.carbonModifierFlags
 
+        let overlayShortcut = Self.loadOptionalShortcut(
+            defaults: defaults,
+            enabledKey: Keys.overlayBufferShortcutEnabled,
+            keyCodeKey: Keys.overlayBufferShortcutKeyCode,
+            modifierFlagsKey: Keys.overlayBufferShortcutCarbonModifierFlags,
+            fallback: Self.defaultDictationShortcut
+        )
+        overlayBufferShortcutEnabled = overlayShortcut.isEnabled
+        overlayBufferShortcutKeyCode = overlayShortcut.shortcut.keyCode
+        overlayBufferShortcutCarbonModifierFlags = overlayShortcut.shortcut.carbonModifierFlags
+
+        let liveShortcut = Self.loadOptionalShortcut(
+            defaults: defaults,
+            enabledKey: Keys.liveAutoPasteShortcutEnabled,
+            keyCodeKey: Keys.liveAutoPasteShortcutKeyCode,
+            modifierFlagsKey: Keys.liveAutoPasteShortcutCarbonModifierFlags,
+            fallback: Self.defaultDictationShortcut
+        )
+        liveAutoPasteShortcutEnabled = liveShortcut.isEnabled
+        liveAutoPasteShortcutKeyCode = liveShortcut.shortcut.keyCode
+        liveAutoPasteShortcutCarbonModifierFlags = liveShortcut.shortcut.carbonModifierFlags
+
+        ghosttyAgentModeEnabled = Self.loadBool(
+            defaults: defaults, key: Keys.ghosttyAgentModeEnabled, fallback: false)
+
         llmPolishingEnabled = Self.loadBool(
             defaults: defaults, key: Keys.llmPolishingEnabled, fallback: false)
         llmPolishingEndpointURL = Self.loadString(
@@ -407,6 +492,33 @@ final class SettingsStore {
         defaults.object(forKey: key) != nil
             ? defaults.bool(forKey: key)
             : fallback
+    }
+
+    private static func loadOptionalShortcut(
+        defaults: UserDefaults,
+        enabledKey: String,
+        keyCodeKey: String,
+        modifierFlagsKey: String,
+        fallback: DictationShortcut
+    ) -> (isEnabled: Bool, shortcut: DictationShortcut) {
+        let isEnabled = loadBool(defaults: defaults, key: enabledKey, fallback: false)
+        let storedKeyCode = (defaults.object(forKey: keyCodeKey) as? NSNumber)?.uint32Value
+        let storedModifierFlags = (defaults.object(forKey: modifierFlagsKey) as? NSNumber)?.uint32Value
+
+        guard let storedKeyCode, let storedModifierFlags else {
+            return (isEnabled, fallback)
+        }
+
+        let candidate = DictationShortcut(
+            keyCode: storedKeyCode,
+            carbonModifierFlags: storedModifierFlags
+        ).normalized
+
+        guard DictationShortcutValidation.persistenceErrorMessage(for: candidate) == nil else {
+            return (isEnabled, fallback)
+        }
+
+        return (isEnabled, candidate)
     }
 
     private static func loadModelName(
@@ -462,6 +574,37 @@ final class SettingsStore {
         return candidate
     }
 
+    var overlayBufferPushToTalkShortcut: DictationShortcut? {
+        guard overlayBufferShortcutEnabled else { return nil }
+
+        return resolvedShortcut(
+            keyCode: overlayBufferShortcutKeyCode,
+            modifierFlags: overlayBufferShortcutCarbonModifierFlags
+        )
+    }
+
+    var liveAutoPasteToggleShortcut: DictationShortcut? {
+        guard liveAutoPasteShortcutEnabled else { return nil }
+
+        return resolvedShortcut(
+            keyCode: liveAutoPasteShortcutKeyCode,
+            modifierFlags: liveAutoPasteShortcutCarbonModifierFlags
+        )
+    }
+
+    private func resolvedShortcut(keyCode: UInt32, modifierFlags: UInt32) -> DictationShortcut {
+        let candidate = DictationShortcut(
+            keyCode: keyCode,
+            carbonModifierFlags: modifierFlags
+        ).normalized
+
+        if DictationShortcutValidation.persistenceErrorMessage(for: candidate) != nil {
+            return Self.defaultDictationShortcut
+        }
+
+        return candidate
+    }
+
     func setDictationShortcut(_ shortcut: DictationShortcut?) {
         guard let shortcut else {
             dictationShortcutEnabled = false
@@ -483,6 +626,31 @@ final class SettingsStore {
 
     func resetDictationShortcutToDefault() {
         setDictationShortcut(Self.defaultDictationShortcut)
+    }
+
+    func setOverlayBufferPushToTalkShortcut(_ shortcut: DictationShortcut?) {
+        let resolved = resolvedPersistableShortcut(shortcut)
+        overlayBufferShortcutKeyCode = resolved.keyCode
+        overlayBufferShortcutCarbonModifierFlags = resolved.carbonModifierFlags
+        overlayBufferShortcutEnabled = shortcut != nil
+    }
+
+    func setLiveAutoPasteToggleShortcut(_ shortcut: DictationShortcut?) {
+        let resolved = resolvedPersistableShortcut(shortcut)
+        liveAutoPasteShortcutKeyCode = resolved.keyCode
+        liveAutoPasteShortcutCarbonModifierFlags = resolved.carbonModifierFlags
+        liveAutoPasteShortcutEnabled = shortcut != nil
+    }
+
+    private func resolvedPersistableShortcut(_ shortcut: DictationShortcut?) -> DictationShortcut {
+        guard let shortcut else { return Self.defaultDictationShortcut }
+
+        let normalizedShortcut = shortcut.normalized
+        if DictationShortcutValidation.persistenceErrorMessage(for: normalizedShortcut) == nil {
+            return normalizedShortcut
+        }
+
+        return Self.defaultDictationShortcut
     }
 
     func modelName(for provider: RealtimeProvider) -> String {

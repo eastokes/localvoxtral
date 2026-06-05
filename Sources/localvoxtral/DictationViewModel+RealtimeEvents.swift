@@ -132,10 +132,24 @@ extension DictationViewModel {
 
         pendingSegmentText.append(processedDelta)
         livePartialText = pendingSegmentText
+        if isGhosttyAgentModeActive,
+           shouldSuppressGhosttyAgentPostSubmitPunctuation(processedDelta)
+        {
+            pendingSegmentText = ""
+            livePartialText = ""
+            refreshOverlayBufferSession()
+            return
+        }
+
         if isLiveAutoPasteModeEnabled {
             textInsertion.enqueueRealtimeInsertion(processedDelta)
             if let accessibilityError = textInsertion.lastAccessibilityError {
                 lastError = accessibilityError
+            }
+            if isGhosttyAgentModeActive,
+               handleGhosttyAgentPartialCommandIfNeeded()
+            {
+                return
             }
         }
         statusText = isFinalizingStop ? "Finalizing..." : "Transcribing..."
@@ -156,6 +170,14 @@ extension DictationViewModel {
         let finalizedSegment = resolvedFinalizedSegment(from: processedText)
         let hadLiveDelta = !pendingSegmentText.trimmed.isEmpty
             || !livePartialText.trimmed.isEmpty
+        if isGhosttyAgentModeActive,
+           isDuplicateGhosttyAgentLiveSubmittedSegment(finalizedSegment)
+        {
+            livePartialText = ""
+            pendingSegmentText = ""
+            refreshOverlayBufferSession()
+            return
+        }
         guard !finalizedSegment.isEmpty else {
             livePartialText = ""
             pendingSegmentText = ""
@@ -173,7 +195,19 @@ extension DictationViewModel {
         pendingSegmentText = ""
         statusText = activeStatusText
 
-        if !hadLiveDelta, isLiveAutoPasteModeEnabled {
+        if isGhosttyAgentModeActive {
+            guard !isFinalizingStop else {
+                if isLiveAutoPasteModeEnabled, settings.autoCopyEnabled {
+                    copyLatestSegment(updateStatus: false)
+                }
+                refreshOverlayBufferSession()
+                return
+            }
+            handleGhosttyAgentFinalizedSegment(
+                finalizedSegment,
+                textAlreadyInserted: hadLiveDelta
+            )
+        } else if !hadLiveDelta, isLiveAutoPasteModeEnabled {
             textInsertion.enqueueRealtimeInsertion(finalizedSegment)
             if let accessibilityError = textInsertion.lastAccessibilityError {
                 lastError = accessibilityError
@@ -271,6 +305,12 @@ extension DictationViewModel {
         let finalizedDelta = mlxStabilizer.consumeCommittedSinceLastFinal().trimmed
         if !finalizedDelta.isEmpty {
             appendToTranscript(finalizedDelta)
+            if isGhosttyAgentModeActive, !isFinalizingStop {
+                handleGhosttyAgentFinalizedSegment(
+                    finalizedDelta,
+                    textAlreadyInserted: true
+                )
+            }
         }
 
         lastFinalSegment = currentDictationEventText
@@ -326,6 +366,143 @@ extension DictationViewModel {
         }
 
         return pendingSegment
+    }
+
+    @discardableResult
+    func handleGhosttyAgentFinalizedSegment(
+        _ segment: String,
+        textAlreadyInserted: Bool = false
+    ) -> Bool {
+        guard isGhosttyAgentModeActive else { return false }
+        let preferredPID = liveAutoPasteTargetAppPID
+
+        switch GhosttyAgentCommandParser.parse(segment) {
+        case .none:
+            return true
+
+        case .insertText(let text):
+            if textAlreadyInserted {
+                return true
+            }
+            return insertGhosttyAgentText(text, preferredPID: preferredPID)
+
+        case .pressReturn(let deleteCharacterCount):
+            if textAlreadyInserted,
+               !deleteGhosttyAgentText(count: deleteCharacterCount, preferredPID: preferredPID)
+            {
+                return false
+            }
+            return postGhosttyAgentReturn(preferredPID: preferredPID)
+
+        case .insertTextAndPressReturn(let text, let deleteCharacterCount):
+            if textAlreadyInserted {
+                guard deleteGhosttyAgentText(count: deleteCharacterCount, preferredPID: preferredPID) else {
+                    return false
+                }
+            } else {
+                guard insertGhosttyAgentText(text, preferredPID: preferredPID) else { return false }
+            }
+            return postGhosttyAgentReturn(preferredPID: preferredPID)
+        }
+    }
+
+    private func handleGhosttyAgentPartialCommandIfNeeded() -> Bool {
+        let liveSegment = pendingSegmentText.trimmed
+        guard GhosttyAgentCommandParser.containsReturnCommand(liveSegment) else {
+            return false
+        }
+
+        let action = GhosttyAgentCommandParser.parse(liveSegment)
+        let submittedText: String
+        switch action {
+        case .insertTextAndPressReturn(let text, _):
+            submittedText = text
+        case .pressReturn:
+            submittedText = ""
+        case .insertText, .none:
+            return false
+        }
+
+        guard handleGhosttyAgentFinalizedSegment(liveSegment, textAlreadyInserted: true) else {
+            return false
+        }
+
+        if !submittedText.isEmpty {
+            appendToTranscript(submittedText)
+            currentDictationEventText = TextMergingAlgorithms.appendToCurrentDictationEvent(
+                segment: submittedText,
+                existingText: currentDictationEventText
+            )
+            lastFinalSegment = currentDictationEventText
+        }
+
+        lastGhosttyAgentLiveSubmittedSegment = liveSegment
+        livePartialText = ""
+        pendingSegmentText = ""
+        statusText = activeStatusText
+        refreshOverlayBufferSession()
+        return true
+    }
+
+    private func shouldSuppressGhosttyAgentPostSubmitPunctuation(_ delta: String) -> Bool {
+        guard lastGhosttyAgentLiveSubmittedSegment != nil else { return false }
+        let trimmed = delta.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        return trimmed.unicodeScalars.allSatisfy {
+            CharacterSet(charactersIn: ".,;:!?").contains($0)
+        }
+    }
+
+    private func isDuplicateGhosttyAgentLiveSubmittedSegment(_ segment: String) -> Bool {
+        guard let lastGhosttyAgentLiveSubmittedSegment else { return false }
+        let normalizedSegment = GhosttyAgentCommandParser.normalizedCommandText(segment)
+        let normalizedLastSubmitted = GhosttyAgentCommandParser.normalizedCommandText(
+            lastGhosttyAgentLiveSubmittedSegment
+        )
+        guard !normalizedSegment.isEmpty,
+              normalizedSegment == normalizedLastSubmitted
+        else {
+            return false
+        }
+        self.lastGhosttyAgentLiveSubmittedSegment = nil
+        return true
+    }
+
+    private func insertGhosttyAgentText(_ text: String, preferredPID: pid_t?) -> Bool {
+        let primaryResult = textInsertion.insertTextPrioritizingKeyboard(
+            text,
+            preferredAppPID: preferredPID
+        )
+        if primaryResult.isSuccess {
+            return true
+        }
+
+        if textInsertion.pasteUsingCommandV(text, preferredAppPID: preferredPID) {
+            return true
+        }
+
+        if let accessibilityError = textInsertion.lastAccessibilityError {
+            lastError = accessibilityError
+        } else {
+            lastError = "Unable to insert finalized text into Ghostty."
+        }
+        return false
+    }
+
+    private func deleteGhosttyAgentText(count: Int, preferredPID: pid_t?) -> Bool {
+        guard textInsertion.postBackspace(count: count, preferredAppPID: preferredPID) else {
+            lastError = "Unable to remove spoken command from Ghostty."
+            return false
+        }
+        return true
+    }
+
+    private func postGhosttyAgentReturn(preferredPID: pid_t?) -> Bool {
+        guard textInsertion.postReturnKey(preferredAppPID: preferredPID) else {
+            lastError = "Unable to send Return to Ghostty."
+            return false
+        }
+        return true
     }
 
     // MARK: - Helpers

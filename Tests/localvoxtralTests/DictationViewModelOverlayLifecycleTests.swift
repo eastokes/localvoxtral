@@ -30,6 +30,24 @@ final class DictationViewModelOverlayLifecycleTests: XCTestCase {
         XCTAssertTrue(viewModel.isLiveAutoPasteModeEnabled)
     }
 
+    func testBeginDictationSessionUsesRequestedOutputMode() {
+        let settings = makeSettings(outputMode: .overlayBuffer)
+        let overlayCoordinator = MockOverlayCoordinator()
+        let viewModel = DictationViewModel(
+            settings: settings,
+            overlayBufferCoordinator: overlayCoordinator,
+            startRuntimeServices: false
+        )
+        retainForTestProcessLifetime(viewModel)
+
+        viewModel.requestedSessionOutputMode = .liveAutoPaste
+
+        viewModel.beginDictationSession()
+
+        XCTAssertEqual(viewModel.sessionOutputMode, .liveAutoPaste)
+        XCTAssertNil(viewModel.requestedSessionOutputMode)
+    }
+
     func testStopWithoutFinalizationStillCommitsOverlayUsingLatchedSessionMode() {
         let settings = makeSettings(outputMode: .overlayBuffer)
         let overlayCoordinator = MockOverlayCoordinator()
@@ -188,6 +206,152 @@ final class DictationViewModelOverlayLifecycleTests: XCTestCase {
         XCTAssertNil(viewModel.activeClientSource)
         XCTAssertEqual(viewModel.statusText, "Ready")
         XCTAssertEqual(viewModel.realtimeSessionIndicatorState, .idle)
+    }
+
+    func testGhosttyAgentModeInsertsPartialTextAndDeletesFinalizedCommand() {
+        let settings = makeSettings(outputMode: .liveAutoPaste)
+        settings.ghosttyAgentModeEnabled = true
+        let overlayCoordinator = MockOverlayCoordinator()
+        let viewModel = DictationViewModel(
+            settings: settings,
+            overlayBufferCoordinator: overlayCoordinator,
+            startRuntimeServices: false
+        )
+        retainForTestProcessLifetime(viewModel)
+
+        var keyboardInsertedTexts: [String] = []
+        var accessibilityInsertedTexts: [String] = []
+        var accessibilityPIDs: [pid_t?] = []
+        var backspaceCalls: [(count: Int, pid: pid_t?)] = []
+        var returnPIDs: [pid_t?] = []
+        viewModel.textInsertion.debugConfigureInsertionHooks(
+            unicodePoster: { text in
+                keyboardInsertedTexts.append(text)
+                return false
+            },
+            accessibilityInserter: { text, preferredPID in
+                accessibilityInsertedTexts.append(text)
+                accessibilityPIDs.append(preferredPID)
+                return true
+            },
+            returnKeyPoster: { preferredPID in
+                returnPIDs.append(preferredPID)
+                return true
+            },
+            backspacePoster: { count, preferredPID in
+                backspaceCalls.append((count: count, pid: preferredPID))
+                return true
+            }
+        )
+
+        viewModel.sessionOutputMode = .liveAutoPaste
+        viewModel.activeClientSource = .realtimeAPI
+        viewModel.isDictating = true
+        viewModel.liveAutoPasteTargetAppPID = 123
+        viewModel.liveAutoPasteTargetAppBundleID = "com.mitchellh.ghostty"
+
+        viewModel.handle(event: .partialTranscript("show me the failing test send now"), source: .realtimeAPI)
+        viewModel.handle(event: .finalTranscript("show me the failing test send now"), source: .realtimeAPI)
+
+        XCTAssertEqual(keyboardInsertedTexts, ["show me the failing test send now"])
+        XCTAssertEqual(accessibilityInsertedTexts, ["show me the failing test send now"])
+        XCTAssertEqual(accessibilityPIDs.first ?? nil, 123)
+        XCTAssertEqual(backspaceCalls.first?.count, 9)
+        XCTAssertEqual(backspaceCalls.first?.pid ?? nil, 123)
+        XCTAssertEqual(returnPIDs.first ?? nil, 123)
+        XCTAssertFalse(viewModel.textInsertion.hasPendingInsertionText)
+    }
+
+    func testGhosttyAgentModeSuppressesPunctuationDeltaAfterLiveSubmit() {
+        let settings = makeSettings(outputMode: .liveAutoPaste)
+        settings.ghosttyAgentModeEnabled = true
+        let overlayCoordinator = MockOverlayCoordinator()
+        let viewModel = DictationViewModel(
+            settings: settings,
+            overlayBufferCoordinator: overlayCoordinator,
+            startRuntimeServices: false
+        )
+        retainForTestProcessLifetime(viewModel)
+
+        var keyboardInsertedTexts: [String] = []
+        var accessibilityInsertedTexts: [String] = []
+        var backspaceCounts: [Int] = []
+        var returnPIDs: [pid_t?] = []
+        viewModel.textInsertion.debugConfigureInsertionHooks(
+            unicodePoster: { text in
+                keyboardInsertedTexts.append(text)
+                return false
+            },
+            accessibilityInserter: { text, _ in
+                accessibilityInsertedTexts.append(text)
+                return true
+            },
+            returnKeyPoster: { preferredPID in
+                returnPIDs.append(preferredPID)
+                return true
+            },
+            backspacePoster: { count, _ in
+                backspaceCounts.append(count)
+                return true
+            }
+        )
+
+        viewModel.sessionOutputMode = .liveAutoPaste
+        viewModel.activeClientSource = .realtimeAPI
+        viewModel.isDictating = true
+        viewModel.liveAutoPasteTargetAppPID = 123
+        viewModel.liveAutoPasteTargetAppBundleID = "com.mitchellh.ghostty"
+
+        viewModel.handle(event: .partialTranscript("Send now"), source: .realtimeAPI)
+        viewModel.handle(event: .partialTranscript("."), source: .realtimeAPI)
+
+        XCTAssertEqual(keyboardInsertedTexts, ["Send now"])
+        XCTAssertEqual(accessibilityInsertedTexts, ["Send now"])
+        XCTAssertEqual(backspaceCounts, [8])
+        XCTAssertEqual(returnPIDs.first ?? nil, 123)
+        XCTAssertFalse(viewModel.textInsertion.hasPendingInsertionText)
+    }
+
+    func testGhosttyAgentModeDoesNotTypeFinalTranscriptDuringStopFinalization() {
+        let settings = makeSettings(outputMode: .liveAutoPaste)
+        settings.ghosttyAgentModeEnabled = true
+        let overlayCoordinator = MockOverlayCoordinator()
+        let viewModel = DictationViewModel(
+            settings: settings,
+            overlayBufferCoordinator: overlayCoordinator,
+            startRuntimeServices: false
+        )
+        retainForTestProcessLifetime(viewModel)
+
+        var keyboardInsertedTexts: [String] = []
+        var backspaceCounts: [Int] = []
+        var returnPIDs: [pid_t?] = []
+        viewModel.textInsertion.debugConfigureInsertionHooks(
+            unicodePoster: { text in
+                keyboardInsertedTexts.append(text)
+                return true
+            },
+            returnKeyPoster: { preferredPID in
+                returnPIDs.append(preferredPID)
+                return true
+            },
+            backspacePoster: { count, _ in
+                backspaceCounts.append(count)
+                return true
+            }
+        )
+
+        viewModel.sessionOutputMode = .liveAutoPaste
+        viewModel.activeClientSource = .realtimeAPI
+        viewModel.isFinalizingStop = true
+        viewModel.liveAutoPasteTargetAppPID = 123
+        viewModel.liveAutoPasteTargetAppBundleID = "com.mitchellh.ghostty"
+
+        viewModel.handle(event: .finalTranscript("already typed conversation send now"), source: .realtimeAPI)
+
+        XCTAssertTrue(keyboardInsertedTexts.isEmpty)
+        XCTAssertTrue(backspaceCounts.isEmpty)
+        XCTAssertTrue(returnPIDs.isEmpty)
     }
 
     func testCancelPolishingForNewSessionIfNeededResetsFinalizationState() {

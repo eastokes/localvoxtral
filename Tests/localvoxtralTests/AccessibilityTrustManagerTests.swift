@@ -47,6 +47,46 @@ final class AccessibilityTrustManagerTests: XCTestCase {
         XCTAssertEqual(promptCount, 2)
     }
 
+    func testResetPermission_clearsPromptGateAndUsesBundleIdentifier() {
+        var promptCount = 0
+        var resetBundleIdentifier: String?
+        let manager = AccessibilityTrustManager(
+            trustChecker: { false },
+            permissionPrompter: { promptCount += 1 },
+            permissionResetter: { bundleIdentifier in
+                resetBundleIdentifier = bundleIdentifier
+                return true
+            },
+            pollingTimeoutSeconds: 0
+        )
+
+        manager.promptIfNeeded()
+        manager.promptIfNeeded()
+        XCTAssertEqual(promptCount, 1)
+
+        XCTAssertTrue(manager.resetPermission(bundleIdentifier: "com.localvoxtral.app"))
+        manager.promptIfNeeded()
+
+        XCTAssertEqual(resetBundleIdentifier, "com.localvoxtral.app")
+        XCTAssertEqual(promptCount, 2)
+    }
+
+    func testResetPermission_withoutBundleIdentifierFailsWithoutResetting() {
+        var resetCount = 0
+        let manager = AccessibilityTrustManager(
+            trustChecker: { false },
+            permissionPrompter: {},
+            permissionResetter: { _ in
+                resetCount += 1
+                return true
+            },
+            pollingTimeoutSeconds: 0
+        )
+
+        XCTAssertFalse(manager.resetPermission(bundleIdentifier: nil))
+        XCTAssertEqual(resetCount, 0)
+    }
+
     func testRefresh_whenTrustBecomesGranted_clearsErrorAndNotifies() {
         var trusted = false
         var trustChangedCount = 0

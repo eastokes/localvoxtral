@@ -69,7 +69,18 @@ final class ShortcutValidationTests: XCTestCase {
 
         XCTAssertEqual(
             DictationShortcutValidation.validationErrorMessage(for: shortcut),
-            "Shortcut must include at least one modifier key."
+            "Shortcut must include at least one modifier key unless it is a function key."
         )
+    }
+
+    func testValidation_allowsBareFunctionKeyShortcuts() {
+        let shortcuts = [
+            DictationShortcut(keyCode: UInt32(kVK_F6), carbonModifierFlags: 0),
+            DictationShortcut(keyCode: UInt32(kVK_F7), carbonModifierFlags: 0),
+        ]
+
+        for shortcut in shortcuts {
+            XCTAssertNil(DictationShortcutValidation.validationErrorMessage(for: shortcut))
+        }
     }
 }

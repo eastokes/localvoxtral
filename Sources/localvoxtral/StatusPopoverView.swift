@@ -64,6 +64,11 @@ struct StatusPopoverView: View {
                     viewModel.requestAccessibilityPermission()
                     openAccessibilitySettings()
                 }
+
+                Button("Reset Accessibility Permission…") {
+                    viewModel.resetAccessibilityPermission()
+                    openAccessibilitySettings()
+                }
             }
 
             Divider()

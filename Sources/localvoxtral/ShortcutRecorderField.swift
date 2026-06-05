@@ -25,7 +25,7 @@ struct ShortcutRecorderField: NSViewRepresentable {
         control.set(
             allowedModifierFlags: CocoaModifierFlagsMask,
             requiredModifierFlags: [],
-            allowsEmptyModifierFlags: false
+            allowsEmptyModifierFlags: true
         )
         if let fixedWidth {
             control.widthAnchor.constraint(equalToConstant: fixedWidth).isActive = true

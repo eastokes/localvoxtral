@@ -39,5 +39,36 @@ final class TextInsertionServiceRealtimeInsertionTests: XCTestCase {
         XCTAssertEqual(snapshot.activeModifierFallbackCount, 1)
         XCTAssertEqual(snapshot.axInsertionSuccessCount, 0)
     }
+
+    func testPostReturnKey_usesPreferredPID() {
+        let service = TextInsertionService()
+        var observedPID: pid_t?
+        service.debugConfigureInsertionHooks(
+            returnKeyPoster: { preferredPID in
+                observedPID = preferredPID
+                return true
+            }
+        )
+
+        XCTAssertTrue(service.postReturnKey(preferredAppPID: 123))
+        XCTAssertEqual(observedPID, 123)
+    }
+
+    func testPostBackspace_usesPreferredPIDAndCount() {
+        let service = TextInsertionService()
+        var observedCount = 0
+        var observedPID: pid_t?
+        service.debugConfigureInsertionHooks(
+            backspacePoster: { count, preferredPID in
+                observedCount = count
+                observedPID = preferredPID
+                return true
+            }
+        )
+
+        XCTAssertTrue(service.postBackspace(count: 9, preferredAppPID: 123))
+        XCTAssertEqual(observedCount, 9)
+        XCTAssertEqual(observedPID, 123)
+    }
 }
 #endif

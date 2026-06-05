@@ -8,6 +8,7 @@ import Observation
 final class AccessibilityTrustManager {
     typealias TrustChecker = () -> Bool
     typealias PermissionPrompter = () -> Void
+    typealias PermissionResetter = (String) -> Bool
     typealias SleepClosure = (Duration) async -> Void
     typealias DateProvider = () -> Date
 
@@ -24,6 +25,7 @@ final class AccessibilityTrustManager {
     private var pollingTask: Task<Void, Never>?
     @ObservationIgnored private let trustChecker: TrustChecker
     @ObservationIgnored private let permissionPrompter: PermissionPrompter
+    @ObservationIgnored private let permissionResetter: PermissionResetter
     @ObservationIgnored private let sleepFor: SleepClosure
     @ObservationIgnored private let now: DateProvider
     @ObservationIgnored private let pollingInterval: Duration
@@ -32,8 +34,21 @@ final class AccessibilityTrustManager {
     init(
         trustChecker: @escaping TrustChecker = { AXIsProcessTrusted() },
         permissionPrompter: @escaping PermissionPrompter = {
-            let options = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
+            let options = ["AXTrustedCheckOptionPrompt" as CFString: true] as CFDictionary
             _ = AXIsProcessTrustedWithOptions(options)
+        },
+        permissionResetter: @escaping PermissionResetter = { bundleIdentifier in
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
+            process.arguments = ["reset", "Accessibility", bundleIdentifier]
+
+            do {
+                try process.run()
+                process.waitUntilExit()
+                return process.terminationStatus == 0
+            } catch {
+                return false
+            }
         },
         sleepFor: @escaping SleepClosure = { duration in
             try? await Task.sleep(for: duration)
@@ -44,6 +59,7 @@ final class AccessibilityTrustManager {
     ) {
         self.trustChecker = trustChecker
         self.permissionPrompter = permissionPrompter
+        self.permissionResetter = permissionResetter
         self.sleepFor = sleepFor
         self.now = now
         self.pollingInterval = pollingInterval
@@ -73,6 +89,23 @@ final class AccessibilityTrustManager {
         permissionPrompter()
         startPolling()
         refresh()
+    }
+
+    @discardableResult
+    func resetPermission(bundleIdentifier: String? = Bundle.main.bundleIdentifier) -> Bool {
+        guard let bundleIdentifier, !bundleIdentifier.isEmpty else { return false }
+
+        pollingTask?.cancel()
+        pollingTask = nil
+        hasPromptedForPermission = false
+        hasShownError = false
+        if lastError == Self.errorMessage {
+            lastError = nil
+        }
+
+        let didReset = permissionResetter(bundleIdentifier)
+        refresh()
+        return didReset
     }
 
     func promptIfNeeded() {

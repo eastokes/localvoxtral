@@ -175,6 +175,19 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertEqual(store.dictationOutputMode, .overlayBuffer)
     }
 
+    func testGhosttyAgentMode_defaultsToDisabled() {
+        let store = makeStore()
+        XCTAssertFalse(store.ghosttyAgentModeEnabled)
+    }
+
+    func testGhosttyAgentMode_persistsAcrossReload() {
+        let store = makeStore()
+        store.ghosttyAgentModeEnabled = true
+
+        let reloadedStore = makeStore()
+        XCTAssertTrue(reloadedStore.ghosttyAgentModeEnabled)
+    }
+
     // MARK: - dictationShortcutMode
 
     func testDictationShortcutMode_defaultsToToggle() {
@@ -251,6 +264,48 @@ final class SettingsStoreTests: XCTestCase {
 
         XCTAssertTrue(store.dictationShortcutEnabled)
         XCTAssertEqual(store.dictationShortcut, SettingsStore.defaultDictationShortcut)
+    }
+
+    func testOverlayBufferPushToTalkShortcut_defaultsToDisabled() {
+        let store = makeStore()
+
+        XCTAssertFalse(store.overlayBufferShortcutEnabled)
+        XCTAssertNil(store.overlayBufferPushToTalkShortcut)
+    }
+
+    func testOverlayBufferPushToTalkShortcut_customPersistsAcrossReload() {
+        let store = makeStore()
+        let customShortcut = DictationShortcut(
+            keyCode: UInt32(kVK_ANSI_O),
+            carbonModifierFlags: UInt32(cmdKey | optionKey)
+        )
+
+        store.setOverlayBufferPushToTalkShortcut(customShortcut)
+
+        let reloadedStore = makeStore()
+        XCTAssertTrue(reloadedStore.overlayBufferShortcutEnabled)
+        XCTAssertEqual(reloadedStore.overlayBufferPushToTalkShortcut, customShortcut)
+    }
+
+    func testLiveAutoPasteToggleShortcut_defaultsToDisabled() {
+        let store = makeStore()
+
+        XCTAssertFalse(store.liveAutoPasteShortcutEnabled)
+        XCTAssertNil(store.liveAutoPasteToggleShortcut)
+    }
+
+    func testLiveAutoPasteToggleShortcut_customPersistsAcrossReload() {
+        let store = makeStore()
+        let customShortcut = DictationShortcut(
+            keyCode: UInt32(kVK_ANSI_L),
+            carbonModifierFlags: UInt32(cmdKey | optionKey)
+        )
+
+        store.setLiveAutoPasteToggleShortcut(customShortcut)
+
+        let reloadedStore = makeStore()
+        XCTAssertTrue(reloadedStore.liveAutoPasteShortcutEnabled)
+        XCTAssertEqual(reloadedStore.liveAutoPasteToggleShortcut, customShortcut)
     }
 
     func testDictationShortcut_invalidStoredValueFallsBackToDefault() {

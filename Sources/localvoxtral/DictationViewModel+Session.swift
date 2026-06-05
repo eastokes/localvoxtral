@@ -34,6 +34,23 @@ extension DictationViewModel {
         sessionStartedAt = nil
         sessionProvider = nil
         sessionModelName = nil
+        liveAutoPasteTargetAppPID = nil
+        liveAutoPasteTargetAppBundleID = nil
+        lastGhosttyAgentLiveSubmittedSegment = nil
+    }
+
+    private func captureLiveAutoPasteTargetIfNeeded() {
+        guard sessionOutputMode == .liveAutoPaste,
+              let frontmostApp = NSWorkspace.shared.frontmostApplication,
+              frontmostApp.processIdentifier != getpid()
+        else {
+            liveAutoPasteTargetAppPID = nil
+            liveAutoPasteTargetAppBundleID = nil
+            return
+        }
+
+        liveAutoPasteTargetAppPID = frontmostApp.processIdentifier
+        liveAutoPasteTargetAppBundleID = frontmostApp.bundleIdentifier
     }
 
     func beginDictationSession() {
@@ -47,8 +64,10 @@ extension DictationViewModel {
         isFinalizingStop = false
         isConnectingRealtimeSession = false
         clearLatchedSessionMetadata()
-        sessionOutputMode = settings.dictationOutputMode
+        sessionOutputMode = requestedSessionOutputMode ?? settings.dictationOutputMode
+        requestedSessionOutputMode = nil
         sessionStartedAt = Date()
+        captureLiveAutoPasteTargetIfNeeded()
         setRealtimeIndicatorIdle()
 
         let provider = settings.realtimeProvider
@@ -367,10 +386,11 @@ extension DictationViewModel {
                 ? promotePendingMlxTextToLatestSegment()
                 : promotePendingRealtimeTextToLatestSegment()
 
-            if sessionMode == .liveAutoPaste, wasMlxAudio, let promoted, !promoted.isEmpty {
-                if !textInsertion.insertTextUsingAccessibilityOnly(promoted) {
-                    _ = textInsertion.pasteUsingCommandV(promoted)
-                }
+            if sessionMode == .liveAutoPaste, wasMlxAudio, let promoted, !promoted.isEmpty,
+               !isGhosttyAgentModeActive,
+               !textInsertion.insertTextUsingAccessibilityOnly(promoted)
+            {
+                _ = textInsertion.pasteUsingCommandV(promoted)
             }
         }
 
@@ -592,6 +612,8 @@ extension DictationViewModel {
         realtimeFinalizationLastActivityAt = nil
         polishAndCommitTask = nil
         clearLatchedSessionMetadata()
+        requestedSessionOutputMode = nil
+        clearPushToTalkShortcutSessionAttempt()
         setRealtimeIndicatorIdle()
         livePartialText = ""
         pendingSegmentText = ""
@@ -706,6 +728,7 @@ extension DictationViewModel {
         isCompletingStoppedSession = false
         polishAndCommitTask = nil
         clearLatchedSessionMetadata()
+        requestedSessionOutputMode = nil
         microphone.stop()
         realtimeFinalizationLastActivityAt = nil
         firstChunkPreprocessor.reset()
@@ -776,8 +799,16 @@ extension DictationViewModel {
         markRecentConnectionFailureIndicator()
         presentConnectionFailureAlert(
             title: "LLM Polishing Connection Failed",
-            message: resolvedMessage
+            message: connectionFailureAlertMessage(
+                message: resolvedMessage,
+                technicalDetails: resolvedDetails
+            )
         )
+    }
+
+    private func connectionFailureAlertMessage(message: String, technicalDetails: String?) -> String {
+        guard let technicalDetails else { return message }
+        return "\(message)\n\nDetails: \(technicalDetails)"
     }
 
     func presentConnectionFailureAlert(title: String = "Realtime Connection Failed", message: String) {

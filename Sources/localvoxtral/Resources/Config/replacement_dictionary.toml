@@ -1,7 +1,30 @@
 # Map any alias in `matches` to the canonical `replace_with` spelling.
-# Add as many `[[replacement]]` blocks as you want.
+# Matching is case-insensitive, respects word boundaries, and treats repeated
+# internal whitespace as a single separator. Longer matches win over shorter
+# overlapping matches; ties use the order in this file.
 #
-# Example:
-# [[replacement]]
-# replace_with = "PostgreSQL"
-# matches = ["postgres", "post gres sql", "postgress"]
+# Add, remove, or replace these examples with terms you dictate often.
+
+[[replacement]]
+replace_with = "localvoxtral"
+matches = ["local voxtral", "local voxtrel", "local voxel"]
+
+[[replacement]]
+replace_with = "Voxtral"
+matches = ["voxtral", "voxtrel", "vox trial"]
+
+[[replacement]]
+replace_with = "vLLM"
+matches = ["vlm", "v l l m", "vllm"]
+
+[[replacement]]
+replace_with = "MLX"
+matches = ["mlx", "m l x"]
+
+[[replacement]]
+replace_with = "mise"
+matches = ["mize"]
+
+[[replacement]]
+replace_with = "PostgreSQL"
+matches = ["postgres", "post gres sql", "postgress"]

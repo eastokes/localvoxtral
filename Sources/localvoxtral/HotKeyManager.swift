@@ -17,10 +17,10 @@ final class HotKeyManager {
     static let registrationErrorStatus = "Failed to register global hotkey."
     static let unavailableErrorMessage = "The selected keyboard shortcut is unavailable."
 
-    var onPress: (() -> Void)?
-    var onRelease: (() -> Void)?
+    var onPress: ((UInt32) -> Void)?
+    var onRelease: ((UInt32) -> Void)?
 
-    private var hotKeyRef: EventHotKeyRef?
+    private var hotKeyRefs: [UInt32: EventHotKeyRef] = [:]
     private var hotKeyHandlerRef: EventHandlerRef?
     private static let hotKeySignature = OSType(0x53565854) // SVXT
     private nonisolated(unsafe) static weak var hotKeyTarget: HotKeyManager?
@@ -33,9 +33,16 @@ final class HotKeyManager {
     /// Returns `.success` when registration succeeds (including when shortcut is nil).
     @discardableResult
     func register(shortcut: DictationShortcut?) -> RegistrationResult {
+        register(shortcuts: [1: shortcut])
+    }
+
+    /// Registers global hotkeys by identifier. Nil shortcuts are skipped.
+    @discardableResult
+    func register(shortcuts: [UInt32: DictationShortcut?]) -> RegistrationResult {
         unregister()
 
-        guard let shortcut else {
+        let activeShortcuts = shortcuts.compactMapValues { $0 }
+        guard !activeShortcuts.isEmpty else {
             return .success
         }
 
@@ -68,14 +75,15 @@ final class HotKeyManager {
 
                 guard status == noErr,
                       hotKeyID.signature == HotKeyManager.hotKeySignature,
-                      hotKeyID.id == 1
+                      HotKeyManager.hotKeyTarget?.hotKeyRefs[hotKeyID.id] != nil
                 else {
                     return noErr
                 }
 
                 let eventKind = GetEventKind(eventRef)
+                let id = hotKeyID.id
                 DispatchQueue.main.async {
-                    HotKeyManager.hotKeyTarget?.handleHotKeyEvent(kind: eventKind)
+                    HotKeyManager.hotKeyTarget?.handleHotKeyEvent(kind: eventKind, id: id)
                 }
 
                 return noErr
@@ -90,29 +98,36 @@ final class HotKeyManager {
             return .failure(.handlerInstallFailed)
         }
 
-        let hotKeyID = EventHotKeyID(signature: Self.hotKeySignature, id: 1)
-        let registerStatus = RegisterEventHotKey(
-            shortcut.keyCode,
-            shortcut.carbonModifierFlags,
-            hotKeyID,
-            GetApplicationEventTarget(),
-            0,
-            &hotKeyRef
-        )
+        for (id, shortcut) in activeShortcuts {
+            var hotKeyRef: EventHotKeyRef?
+            let hotKeyID = EventHotKeyID(signature: Self.hotKeySignature, id: id)
+            let registerStatus = RegisterEventHotKey(
+                shortcut.keyCode,
+                shortcut.carbonModifierFlags,
+                hotKeyID,
+                GetApplicationEventTarget(),
+                0,
+                &hotKeyRef
+            )
 
-        if registerStatus != noErr {
-            unregister()
-            return .failure(.shortcutUnavailable)
+            if registerStatus != noErr {
+                unregister()
+                return .failure(.shortcutUnavailable)
+            }
+
+            if let hotKeyRef {
+                hotKeyRefs[id] = hotKeyRef
+            }
         }
 
         return .success
     }
 
     func unregister() {
-        if let hotKeyRef {
+        for hotKeyRef in hotKeyRefs.values {
             UnregisterEventHotKey(hotKeyRef)
-            self.hotKeyRef = nil
         }
+        hotKeyRefs.removeAll()
 
         if let hotKeyHandlerRef {
             RemoveEventHandler(hotKeyHandlerRef)
@@ -120,12 +135,12 @@ final class HotKeyManager {
         }
     }
 
-    private func handleHotKeyEvent(kind: UInt32) {
+    private func handleHotKeyEvent(kind: UInt32, id: UInt32) {
         switch kind {
         case UInt32(kEventHotKeyPressed):
-            onPress?()
+            onPress?(id)
         case UInt32(kEventHotKeyReleased):
-            onRelease?()
+            onRelease?(id)
         default:
             break
         }

@@ -4,6 +4,8 @@ struct SettingsView: View {
     @Bindable var settings: SettingsStore
     var viewModel: DictationViewModel
     @State private var shortcutValidationError: String?
+    @State private var overlayShortcutValidationError: String?
+    @State private var liveAutoPasteShortcutValidationError: String?
 
     private var mlxTranscriptionDelaySecondsBinding: Binding<Double> {
         Binding(
@@ -62,6 +64,28 @@ struct SettingsView: View {
         )
     }
 
+    private var overlayBufferShortcutBinding: Binding<DictationShortcut?> {
+        Binding(
+            get: {
+                settings.overlayBufferPushToTalkShortcut
+            },
+            set: { newValue in
+                viewModel.updateOverlayBufferPushToTalkShortcut(newValue)
+            }
+        )
+    }
+
+    private var liveAutoPasteShortcutBinding: Binding<DictationShortcut?> {
+        Binding(
+            get: {
+                settings.liveAutoPasteToggleShortcut
+            },
+            set: { newValue in
+                viewModel.updateLiveAutoPasteToggleShortcut(newValue)
+            }
+        )
+    }
+
     var body: some View {
         TabView {
             ConnectionSettingsPane(
@@ -79,7 +103,11 @@ struct SettingsView: View {
                 settings: settings,
                 viewModel: viewModel,
                 dictationShortcutBinding: dictationShortcutBinding,
-                shortcutValidationError: $shortcutValidationError
+                overlayBufferShortcutBinding: overlayBufferShortcutBinding,
+                liveAutoPasteShortcutBinding: liveAutoPasteShortcutBinding,
+                shortcutValidationError: $shortcutValidationError,
+                overlayShortcutValidationError: $overlayShortcutValidationError,
+                liveAutoPasteShortcutValidationError: $liveAutoPasteShortcutValidationError
             )
             .tabItem {
                 Label("Dictation", systemImage: "mic")
@@ -197,7 +225,11 @@ private struct DictationSettingsPane: View {
     @Bindable var settings: SettingsStore
     let viewModel: DictationViewModel
     let dictationShortcutBinding: Binding<DictationShortcut?>
+    let overlayBufferShortcutBinding: Binding<DictationShortcut?>
+    let liveAutoPasteShortcutBinding: Binding<DictationShortcut?>
     @Binding var shortcutValidationError: String?
+    @Binding var overlayShortcutValidationError: String?
+    @Binding var liveAutoPasteShortcutValidationError: String?
 
     var body: some View {
         SettingsPage {
@@ -235,6 +267,12 @@ private struct DictationSettingsPane: View {
                     subtitle: "Copy the finalized segment to the clipboard after dictation stops.",
                     isOn: $settings.autoCopyEnabled
                 )
+
+                ToggleSettingRow(
+                    title: "Ghostty agent mode",
+                    subtitle: "In Live Auto-Paste, use finalized text only and say \"send now\" to press Return in Ghostty.",
+                    isOn: $settings.ghosttyAgentModeEnabled
+                )
             }
 
             SettingsGroup(title: "Shortcut") {
@@ -266,6 +304,46 @@ private struct DictationSettingsPane: View {
                         "Global dictation shortcut is currently disabled.",
                         color: .secondary
                     )
+                }
+
+                Divider()
+
+                SettingsFieldRow(title: "Overlay push-to-talk") {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ShortcutRecorderField(
+                            shortcut: overlayBufferShortcutBinding,
+                            validationError: $overlayShortcutValidationError,
+                            fixedWidth: 132
+                        )
+                        .frame(height: 24, alignment: .leading)
+
+                        SettingsHelpText(
+                            "Optional shortcut that always uses Overlay Buffer and stops on release."
+                        )
+                    }
+                }
+
+                if let overlayShortcutValidationError {
+                    SettingsMessageRow(overlayShortcutValidationError, color: .red)
+                }
+
+                SettingsFieldRow(title: "Live auto-paste toggle") {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ShortcutRecorderField(
+                            shortcut: liveAutoPasteShortcutBinding,
+                            validationError: $liveAutoPasteShortcutValidationError,
+                            fixedWidth: 132
+                        )
+                        .frame(height: 24, alignment: .leading)
+
+                        SettingsHelpText(
+                            "Optional shortcut that always streams directly into the focused app."
+                        )
+                    }
+                }
+
+                if let liveAutoPasteShortcutValidationError {
+                    SettingsMessageRow(liveAutoPasteShortcutValidationError, color: .red)
                 }
             }
         }
@@ -300,7 +378,7 @@ private struct TextProcessingSettingsPane: View {
                 SettingsAvailabilityCard(
                     title: "Unavailable in Live Auto-Paste output mode",
                     message:
-                        "Text Processing can't run in Live Auto-Paste output mode. Switch Dictation > Output mode to Overlay Buffer to enable text processing features.",
+                        "Text Processing can't run in Live Auto-Paste output mode. Use Overlay Buffer globally or through the Overlay push-to-talk shortcut to apply text processing.",
                     systemImage: "exclamationmark.triangle.fill",
                     tint: .orange
                 )

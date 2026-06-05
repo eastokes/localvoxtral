@@ -103,6 +103,10 @@ final class TextInsertionService {
     private var debugModifierStateReader: (() -> Bool)?
     @ObservationIgnored
     private var debugAccessibilityInserter: ((String, pid_t?) -> Bool)?
+    @ObservationIgnored
+    private var debugReturnKeyPoster: ((pid_t?) -> Bool)?
+    @ObservationIgnored
+    private var debugBackspacePoster: ((Int, pid_t?) -> Bool)?
 #endif
 
     static let accessibilityErrorMessage = AccessibilityTrustManager.errorMessage
@@ -208,6 +212,61 @@ final class TextInsertionService {
         return true
     }
 
+    func postReturnKey(preferredAppPID: pid_t? = nil) -> Bool {
+#if DEBUG
+        if let debugReturnKeyPoster {
+            return debugReturnKeyPoster(preferredAppPID)
+        }
+#endif
+        if !ensurePasteTargetIsActive(preferredAppPID: preferredAppPID) {
+            return false
+        }
+
+        guard let eventSource = CGEventSource(stateID: .combinedSessionState),
+              let keyDown = CGEvent(keyboardEventSource: eventSource, virtualKey: 36, keyDown: true),
+              let keyUp = CGEvent(keyboardEventSource: eventSource, virtualKey: 36, keyDown: false)
+        else {
+            return false
+        }
+
+        keyDown.flags = []
+        keyUp.flags = []
+        keyDown.post(tap: .cgAnnotatedSessionEventTap)
+        keyUp.post(tap: .cgAnnotatedSessionEventTap)
+        return true
+    }
+
+    func postBackspace(count: Int, preferredAppPID: pid_t? = nil) -> Bool {
+        guard count > 0 else { return true }
+#if DEBUG
+        if let debugBackspacePoster {
+            return debugBackspacePoster(count, preferredAppPID)
+        }
+#endif
+        if !ensurePasteTargetIsActive(preferredAppPID: preferredAppPID) {
+            return false
+        }
+
+        guard let eventSource = CGEventSource(stateID: .combinedSessionState) else {
+            return false
+        }
+
+        for _ in 0 ..< count {
+            guard let keyDown = CGEvent(keyboardEventSource: eventSource, virtualKey: 51, keyDown: true),
+                  let keyUp = CGEvent(keyboardEventSource: eventSource, virtualKey: 51, keyDown: false)
+            else {
+                return false
+            }
+
+            keyDown.flags = []
+            keyUp.flags = []
+            keyDown.post(tap: .cgAnnotatedSessionEventTap)
+            keyUp.post(tap: .cgAnnotatedSessionEventTap)
+        }
+
+        return true
+    }
+
     func enqueueRealtimeInsertion(_ text: String) {
         guard !text.isEmpty else { return }
         pendingRealtimeInsertionText.append(text)
@@ -257,6 +316,11 @@ final class TextInsertionService {
 
     func requestAccessibilityPermissionIfNeeded() {
         accessibilityTrust.promptIfNeeded()
+    }
+
+    @discardableResult
+    func resetAccessibilityPermission() -> Bool {
+        accessibilityTrust.resetPermission()
     }
 
     func resetDiagnostics() {
@@ -631,11 +695,15 @@ extension TextInsertionService {
     func debugConfigureInsertionHooks(
         unicodePoster: ((String) -> Bool)? = nil,
         modifierStateReader: (() -> Bool)? = nil,
-        accessibilityInserter: ((String, pid_t?) -> Bool)? = nil
+        accessibilityInserter: ((String, pid_t?) -> Bool)? = nil,
+        returnKeyPoster: ((pid_t?) -> Bool)? = nil,
+        backspacePoster: ((Int, pid_t?) -> Bool)? = nil
     ) {
         debugUnicodePoster = unicodePoster
         debugModifierStateReader = modifierStateReader
         debugAccessibilityInserter = accessibilityInserter
+        debugReturnKeyPoster = returnKeyPoster
+        debugBackspacePoster = backspacePoster
     }
 
     func debugInsertionSnapshot() -> DebugInsertionSnapshot {
