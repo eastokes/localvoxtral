@@ -210,7 +210,7 @@ final class DictationViewModel {
     @ObservationIgnored
     var liveAutoPasteTargetAppBundleID: String?
     @ObservationIgnored
-    var lastGhosttyAgentLiveSubmittedSegment: String?
+    var lastSendNowLiveSubmittedSegment: String?
     @ObservationIgnored
     var firstChunkPreprocessor = FirstChunkPreprocessor()
 
@@ -997,20 +997,16 @@ final class DictationViewModel {
         activeOutputMode == .liveAutoPaste
     }
 
-    var isGhosttyAgentModeActive: Bool {
-        guard settings.ghosttyAgentModeEnabled,
+    var isSendNowCommandActive: Bool {
+        guard settings.sendNowCommandEnabled,
               isLiveAutoPasteModeEnabled,
               liveAutoPasteTargetAppPID != nil,
               let bundleID = liveAutoPasteTargetAppBundleID
         else {
             return false
         }
-        return Self.ghosttyBundleIdentifiers.contains(bundleID)
+        return settings.matchesSendNowTargetApp(bundleIdentifier: bundleID)
     }
-
-    private static let ghosttyBundleIdentifiers: Set<String> = [
-        "com.mitchellh.ghostty",
-    ]
 
     private var activeOutputMode: DictationOutputMode {
         sessionOutputMode ?? settings.dictationOutputMode
@@ -1064,7 +1060,7 @@ final class DictationViewModel {
     }
 
     private func handleMlxFinalizedInsertionDelta(_ delta: String) {
-        guard isLiveAutoPasteModeEnabled, !isGhosttyAgentModeActive else { return }
+        guard isLiveAutoPasteModeEnabled, !isSendNowCommandActive else { return }
         if !textInsertion.insertTextUsingAccessibilityOnly(delta) {
             _ = textInsertion.pasteUsingCommandV(delta)
         }

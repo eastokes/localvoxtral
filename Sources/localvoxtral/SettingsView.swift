@@ -231,6 +231,13 @@ private struct DictationSettingsPane: View {
     @Binding var overlayShortcutValidationError: String?
     @Binding var liveAutoPasteShortcutValidationError: String?
 
+    private func sendNowTargetAppBinding(for app: SendNowTargetApp) -> Binding<Bool> {
+        Binding(
+            get: { settings.isSendNowTargetAppSelected(app) },
+            set: { settings.setSendNowTargetApp(app, isSelected: $0) }
+        )
+    }
+
     var body: some View {
         SettingsPage {
             SettingsGroup(title: "Behavior") {
@@ -269,10 +276,43 @@ private struct DictationSettingsPane: View {
                 )
 
                 ToggleSettingRow(
-                    title: "Ghostty agent mode",
-                    subtitle: "In Live Auto-Paste, use finalized text only and say \"send now\" to press Return in Ghostty.",
-                    isOn: $settings.ghosttyAgentModeEnabled
+                    title: "Send-now command",
+                    subtitle: "In Live Auto-Paste, speak a trigger phrase to press Return in selected apps.",
+                    isOn: $settings.sendNowCommandEnabled
                 )
+
+                if settings.sendNowCommandEnabled {
+                    SettingsFieldRow(title: "Trigger phrase") {
+                        TextField(
+                            SettingsStore.defaultSendNowTriggerPhrase,
+                            text: $settings.sendNowTriggerPhrase
+                        )
+                        .textFieldStyle(.roundedBorder)
+
+                        SettingsHelpText(
+                            "Use something uncommon enough to avoid accidental submits. Current command: \"\(settings.effectiveSendNowTriggerPhrase)\"."
+                        )
+                    }
+
+                    SettingsFieldRow(title: "Applications") {
+                        VStack(alignment: .leading, spacing: 8) {
+                            ForEach(SendNowTargetApp.allCases) { app in
+                                Toggle(app.displayName, isOn: sendNowTargetAppBinding(for: app))
+                            }
+
+                            SettingsHelpText(
+                                "Only the selected apps treat the trigger phrase as Return."
+                            )
+                        }
+                    }
+
+                    if settings.selectedSendNowTargetApps.isEmpty {
+                        SettingsMessageRow(
+                            "Select at least one app for the send-now command to be active.",
+                            color: .secondary
+                        )
+                    }
+                }
             }
 
             SettingsGroup(title: "Shortcut") {

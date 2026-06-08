@@ -65,6 +65,46 @@ enum DictationShortcutMode: String, CaseIterable, Identifiable {
     }
 }
 
+enum SendNowTargetApp: String, CaseIterable, Identifiable {
+    case ghostty = "ghostty"
+    case terminal = "terminal"
+    case iTerm = "iterm"
+    case warp = "warp"
+    case wezTerm = "wezterm"
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .ghostty:
+            return "Ghostty"
+        case .terminal:
+            return "Terminal"
+        case .iTerm:
+            return "iTerm"
+        case .warp:
+            return "Warp"
+        case .wezTerm:
+            return "WezTerm"
+        }
+    }
+
+    var bundleIdentifiers: Set<String> {
+        switch self {
+        case .ghostty:
+            return ["com.mitchellh.ghostty"]
+        case .terminal:
+            return ["com.apple.Terminal"]
+        case .iTerm:
+            return ["com.googlecode.iterm2"]
+        case .warp:
+            return ["dev.warp.Warp-Stable"]
+        case .wezTerm:
+            return ["com.github.wez.wezterm"]
+        }
+    }
+}
+
 enum DictationShortcutValidation {
     static let allowedModifierFlagsMask = UInt32(cmdKey | optionKey | shiftKey | controlKey)
 
@@ -183,6 +223,9 @@ final class SettingsStore {
         static let liveAutoPasteShortcutKeyCode = "settings.live_auto_paste_shortcut_key_code"
         static let liveAutoPasteShortcutCarbonModifierFlags =
             "settings.live_auto_paste_shortcut_carbon_modifiers"
+        static let sendNowCommandEnabled = "settings.send_now_command_enabled"
+        static let sendNowTriggerPhrase = "settings.send_now_trigger_phrase"
+        static let sendNowTargetAppIDs = "settings.send_now_target_app_ids"
         static let ghosttyAgentModeEnabled = "settings.ghostty_agent_mode_enabled"
         static let llmPolishingEnabled = "settings.llm_polishing_enabled"
         static let llmPolishingEndpointURL = "settings.llm_polishing_endpoint_url"
@@ -197,6 +240,8 @@ final class SettingsStore {
         keyCode: UInt32(kVK_Space),
         carbonModifierFlags: UInt32(optionKey)
     )
+    static let defaultSendNowTriggerPhrase = "send now"
+    static let defaultSendNowTargetApps: [SendNowTargetApp] = [.ghostty]
 
     var realtimeProvider: RealtimeProvider {
         didSet { defaults.set(realtimeProvider.rawValue, forKey: Keys.realtimeProvider) }
@@ -298,8 +343,16 @@ final class SettingsStore {
         }
     }
 
-    var ghosttyAgentModeEnabled: Bool {
-        didSet { defaults.set(ghosttyAgentModeEnabled, forKey: Keys.ghosttyAgentModeEnabled) }
+    var sendNowCommandEnabled: Bool {
+        didSet { defaults.set(sendNowCommandEnabled, forKey: Keys.sendNowCommandEnabled) }
+    }
+
+    var sendNowTriggerPhrase: String {
+        didSet { defaults.set(sendNowTriggerPhrase, forKey: Keys.sendNowTriggerPhrase) }
+    }
+
+    private var sendNowTargetAppIDs: [String] {
+        didSet { defaults.set(sendNowTargetAppIDs, forKey: Keys.sendNowTargetAppIDs) }
     }
 
     var llmPolishingEnabled: Bool {
@@ -450,8 +503,18 @@ final class SettingsStore {
         liveAutoPasteShortcutKeyCode = liveShortcut.shortcut.keyCode
         liveAutoPasteShortcutCarbonModifierFlags = liveShortcut.shortcut.carbonModifierFlags
 
-        ghosttyAgentModeEnabled = Self.loadBool(
-            defaults: defaults, key: Keys.ghosttyAgentModeEnabled, fallback: false)
+        if defaults.object(forKey: Keys.sendNowCommandEnabled) != nil {
+            sendNowCommandEnabled = defaults.bool(forKey: Keys.sendNowCommandEnabled)
+        } else {
+            sendNowCommandEnabled = Self.loadBool(
+                defaults: defaults,
+                key: Keys.ghosttyAgentModeEnabled,
+                fallback: false
+            )
+        }
+        sendNowTriggerPhrase = defaults.string(forKey: Keys.sendNowTriggerPhrase)
+            ?? Self.defaultSendNowTriggerPhrase
+        sendNowTargetAppIDs = Self.loadSendNowTargetAppIDs(defaults: defaults)
 
         llmPolishingEnabled = Self.loadBool(
             defaults: defaults, key: Keys.llmPolishingEnabled, fallback: false)
@@ -539,6 +602,17 @@ final class SettingsStore {
         return normalized.isEmpty ? provider.defaultModelName : normalized
     }
 
+    private static func loadSendNowTargetAppIDs(defaults: UserDefaults) -> [String] {
+        guard let storedIDs = defaults.array(forKey: Keys.sendNowTargetAppIDs) as? [String] else {
+            return defaultSendNowTargetApps.map(\.rawValue)
+        }
+
+        let storedIDSet = Set(storedIDs)
+        return SendNowTargetApp.allCases
+            .map(\.rawValue)
+            .filter { storedIDSet.contains($0) }
+    }
+
     var trimmedAPIKey: String {
         apiKey.trimmed
     }
@@ -603,6 +677,38 @@ final class SettingsStore {
         }
 
         return candidate
+    }
+
+    var effectiveSendNowTriggerPhrase: String {
+        let trimmed = sendNowTriggerPhrase.trimmed
+        return trimmed.isEmpty ? Self.defaultSendNowTriggerPhrase : trimmed
+    }
+
+    var selectedSendNowTargetApps: [SendNowTargetApp] {
+        let selectedIDSet = Set(sendNowTargetAppIDs)
+        return SendNowTargetApp.allCases.filter { selectedIDSet.contains($0.rawValue) }
+    }
+
+    func isSendNowTargetAppSelected(_ app: SendNowTargetApp) -> Bool {
+        sendNowTargetAppIDs.contains(app.rawValue)
+    }
+
+    func setSendNowTargetApp(_ app: SendNowTargetApp, isSelected: Bool) {
+        let selectedIDs = Set(sendNowTargetAppIDs)
+        let updatedIDs = isSelected
+            ? selectedIDs.union([app.rawValue])
+            : selectedIDs.subtracting([app.rawValue])
+        sendNowTargetAppIDs = SendNowTargetApp.allCases
+            .map(\.rawValue)
+            .filter { updatedIDs.contains($0) }
+    }
+
+    func matchesSendNowTargetApp(bundleIdentifier: String) -> Bool {
+        sendNowTargetApp(for: bundleIdentifier) != nil
+    }
+
+    func sendNowTargetApp(for bundleIdentifier: String) -> SendNowTargetApp? {
+        selectedSendNowTargetApps.first { $0.bundleIdentifiers.contains(bundleIdentifier) }
     }
 
     func setDictationShortcut(_ shortcut: DictationShortcut?) {

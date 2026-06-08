@@ -36,7 +36,7 @@ extension DictationViewModel {
         sessionModelName = nil
         liveAutoPasteTargetAppPID = nil
         liveAutoPasteTargetAppBundleID = nil
-        lastGhosttyAgentLiveSubmittedSegment = nil
+        lastSendNowLiveSubmittedSegment = nil
     }
 
     private func captureLiveAutoPasteTargetIfNeeded() {
@@ -387,7 +387,7 @@ extension DictationViewModel {
                 : promotePendingRealtimeTextToLatestSegment()
 
             if sessionMode == .liveAutoPaste, wasMlxAudio, let promoted, !promoted.isEmpty,
-               !isGhosttyAgentModeActive,
+               !isSendNowCommandActive,
                !textInsertion.insertTextUsingAccessibilityOnly(promoted)
             {
                 _ = textInsertion.pasteUsingCommandV(promoted)

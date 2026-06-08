@@ -25,7 +25,7 @@ This repo is a fork of [T0mSIlver/localvoxtral](https://github.com/T0mSIlver/loc
 - Multiple shortcut improvements, including mode-specific hotkeys and better modifier-only / `Fn` handling
 - More resilient overlay behavior, including clipping fixes, safer click handling, and `Escape` to cancel dictation cleanly
 - Accessibility permission recovery via a `PermissionResetter` flow for MacOS issues.
-- Better terminal and coding dictation defaults, including Ghostty "send now" -> <return/enter> support. This allows coding agent conversations without needing keyboard input.
+- Better terminal and coding dictation defaults, including configurable "send now" -> <return/enter> support for selected apps. This allows coding agent conversations without needing keyboard input.
 
 ## Features
 

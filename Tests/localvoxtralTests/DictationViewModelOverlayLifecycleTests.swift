@@ -208,9 +208,9 @@ final class DictationViewModelOverlayLifecycleTests: XCTestCase {
         XCTAssertEqual(viewModel.realtimeSessionIndicatorState, .idle)
     }
 
-    func testGhosttyAgentModeInsertsPartialTextAndDeletesFinalizedCommand() {
+    func testSendNowCommandInsertsPartialTextAndDeletesFinalizedCommand() {
         let settings = makeSettings(outputMode: .liveAutoPaste)
-        settings.ghosttyAgentModeEnabled = true
+        settings.sendNowCommandEnabled = true
         let overlayCoordinator = MockOverlayCoordinator()
         let viewModel = DictationViewModel(
             settings: settings,
@@ -262,9 +262,9 @@ final class DictationViewModelOverlayLifecycleTests: XCTestCase {
         XCTAssertFalse(viewModel.textInsertion.hasPendingInsertionText)
     }
 
-    func testGhosttyAgentModeSuppressesPunctuationDeltaAfterLiveSubmit() {
+    func testSendNowCommandSuppressesPunctuationDeltaAfterLiveSubmit() {
         let settings = makeSettings(outputMode: .liveAutoPaste)
-        settings.ghosttyAgentModeEnabled = true
+        settings.sendNowCommandEnabled = true
         let overlayCoordinator = MockOverlayCoordinator()
         let viewModel = DictationViewModel(
             settings: settings,
@@ -312,9 +312,9 @@ final class DictationViewModelOverlayLifecycleTests: XCTestCase {
         XCTAssertFalse(viewModel.textInsertion.hasPendingInsertionText)
     }
 
-    func testGhosttyAgentModeDoesNotTypeFinalTranscriptDuringStopFinalization() {
+    func testSendNowCommandDoesNotTypeFinalTranscriptDuringStopFinalization() {
         let settings = makeSettings(outputMode: .liveAutoPaste)
-        settings.ghosttyAgentModeEnabled = true
+        settings.sendNowCommandEnabled = true
         let overlayCoordinator = MockOverlayCoordinator()
         let viewModel = DictationViewModel(
             settings: settings,

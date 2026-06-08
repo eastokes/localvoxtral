@@ -1,29 +1,32 @@
 import Foundation
 
-enum GhosttyAgentCommandAction: Equatable {
+enum SendNowCommandAction: Equatable {
     case insertText(String)
     case pressReturn(deleteCharacterCount: Int)
     case insertTextAndPressReturn(String, deleteCharacterCount: Int)
     case none
 }
 
-enum GhosttyAgentCommandParser {
-    private static let sendPhrase = "send now"
-
-    static func parse(_ text: String) -> GhosttyAgentCommandAction {
+enum SendNowCommandParser {
+    static func parse(_ text: String, triggerPhrase: String) -> SendNowCommandAction {
         let trimmed = text.trimmed
         guard !trimmed.isEmpty else { return .none }
 
-        let normalized = normalizedCommandText(trimmed)
-        if normalized == sendPhrase {
-            return .pressReturn(deleteCharacterCount: trimmed.count)
-        }
-
-        guard normalized.hasSuffix(sendPhrase) else {
+        let normalizedTriggerPhrase = normalizedCommandText(triggerPhrase)
+        guard !normalizedTriggerPhrase.isEmpty else {
             return .insertText(trimmed)
         }
 
-        let prefixLength = normalized.count - sendPhrase.count
+        let normalized = normalizedCommandText(trimmed)
+        if normalized == normalizedTriggerPhrase {
+            return .pressReturn(deleteCharacterCount: trimmed.count)
+        }
+
+        guard normalized.hasSuffix(normalizedTriggerPhrase) else {
+            return .insertText(trimmed)
+        }
+
+        let prefixLength = normalized.count - normalizedTriggerPhrase.count
         if prefixLength > 0 {
             let boundaryIndex = normalized.index(normalized.startIndex, offsetBy: prefixLength)
             let previousIndex = normalized.index(before: boundaryIndex)
@@ -47,8 +50,8 @@ enum GhosttyAgentCommandParser {
             )
     }
 
-    static func containsReturnCommand(_ text: String) -> Bool {
-        switch parse(text) {
+    static func containsReturnCommand(_ text: String, triggerPhrase: String) -> Bool {
+        switch parse(text, triggerPhrase: triggerPhrase) {
         case .pressReturn, .insertTextAndPressReturn:
             return true
         case .insertText, .none:

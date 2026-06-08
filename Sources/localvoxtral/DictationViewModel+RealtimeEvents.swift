@@ -122,6 +122,7 @@ extension DictationViewModel {
         guard acceptsRealtimeEvents else { return }
         let processedDelta = preprocessIncomingTranscriptChunk(delta)
         guard !processedDelta.isEmpty else { return }
+        let sendNowTriggerPhrase = settings.effectiveSendNowTriggerPhrase
         if source == .mlxAudio {
             handleMlxPartialTranscript(processedDelta)
             return
@@ -132,8 +133,8 @@ extension DictationViewModel {
 
         pendingSegmentText.append(processedDelta)
         livePartialText = pendingSegmentText
-        if isGhosttyAgentModeActive,
-           shouldSuppressGhosttyAgentPostSubmitPunctuation(processedDelta)
+        if isSendNowCommandActive,
+           shouldSuppressSendNowPostSubmitPunctuation(processedDelta)
         {
             pendingSegmentText = ""
             livePartialText = ""
@@ -146,8 +147,8 @@ extension DictationViewModel {
             if let accessibilityError = textInsertion.lastAccessibilityError {
                 lastError = accessibilityError
             }
-            if isGhosttyAgentModeActive,
-               handleGhosttyAgentPartialCommandIfNeeded()
+            if isSendNowCommandActive,
+               handleSendNowPartialCommandIfNeeded(triggerPhrase: sendNowTriggerPhrase)
             {
                 return
             }
@@ -168,10 +169,14 @@ extension DictationViewModel {
         }
 
         let finalizedSegment = resolvedFinalizedSegment(from: processedText)
+        let sendNowTriggerPhrase = settings.effectiveSendNowTriggerPhrase
         let hadLiveDelta = !pendingSegmentText.trimmed.isEmpty
             || !livePartialText.trimmed.isEmpty
-        if isGhosttyAgentModeActive,
-           isDuplicateGhosttyAgentLiveSubmittedSegment(finalizedSegment)
+        if isSendNowCommandActive,
+           isDuplicateSendNowLiveSubmittedSegment(
+               finalizedSegment,
+               triggerPhrase: sendNowTriggerPhrase
+           )
         {
             livePartialText = ""
             pendingSegmentText = ""
@@ -195,7 +200,7 @@ extension DictationViewModel {
         pendingSegmentText = ""
         statusText = activeStatusText
 
-        if isGhosttyAgentModeActive {
+        if isSendNowCommandActive {
             guard !isFinalizingStop else {
                 if isLiveAutoPasteModeEnabled, settings.autoCopyEnabled {
                     copyLatestSegment(updateStatus: false)
@@ -203,9 +208,10 @@ extension DictationViewModel {
                 refreshOverlayBufferSession()
                 return
             }
-            handleGhosttyAgentFinalizedSegment(
+            handleSendNowFinalizedSegment(
                 finalizedSegment,
-                textAlreadyInserted: hadLiveDelta
+                textAlreadyInserted: hadLiveDelta,
+                triggerPhrase: sendNowTriggerPhrase
             )
         } else if !hadLiveDelta, isLiveAutoPasteModeEnabled {
             textInsertion.enqueueRealtimeInsertion(finalizedSegment)
@@ -305,10 +311,11 @@ extension DictationViewModel {
         let finalizedDelta = mlxStabilizer.consumeCommittedSinceLastFinal().trimmed
         if !finalizedDelta.isEmpty {
             appendToTranscript(finalizedDelta)
-            if isGhosttyAgentModeActive, !isFinalizingStop {
-                handleGhosttyAgentFinalizedSegment(
+            if isSendNowCommandActive, !isFinalizingStop {
+                handleSendNowFinalizedSegment(
                     finalizedDelta,
-                    textAlreadyInserted: true
+                    textAlreadyInserted: true,
+                    triggerPhrase: settings.effectiveSendNowTriggerPhrase
                 )
             }
         }
@@ -369,14 +376,15 @@ extension DictationViewModel {
     }
 
     @discardableResult
-    func handleGhosttyAgentFinalizedSegment(
+    func handleSendNowFinalizedSegment(
         _ segment: String,
-        textAlreadyInserted: Bool = false
+        textAlreadyInserted: Bool = false,
+        triggerPhrase: String
     ) -> Bool {
-        guard isGhosttyAgentModeActive else { return false }
+        guard isSendNowCommandActive else { return false }
         let preferredPID = liveAutoPasteTargetAppPID
 
-        switch GhosttyAgentCommandParser.parse(segment) {
+        switch SendNowCommandParser.parse(segment, triggerPhrase: triggerPhrase) {
         case .none:
             return true
 
@@ -384,35 +392,36 @@ extension DictationViewModel {
             if textAlreadyInserted {
                 return true
             }
-            return insertGhosttyAgentText(text, preferredPID: preferredPID)
+            return insertSendNowText(text, preferredPID: preferredPID)
 
         case .pressReturn(let deleteCharacterCount):
             if textAlreadyInserted,
-               !deleteGhosttyAgentText(count: deleteCharacterCount, preferredPID: preferredPID)
+               !deleteSendNowText(count: deleteCharacterCount, preferredPID: preferredPID)
             {
                 return false
             }
-            return postGhosttyAgentReturn(preferredPID: preferredPID)
+            return postSendNowReturn(preferredPID: preferredPID)
 
         case .insertTextAndPressReturn(let text, let deleteCharacterCount):
             if textAlreadyInserted {
-                guard deleteGhosttyAgentText(count: deleteCharacterCount, preferredPID: preferredPID) else {
+                guard deleteSendNowText(count: deleteCharacterCount, preferredPID: preferredPID) else {
                     return false
                 }
             } else {
-                guard insertGhosttyAgentText(text, preferredPID: preferredPID) else { return false }
+                guard insertSendNowText(text, preferredPID: preferredPID) else { return false }
             }
-            return postGhosttyAgentReturn(preferredPID: preferredPID)
+            return postSendNowReturn(preferredPID: preferredPID)
         }
     }
 
-    private func handleGhosttyAgentPartialCommandIfNeeded() -> Bool {
+    private func handleSendNowPartialCommandIfNeeded(triggerPhrase: String) -> Bool {
         let liveSegment = pendingSegmentText.trimmed
-        guard GhosttyAgentCommandParser.containsReturnCommand(liveSegment) else {
+        guard SendNowCommandParser.containsReturnCommand(liveSegment, triggerPhrase: triggerPhrase)
+        else {
             return false
         }
 
-        let action = GhosttyAgentCommandParser.parse(liveSegment)
+        let action = SendNowCommandParser.parse(liveSegment, triggerPhrase: triggerPhrase)
         let submittedText: String
         switch action {
         case .insertTextAndPressReturn(let text, _):
@@ -423,7 +432,11 @@ extension DictationViewModel {
             return false
         }
 
-        guard handleGhosttyAgentFinalizedSegment(liveSegment, textAlreadyInserted: true) else {
+        guard handleSendNowFinalizedSegment(
+            liveSegment,
+            textAlreadyInserted: true,
+            triggerPhrase: triggerPhrase
+        ) else {
             return false
         }
 
@@ -436,7 +449,7 @@ extension DictationViewModel {
             lastFinalSegment = currentDictationEventText
         }
 
-        lastGhosttyAgentLiveSubmittedSegment = liveSegment
+        lastSendNowLiveSubmittedSegment = liveSegment
         livePartialText = ""
         pendingSegmentText = ""
         statusText = activeStatusText
@@ -444,8 +457,8 @@ extension DictationViewModel {
         return true
     }
 
-    private func shouldSuppressGhosttyAgentPostSubmitPunctuation(_ delta: String) -> Bool {
-        guard lastGhosttyAgentLiveSubmittedSegment != nil else { return false }
+    private func shouldSuppressSendNowPostSubmitPunctuation(_ delta: String) -> Bool {
+        guard lastSendNowLiveSubmittedSegment != nil else { return false }
         let trimmed = delta.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
         return trimmed.unicodeScalars.allSatisfy {
@@ -453,22 +466,27 @@ extension DictationViewModel {
         }
     }
 
-    private func isDuplicateGhosttyAgentLiveSubmittedSegment(_ segment: String) -> Bool {
-        guard let lastGhosttyAgentLiveSubmittedSegment else { return false }
-        let normalizedSegment = GhosttyAgentCommandParser.normalizedCommandText(segment)
-        let normalizedLastSubmitted = GhosttyAgentCommandParser.normalizedCommandText(
-            lastGhosttyAgentLiveSubmittedSegment
+    private func isDuplicateSendNowLiveSubmittedSegment(
+        _ segment: String,
+        triggerPhrase: String
+    ) -> Bool {
+        guard let lastSendNowLiveSubmittedSegment else { return false }
+        let normalizedTriggerPhrase = SendNowCommandParser.normalizedCommandText(triggerPhrase)
+        guard !normalizedTriggerPhrase.isEmpty else { return false }
+        let normalizedSegment = SendNowCommandParser.normalizedCommandText(segment)
+        let normalizedLastSubmitted = SendNowCommandParser.normalizedCommandText(
+            lastSendNowLiveSubmittedSegment
         )
         guard !normalizedSegment.isEmpty,
-              normalizedSegment == normalizedLastSubmitted
+               normalizedSegment == normalizedLastSubmitted
         else {
             return false
         }
-        self.lastGhosttyAgentLiveSubmittedSegment = nil
+        self.lastSendNowLiveSubmittedSegment = nil
         return true
     }
 
-    private func insertGhosttyAgentText(_ text: String, preferredPID: pid_t?) -> Bool {
+    private func insertSendNowText(_ text: String, preferredPID: pid_t?) -> Bool {
         let primaryResult = textInsertion.insertTextPrioritizingKeyboard(
             text,
             preferredAppPID: preferredPID
@@ -484,22 +502,30 @@ extension DictationViewModel {
         if let accessibilityError = textInsertion.lastAccessibilityError {
             lastError = accessibilityError
         } else {
-            lastError = "Unable to insert finalized text into Ghostty."
+            lastError = "Unable to insert finalized text into \(activeSendNowTargetName)."
         }
         return false
     }
 
-    private func deleteGhosttyAgentText(count: Int, preferredPID: pid_t?) -> Bool {
+    private func deleteSendNowText(count: Int, preferredPID: pid_t?) -> Bool {
         guard textInsertion.postBackspace(count: count, preferredAppPID: preferredPID) else {
-            lastError = "Unable to remove spoken command from Ghostty."
+            lastError = "Unable to remove the trigger phrase from \(activeSendNowTargetName)."
             return false
         }
         return true
     }
 
-    private func postGhosttyAgentReturn(preferredPID: pid_t?) -> Bool {
+    private var activeSendNowTargetName: String {
+        guard let bundleID = liveAutoPasteTargetAppBundleID else {
+            return "the selected app"
+        }
+        return settings.sendNowTargetApp(for: bundleIdentifier: bundleID)?.displayName
+            ?? "the selected app"
+    }
+
+    private func postSendNowReturn(preferredPID: pid_t?) -> Bool {
         guard textInsertion.postReturnKey(preferredAppPID: preferredPID) else {
-            lastError = "Unable to send Return to Ghostty."
+            lastError = "Unable to send Return to \(activeSendNowTargetName)."
             return false
         }
         return true

@@ -175,17 +175,44 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertEqual(store.dictationOutputMode, .overlayBuffer)
     }
 
-    func testGhosttyAgentMode_defaultsToDisabled() {
+    func testSendNowCommand_defaultsToDisabled() {
         let store = makeStore()
-        XCTAssertFalse(store.ghosttyAgentModeEnabled)
+        XCTAssertFalse(store.sendNowCommandEnabled)
     }
 
-    func testGhosttyAgentMode_persistsAcrossReload() {
+    func testSendNowCommand_persistsAcrossReload() {
         let store = makeStore()
-        store.ghosttyAgentModeEnabled = true
+        store.sendNowCommandEnabled = true
 
         let reloadedStore = makeStore()
-        XCTAssertTrue(reloadedStore.ghosttyAgentModeEnabled)
+        XCTAssertTrue(reloadedStore.sendNowCommandEnabled)
+    }
+
+    func testSendNowTriggerPhrase_defaultsToSendNow() {
+        let store = makeStore()
+        XCTAssertEqual(store.effectiveSendNowTriggerPhrase, SettingsStore.defaultSendNowTriggerPhrase)
+    }
+
+    func testSendNowTriggerPhrase_blankFallsBackToDefault() {
+        let store = makeStore()
+        store.sendNowTriggerPhrase = "   "
+
+        XCTAssertEqual(store.effectiveSendNowTriggerPhrase, SettingsStore.defaultSendNowTriggerPhrase)
+    }
+
+    func testSendNowTargetApps_defaultToGhostty() {
+        let store = makeStore()
+        XCTAssertEqual(store.selectedSendNowTargetApps, [.ghostty])
+    }
+
+    func testSendNowTargetApps_persistAcrossReload() {
+        let store = makeStore()
+        store.setSendNowTargetApp(.ghostty, isSelected: false)
+        store.setSendNowTargetApp(.terminal, isSelected: true)
+        store.setSendNowTargetApp(.warp, isSelected: true)
+
+        let reloadedStore = makeStore()
+        XCTAssertEqual(reloadedStore.selectedSendNowTargetApps, [.terminal, .warp])
     }
 
     // MARK: - dictationShortcutMode
