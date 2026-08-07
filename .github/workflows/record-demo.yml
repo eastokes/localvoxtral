@@ -1,0 +1,157 @@
+name: Record README Demo
+
+# Hands-free demo recording on the self-hosted runner (the owner's Mac, GUI
+# session): scripts/record-demo.sh stages a terminal-centric scene, drives the
+# app, and speaks the demo lines via TTS into the BlackHole loopback device.
+# The encoded mp4 lands in the run's artifacts; publishing it is manual by
+# design — GitHub only renders inline README video from user-attachments URLs,
+# which have no upload API, so the owner drag-drops the mp4 into a PR comment
+# and pastes the URL.
+#
+# Three scenes, chosen by `terminal_agent` / what the runner has:
+#   * claude (flagship): a real Claude Code session in GHOSTTY, so the app joins
+#     the pane to the session by its controlling tty and grounds beat 2 in the
+#     session's own cwd / prior prompt / recent files. The script installs the
+#     localvoxtral Claude Code plugin for the run and uninstalls it after (only
+#     if it installed it). Requires, ON THE RUNNER:
+#       - Ghostty >= 1.4 / tip:  brew install --cask ghostty@tip
+#       - a logged-in `claude` CLI for the runner user
+#       - the app's Automation -> Ghostty grant already allowed (the app raises
+#         the consent sheet at launch via its #167 prewarm; hands-free CI cannot
+#         click it, so it MUST be pre-granted for the runner user — otherwise the
+#         tty read blocks, the join fails open, and beat 2's grounding no-ops)
+#       - Automation -> Ghostty for the runner's shell too (the script reads the
+#         pane tty for its capability check + surgical cleanup)
+#     With terminal_agent=claude the script FAILS FAST when any of the terminal
+#     prerequisites are missing; with terminal_agent=auto it falls back to the
+#     shell scene below.
+#   * herdr (explicit only — never chosen by auto): the claude scene inside a
+#     herdr pane. Ghostty runs `herdr --session <isolated demo session>`, two
+#     panes (claude + a decoy watcher), and beat 2 is grounded through the
+#     HERDR PANE JOIN + pane-exact pane.read screen context; the script asserts
+#     both from the app's unified log and fails (deleting the capture) if the
+#     join silently fell back. Requires everything the claude scene does PLUS
+#     `herdr` on the runner user's login-shell PATH (https://herdr.dev).
+#   * shell (fallback): a plain zsh prompt in Terminal.app (always installed);
+#     beat 2 grounds `useAuth.ts` from the window-title cwd, as before.
+#
+# The script announces itself audibly and waits 3 s before taking over the
+# GUI session (owner rule), and needs an UNLOCKED session — it fails fast
+# when Secure Keyboard Entry is held (locked screen).
+#
+# One-time runner-machine setup (beyond the capture-assets grants):
+#   brew install blackhole-2ch ffmpeg
+#   brew install --cask ghostty@tip          # claude scene only
+#   # then, for the claude scene, log `claude` in for the runner user and grant
+#   # the app (and the runner shell) Automation -> Ghostty once in System
+#   # Settings > Privacy & Security > Automation.
+
+on:
+  workflow_dispatch:
+    inputs:
+      terminal_agent:
+        description: "Scene: auto = Ghostty Claude session when claude+Ghostty available else Terminal.app zsh; claude = require Ghostty+claude (fail fast otherwise); herdr = Claude inside a herdr pane, require Ghostty+claude+herdr (fail fast otherwise); shell = Terminal.app zsh"
+        type: choice
+        default: auto
+        options:
+          - auto
+          - claude
+          - herdr
+          - shell
+
+concurrency:
+  group: record-demo-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  record-demo:
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check record script
+        id: guard
+        run: |
+          if [[ ! -f scripts/record-demo.sh ]]; then
+            echo "scripts/record-demo.sh is not present on this ref; skipping demo recording."
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "present=true" >> "$GITHUB_OUTPUT"
+
+      - name: Idle guard (cheap, pre-build)
+        # The recorder's own hands-free idle guard (scripts/record-demo.sh)
+        # runs AFTER packaging, so a refused takeover would still burn a ~7 min
+        # helper build on the personal-Mac runner. Duplicate the cheap check
+        # here to fail in seconds instead; the script's guard remains the
+        # authoritative one (it re-checks immediately before the takeover).
+        if: steps.guard.outputs.present == 'true'
+        run: |
+          IDLE="$(ioreg -c IOHIDSystem 2>/dev/null \
+            | awk '/HIDIdleTime/ {print int($NF/1000000000); exit}')"
+          REQUIRED="${DEMO_IDLE_REQUIRED_SECONDS:-120}"
+          if [[ -z "$IDLE" ]]; then
+            echo "Cannot read HID idle time — failing before the build (the script would refuse anyway)." >&2
+            exit 1
+          fi
+          if (( IDLE < REQUIRED )); then
+            echo "Machine in active use (idle ${IDLE}s < ${REQUIRED}s) — refusing before the build. Rerun when the Mac is idle." >&2
+            exit 1
+          fi
+          # Same economics for the claude/herdr scenes' other refusal: a
+          # pre-running Ghostty swallows the launch args (script aborts
+          # post-build).
+          if [[ "${{ inputs.terminal_agent }}" == "claude" || "${{ inputs.terminal_agent }}" == "herdr" ]] && pgrep -xiq ghostty; then
+            echo "Ghostty is already running — the ${{ inputs.terminal_agent }} scene must launch it itself. Quit Ghostty and rerun." >&2
+            exit 1
+          fi
+          # And for a locked screen: the recorder fails fast on Secure
+          # Keyboard Entry anyway, but only AFTER packaging. Same probe as
+          # scripts/ci/ui-smoke-guard.sh; probe errors fail open (an
+          # uncomputable state must not silently disable the lane).
+          LOCK_STATE="$(swift - <<'SWIFT' 2>/dev/null || echo error
+          import CoreGraphics
+          guard let session = CGSessionCopyCurrentDictionary() as? [String: Any] else {
+            print("no-session")
+            exit(0)
+          }
+          print(session["CGSSessionScreenIsLocked"] != nil ? "locked" : "unlocked")
+          SWIFT
+          )"
+          if [[ "$LOCK_STATE" == "locked" || "$LOCK_STATE" == "no-session" ]]; then
+            echo "GUI session is $LOCK_STATE — the recorder needs an unlocked session. Refusing before the build." >&2
+            exit 1
+          fi
+          echo "Idle guard (pre-build): machine idle ${IDLE}s (>= ${REQUIRED}s), session unlocked."
+
+      - name: Package app bundle
+        if: steps.guard.outputs.present == 'true'
+        env:
+          LOCALVOXTRAL_CODESIGN_IDENTITY: localvoxtral-dev
+        run: ./scripts/package_app.sh release
+
+      - name: Record demo (hands-free)
+        id: record
+        if: steps.guard.outputs.present == 'true'
+        env:
+          DEMO_HANDS_FREE: "1"
+          DEMO_WARMUP_SECONDS: "25"
+          DEMO_TERMINAL_AGENT: ${{ inputs.terminal_agent || 'auto' }}
+        run: |
+          bash scripts/record-demo.sh dist/localvoxtral.app
+          # The runner's /bin/bash 3.2 has returned exit 0 on a PARSE ERROR
+          # before — never trust the exit code alone, require the artifact.
+          test -s dist/demo/demo.mp4 || { echo "demo.mp4 was not produced"; exit 1; }
+          echo "ran=true" >> "$GITHUB_OUTPUT"
+
+      - name: Upload demo video
+        if: steps.record.outputs.ran == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: readme-demo
+          path: dist/demo/
+          if-no-files-found: error
+          retention-days: 14

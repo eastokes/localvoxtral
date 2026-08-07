@@ -1,9 +1,30 @@
+import CryptoKit
 import Foundation
+
+/// Which polishing prompt profile to load. `standard` is the general STT
+/// cleanup prompt used everywhere; `agent` is the terminal/coding-agent
+/// dictation profile that additionally normalizes spoken symbols, backticks
+/// paths/flags, etc. — while never answering or expanding the dictated prompt.
+enum PolishPromptProfile: String, Sendable {
+    case standard
+    case agent
+}
 
 protocol AppConfigServing {
     func configDirectoryURL() -> URL
     func loadReplacementDictionary() -> ReplacementDictionary
     func loadLLMPromptTemplates() -> LLMPromptTemplates
+    func loadLLMPromptTemplates(profile: PolishPromptProfile) -> LLMPromptTemplates
+    func loadTerminalAppBundleIDs() -> [String]
+}
+
+extension AppConfigServing {
+    /// Default conformance so existing callers/mocks that only implement the
+    /// zero-arg loader keep the standard behavior for every profile. The real
+    /// `AppConfigStore` overrides this to load the agent files for `.agent`.
+    func loadLLMPromptTemplates(profile: PolishPromptProfile) -> LLMPromptTemplates {
+        loadLLMPromptTemplates()
+    }
 }
 
 struct ReplacementEntry: Equatable, Sendable {
@@ -13,6 +34,35 @@ struct ReplacementEntry: Equatable, Sendable {
 
 struct ReplacementDictionary: Equatable, Sendable {
     let entries: [ReplacementEntry]
+
+    func liveReplacementRules() -> [LiveReplacementRule] {
+        var rules: [LiveReplacementRule] = []
+        rules.reserveCapacity(entries.reduce(0) { $0 + $1.matches.count })
+
+        var originalOrder = 0
+        for entry in entries {
+            for match in entry.matches {
+                let normalized = match.collapsingInternalWhitespace.trimmed
+                defer { originalOrder += 1 }
+                guard !normalized.isEmpty else { continue }
+                guard let regex = Self.makeRegex(for: normalized) else { continue }
+                rules.append(
+                    LiveReplacementRule(
+                        regex: regex,
+                        replaceWith: entry.replaceWith,
+                        matchLength: normalized.count,
+                        foldedKeyWords: normalized
+                            .split(whereSeparator: \.isWhitespace)
+                            .map { String($0).caseFoldedForMatching },
+                        originalOrder: originalOrder
+                    )
+                )
+            }
+        }
+
+        rules.sort()
+        return rules
+    }
 
     func apply(to text: String) -> String {
         guard !entries.isEmpty, !text.isEmpty else { return text }
@@ -126,6 +176,42 @@ struct ReplacementDictionary: Equatable, Sendable {
     }
 }
 
+struct LiveReplacementRule: Comparable {
+    let regex: NSRegularExpression
+    let replaceWith: String
+    let matchLength: Int
+    /// The match key's whitespace-separated words, each fully case-folded.
+    ///
+    /// `makeRegex` escapes every key with `escapedPattern` and joins the words
+    /// with `\s+`, so a rule is a literal word list — no metacharacter ever
+    /// survives. `LiveHoldBackReplacementStream` prefix-matches these words to
+    /// decide how little text it can hold back. They are stored pre-folded
+    /// because the regex matches case-insensitively with FULL case folding,
+    /// which can change length (`ß` matches `ss`); comparing raw characters
+    /// would miss live prefixes and release text a correction still rewrites.
+    let foldedKeyWords: [String]
+    let originalOrder: Int
+
+    var wordCount: Int {
+        foldedKeyWords.count
+    }
+
+    static func == (lhs: LiveReplacementRule, rhs: LiveReplacementRule) -> Bool {
+        lhs.matchLength == rhs.matchLength
+            && lhs.foldedKeyWords == rhs.foldedKeyWords
+            && lhs.originalOrder == rhs.originalOrder
+            && lhs.replaceWith == rhs.replaceWith
+            && lhs.regex.pattern == rhs.regex.pattern
+    }
+
+    static func < (lhs: LiveReplacementRule, rhs: LiveReplacementRule) -> Bool {
+        if lhs.matchLength != rhs.matchLength {
+            return lhs.matchLength > rhs.matchLength
+        }
+        return lhs.originalOrder < rhs.originalOrder
+    }
+}
+
 struct LLMPromptTemplates: Equatable, Sendable {
     let systemContent: String
     let userContent: String
@@ -134,6 +220,14 @@ struct LLMPromptTemplates: Equatable, Sendable {
     private static let optionalUserPlaceholders = ["{{replacement_dictionary}}"]
     private static let userPromptPlaceholderPattern = #"\{\{[a-zA-Z0-9_]+\}\}"#
     private static let splitPlaceholders = ["{{replacement_dictionary}}", "{{input_text}}"]
+
+    /// True when the user template carries the OPTIONAL dictionary placeholder.
+    /// The placeholder is documented as removable; features that ride in that
+    /// slot (repo vocabulary) must check this BEFORE doing any work, because
+    /// `renderTemplate` silently drops the section when the slot is absent.
+    var supportsReplacementDictionary: Bool {
+        userContent.contains("{{replacement_dictionary}}")
+    }
 
     func renderedUserPrompt(
         inputText: String,
@@ -184,9 +278,25 @@ struct LLMPromptTemplates: Equatable, Sendable {
         inputText: String,
         replacementDictionary: String
     ) -> String {
-        template
-            .replacingOccurrences(of: "{{input_text}}", with: inputText)
+        var rendered = template
+        if replacementDictionary.isEmpty {
+            // An empty dictionary must not leave its template line behind as
+            // a hole of blank lines between the context blocks and `Working
+            // text:` (field report 2026-07-21). Drop the placeholder together
+            // with one following blank line when present, else with its own
+            // line; only a mid-line placeholder falls through to the bare
+            // replacement below.
+            rendered = rendered
+                .replacingOccurrences(of: "{{replacement_dictionary}}\n\n", with: "")
+                .replacingOccurrences(of: "{{replacement_dictionary}}\n", with: "")
+        }
+        // Dictionary before transcript: `inputText` is DICTATED CONTENT and may
+        // legitimately contain a placeholder literal (the user talking about
+        // this app). Substituting it last means nothing ever re-scans inserted
+        // transcript text; the dictionary is app-generated and placeholder-free.
+        return rendered
             .replacingOccurrences(of: "{{replacement_dictionary}}", with: replacementDictionary)
+            .replacingOccurrences(of: "{{input_text}}", with: inputText)
     }
 
     /// Index of the first placeholder in `userContent`. Content before this
@@ -279,6 +389,9 @@ struct AppConfigStore: AppConfigServing {
         case replacementDictionary
         case llmSystemPrompt
         case llmUserPrompt
+        case llmSystemPromptAgent
+        case llmUserPromptAgent
+        case terminalApps
 
         var fileName: String {
             switch self {
@@ -288,6 +401,12 @@ struct AppConfigStore: AppConfigServing {
                 return "llm_system_prompt.toml"
             case .llmUserPrompt:
                 return "llm_user_prompt.toml"
+            case .llmSystemPromptAgent:
+                return "llm_system_prompt_agent.toml"
+            case .llmUserPromptAgent:
+                return "llm_user_prompt_agent.toml"
+            case .terminalApps:
+                return "terminal_apps.toml"
             }
         }
 
@@ -299,15 +418,24 @@ struct AppConfigStore: AppConfigServing {
     private let fileManager: FileManager
     private let bundle: Bundle
     private let configDirectoryOverride: URL?
+    /// Seams for `reconcileBundledDefaults()`: tests inject a fixed clock for
+    /// deterministic backup names and a custom hash table to simulate old
+    /// shipped defaults without carrying their full content.
+    private let knownDefaultHashes: [String: Set<String>]
+    private let now: @Sendable () -> Date
 
     init(
         fileManager: FileManager = .default,
-        bundle: Bundle = .module,
-        configDirectoryOverride: URL? = nil
+        bundle: Bundle = .localvoxtralResources,
+        configDirectoryOverride: URL? = nil,
+        knownDefaultHashes: [String: Set<String>] = BundledConfigDefaultHistory.knownDefaultHashes,
+        now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.fileManager = fileManager
         self.bundle = bundle
         self.configDirectoryOverride = configDirectoryOverride
+        self.knownDefaultHashes = knownDefaultHashes
+        self.now = now
     }
 
     func configDirectoryURL() -> URL {
@@ -358,6 +486,68 @@ struct AppConfigStore: AppConfigServing {
             userPrompt = defaultTemplates.userContent
         }
         return LLMPromptTemplates(systemContent: systemPrompt, userContent: userPrompt)
+    }
+
+    /// Profile-aware prompt loader. `.standard` is byte-for-byte the existing
+    /// loader; `.agent` reads the agent files through the same load/validate
+    /// chain and falls back to the STANDARD templates on ANY failure, so a
+    /// corrupt, missing, or placeholder-invalid agent file never leaves polish
+    /// promptless.
+    func loadLLMPromptTemplates(profile: PolishPromptProfile) -> LLMPromptTemplates {
+        switch profile {
+        case .standard:
+            return loadLLMPromptTemplates()
+        case .agent:
+            return loadAgentPromptTemplates()
+        }
+    }
+
+    private func loadAgentPromptTemplates() -> LLMPromptTemplates {
+        let standardTemplates = loadLLMPromptTemplates()
+        do {
+            let systemPrompt = try loadAgentPromptContentStrict(file: .llmSystemPromptAgent)
+            let userPrompt = try loadAgentPromptContentStrict(file: .llmUserPromptAgent)
+            let candidate = LLMPromptTemplates(
+                systemContent: systemPrompt,
+                userContent: userPrompt
+            )
+            try candidate.validateUserTemplate(fileName: ConfigFile.llmUserPromptAgent.fileName)
+            return candidate
+        } catch {
+            Log.config.error(
+                "Agent prompt config fallback to standard templates: \(error.localizedDescription, privacy: .public)"
+            )
+            return standardTemplates
+        }
+    }
+
+    /// Reads an agent prompt file strictly: seeds the config dir from the
+    /// bundle if absent, then reads/parses the user file, throwing on any
+    /// failure (no silent bundled fallback) so `loadAgentPromptTemplates` can
+    /// fall back to the standard templates as the design requires.
+    private func loadAgentPromptContentStrict(file: ConfigFile) throws -> String {
+        ensureConfigFilesExist(at: resolvedConfigDirectoryURL())
+        let data = try Data(contentsOf: userConfigURL(for: file))
+        return try Self.parsePromptTemplate(data: data, fileName: file.fileName)
+    }
+
+    /// User-listed bundle IDs to treat as terminals, on top of
+    /// `TerminalTargetDetector`'s built-in allowlist. Any read/parse failure
+    /// falls back to an empty list (the built-in detection still applies).
+    func loadTerminalAppBundleIDs() -> [String] {
+        let file = ConfigFile.terminalApps
+        let url = userConfigURL(for: file)
+
+        do {
+            ensureConfigFilesExist(at: resolvedConfigDirectoryURL())
+            let data = try Data(contentsOf: url)
+            return try Self.parseTerminalApps(data: data, fileName: file.fileName)
+        } catch {
+            Log.config.error(
+                "Terminal apps config fallback to empty list: \(error.localizedDescription, privacy: .public)"
+            )
+            return []
+        }
     }
 
     private func loadPromptContent(file: ConfigFile, fallback: String) -> String {
@@ -589,6 +779,62 @@ struct AppConfigStore: AppConfigServing {
         return ReplacementDictionary(entries: entries)
     }
 
+    private static func parseTerminalApps(
+        data: Data,
+        fileName: String
+    ) throws -> [String] {
+        guard let text = String(data: data, encoding: .utf8) else {
+            throw AppConfigError.invalidFile(fileName: fileName, reason: "File is not valid UTF-8.")
+        }
+
+        let normalizedText = text.replacingOccurrences(of: "\r\n", with: "\n")
+        let rawLines = normalizedText.components(separatedBy: "\n")
+
+        var bundleIDs: [String]?
+        var lineIndex = 0
+
+        while lineIndex < rawLines.count {
+            let line = uncommented(rawLines[lineIndex]).trimmed
+            lineIndex += 1
+
+            guard !line.isEmpty else { continue }
+            guard bundleIDs == nil else {
+                throw AppConfigError.invalidFile(
+                    fileName: fileName,
+                    reason: "Only a single bundle_ids assignment is supported."
+                )
+            }
+
+            let components = line.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            guard components.count == 2, String(components[0]).trimmed == "bundle_ids" else {
+                throw AppConfigError.invalidFile(
+                    fileName: fileName,
+                    reason: "Expected `bundle_ids = [...]` near `\(line)`."
+                )
+            }
+
+            var value = String(components[1]).trimmed
+            while !hasBalancedSquareBrackets(in: value) {
+                guard lineIndex < rawLines.count else {
+                    throw AppConfigError.invalidFile(
+                        fileName: fileName,
+                        reason: "Unterminated bundle_ids array."
+                    )
+                }
+                value += "\n" + uncommented(rawLines[lineIndex]).trimmed
+                lineIndex += 1
+            }
+
+            bundleIDs = try parseStringArray(
+                value,
+                fileName: fileName,
+                fieldName: "bundle_ids"
+            ).map { $0.trimmed }.filter { !$0.isEmpty }
+        }
+
+        return bundleIDs ?? []
+    }
+
     private static func parsePromptTemplate(
         data: Data,
         fileName: String
@@ -680,6 +926,235 @@ struct AppConfigStore: AppConfigServing {
 
         return content
     }
+}
+
+// MARK: - Bundled defaults reconciliation
+
+/// `ensureConfigFilesExist` seeds bundled config files only when absent, so an
+/// existing install never picks up improved bundled defaults on its own. This
+/// extension closes that gap at launch: a user file whose content matches ANY
+/// default ever shipped (`BundledConfigDefaultHistory`) is an unedited stale
+/// seed and is refreshed in place; anything else is a customization and is
+/// only ever replaced through `adoptBundledDefaults` after the user agrees.
+/// A hidden sidecar in the config directory remembers which bundled version a
+/// "keep mine" decision applied to, so the user is asked once per default
+/// change, not once per launch.
+extension AppConfigStore {
+    private static let defaultsStateFileName = ".bundled-defaults-state.json"
+
+    private struct BundledDefaultsState: Codable {
+        /// fileName → bundled-default hash that has already been handled for
+        /// that file (seen in sync, silently refreshed to, adopted, or
+        /// declined). A file is reconsidered only when the current bundled
+        /// hash differs from this entry — which is also what lets a user
+        /// deliberately restore an OLD shipped default: the restore happens
+        /// after the current default was recorded as handled, so it sticks
+        /// instead of being silently re-refreshed on every launch.
+        var resolvedBundledHashes: [String: String] = [:]
+    }
+
+    func reconcileBundledDefaults() -> BundledDefaultsReconciliation {
+        let directory = resolvedConfigDirectoryURL()
+        ensureConfigFilesExist(at: directory)
+
+        var result = BundledDefaultsReconciliation()
+        var state = readBundledDefaultsState(in: directory)
+        var stateChanged = false
+
+        func markResolved(_ file: ConfigFile, hash: String) {
+            if state.resolvedBundledHashes[file.fileName] != hash {
+                state.resolvedBundledHashes[file.fileName] = hash
+                stateChanged = true
+            }
+        }
+
+        for file in ConfigFile.allCases {
+            // The replacement dictionary is the user's own rule set, not a
+            // tunable default — its format has never changed since shipping,
+            // and "updating" it would only swap the user's rules for the
+            // bundled samples. Never refresh it, never prompt for it.
+            if file == .replacementDictionary { continue }
+            guard let bundled = bundledConfigData(for: file) else { continue }
+            if state.resolvedBundledHashes[file.fileName] == bundled.hash { continue }
+            let userURL = directory.appendingPathComponent(file.fileName, isDirectory: false)
+            guard let userData = try? Data(contentsOf: userURL) else { continue }
+
+            let userHash = Self.sha256Hex(userData)
+            if userHash == bundled.hash {
+                markResolved(file, hash: bundled.hash)
+                continue
+            }
+
+            if knownDefaultHashes[file.fileName, default: []].contains(userHash) {
+                do {
+                    try bundled.data.write(to: userURL, options: .atomic)
+                    result.refreshedFileNames.append(file.fileName)
+                    markResolved(file, hash: bundled.hash)
+                    Log.config.notice(
+                        "Refreshed unedited default \(file.fileName, privacy: .public) to the current bundled version"
+                    )
+                } catch {
+                    Log.config.error(
+                        "Failed to refresh stale default \(file.fileName, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                    )
+                }
+                continue
+            }
+
+            result.customizedOutdatedFileNames.append(file.fileName)
+        }
+
+        if stateChanged {
+            writeBundledDefaultsState(state, in: directory)
+        }
+        return result
+    }
+
+    /// Replaces the named user config files with the current bundled defaults,
+    /// saving each existing file alongside as `<name>.backup-<timestamp>`.
+    /// Returns the backup file names that were created.
+    func adoptBundledDefaults(fileNames: [String]) -> [String] {
+        let directory = resolvedConfigDirectoryURL()
+        var state = readBundledDefaultsState(in: directory)
+        var stateChanged = false
+        var backupNames: [String] = []
+        let suffix = backupSuffix()
+
+        for file in ConfigFile.allCases where fileNames.contains(file.fileName) {
+            guard let bundled = bundledConfigData(for: file) else { continue }
+            let userURL = directory.appendingPathComponent(file.fileName, isDirectory: false)
+
+            do {
+                var backupName: String?
+                if fileManager.fileExists(atPath: userURL.path) {
+                    let name = availableBackupName(for: file.fileName, suffix: suffix, in: directory)
+                    try fileManager.copyItem(
+                        at: userURL,
+                        to: directory.appendingPathComponent(name, isDirectory: false)
+                    )
+                    backupName = name
+                }
+                try bundled.data.write(to: userURL, options: .atomic)
+                if let backupName {
+                    backupNames.append(backupName)
+                }
+                if state.resolvedBundledHashes[file.fileName] != bundled.hash {
+                    state.resolvedBundledHashes[file.fileName] = bundled.hash
+                    stateChanged = true
+                }
+                Log.config.notice(
+                    "Adopted new bundled default for \(file.fileName, privacy: .public)"
+                )
+            } catch {
+                Log.config.error(
+                    "Failed to adopt bundled default for \(file.fileName, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                )
+            }
+        }
+
+        if stateChanged {
+            writeBundledDefaultsState(state, in: directory)
+        }
+        return backupNames
+    }
+
+    /// Records that the user chose to keep their customized versions of the
+    /// named files for the CURRENTLY bundled defaults — no further prompt
+    /// until the bundled defaults change again.
+    func recordKeptCustomizedDefaults(fileNames: [String]) {
+        let directory = resolvedConfigDirectoryURL()
+        var state = readBundledDefaultsState(in: directory)
+        var stateChanged = false
+
+        for file in ConfigFile.allCases where fileNames.contains(file.fileName) {
+            guard let bundled = bundledConfigData(for: file) else { continue }
+            if state.resolvedBundledHashes[file.fileName] != bundled.hash {
+                state.resolvedBundledHashes[file.fileName] = bundled.hash
+                stateChanged = true
+            }
+        }
+
+        if stateChanged {
+            writeBundledDefaultsState(state, in: directory)
+        }
+    }
+
+    /// First `<fileName>.backup-<suffix>` name (with a `.2`, `.3`, … tiebreak)
+    /// that doesn't already exist, so repeated adoptions never destroy an
+    /// earlier backup.
+    private func availableBackupName(
+        for fileName: String,
+        suffix: String,
+        in directory: URL
+    ) -> String {
+        let base = "\(fileName).backup-\(suffix)"
+        var candidate = base
+        var counter = 2
+        while fileManager.fileExists(
+            atPath: directory.appendingPathComponent(candidate, isDirectory: false).path
+        ) {
+            candidate = "\(base).\(counter)"
+            counter += 1
+        }
+        return candidate
+    }
+
+    private func bundledConfigData(for file: ConfigFile) -> (data: Data, hash: String)? {
+        guard let url = bundledResourceURL(for: file),
+              let data = try? Data(contentsOf: url)
+        else { return nil }
+        return (data, Self.sha256Hex(data))
+    }
+
+    private func readBundledDefaultsState(in directory: URL) -> BundledDefaultsState {
+        let url = directory.appendingPathComponent(Self.defaultsStateFileName, isDirectory: false)
+        guard let data = try? Data(contentsOf: url),
+              let state = try? JSONDecoder().decode(BundledDefaultsState.self, from: data)
+        else {
+            return BundledDefaultsState()
+        }
+        return state
+    }
+
+    private func writeBundledDefaultsState(_ state: BundledDefaultsState, in directory: URL) {
+        let url = directory.appendingPathComponent(Self.defaultsStateFileName, isDirectory: false)
+        do {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            try encoder.encode(state).write(to: url, options: .atomic)
+        } catch {
+            Log.config.error(
+                "Failed to persist bundled-defaults state: \(error.localizedDescription, privacy: .public)"
+            )
+        }
+    }
+
+    private func backupSuffix() -> String {
+        let components = Calendar(identifier: .gregorian)
+            .dateComponents(in: TimeZone.current, from: now())
+        return String(
+            format: "%04d%02d%02d-%02d%02d%02d",
+            components.year ?? 0,
+            components.month ?? 0,
+            components.day ?? 0,
+            components.hour ?? 0,
+            components.minute ?? 0,
+            components.second ?? 0
+        )
+    }
+
+    static func sha256Hex(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    #if DEBUG
+    /// Test seam: the canonical config file list, so the
+    /// `BundledConfigDefaultHistory` guard-rail test can't drift from the
+    /// private `ConfigFile` enum when a new config file is added.
+    static var debugAllConfigFileNames: [String] {
+        ConfigFile.allCases.map(\.fileName)
+    }
+    #endif
 }
 
 private func uncommented(_ line: String) -> String {

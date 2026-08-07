@@ -54,21 +54,5 @@ final class TextInsertionServiceRealtimeInsertionTests: XCTestCase {
         XCTAssertEqual(observedPID, 123)
     }
 
-    func testPostBackspace_usesPreferredPIDAndCount() {
-        let service = TextInsertionService()
-        var observedCount = 0
-        var observedPID: pid_t?
-        service.debugConfigureInsertionHooks(
-            backspacePoster: { count, preferredPID in
-                observedCount = count
-                observedPID = preferredPID
-                return true
-            }
-        )
-
-        XCTAssertTrue(service.postBackspace(count: 9, preferredAppPID: 123))
-        XCTAssertEqual(observedCount, 9)
-        XCTAssertEqual(observedPID, 123)
-    }
 }
 #endif

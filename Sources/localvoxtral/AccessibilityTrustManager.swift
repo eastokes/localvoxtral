@@ -30,26 +30,56 @@ final class AccessibilityTrustManager {
     @ObservationIgnored private let now: DateProvider
     @ObservationIgnored private let pollingInterval: Duration
     @ObservationIgnored private let pollingTimeoutSeconds: TimeInterval
+    /// Test-only override of the trust verdict. When non-nil it is used in place
+    /// of `trustChecker()` so `refresh()` (called on the dictation-start path)
+    /// does not clobber the injected state. Always nil in release builds.
+    @ObservationIgnored private var debugTrustOverride: Bool?
+
+    /// Default live trust probe. Under XCTest it resolves to a fixed
+    /// `trusted` verdict: an unpinned live sample ties the unit suite to the
+    /// HOST's Accessibility grant for the test runner, and a runner
+    /// auto-update swaps its bundled node binary and silently invalidates
+    /// that grant (2026-07-24 red CI; same class as the locked-screen seams
+    /// pinned in TerminalTargetDetector, PR #122). Injected checkers and
+    /// `debugSetTrustOverride` still win.
+    nonisolated static func defaultTrustChecker() -> Bool {
+        #if DEBUG
+        if TerminalTargetDetector.isRunningUnderXCTest { return true }
+        #endif
+        return AXIsProcessTrusted()
+    }
+
+    /// Default live prompter. Pinned to a no-op under XCTest: on an
+    /// untrusted host the real `AXIsProcessTrustedWithOptions` prompt pops
+    /// an actual TCC dialog in the runner's GUI session on every unit run.
+    nonisolated static func defaultPermissionPrompter() {
+        #if DEBUG
+        if TerminalTargetDetector.isRunningUnderXCTest { return }
+        #endif
+        let options = ["AXTrustedCheckOptionPrompt": true] as CFDictionary
+        _ = AXIsProcessTrustedWithOptions(options)
+    }
+
+    nonisolated static func defaultPermissionResetter(bundleIdentifier: String) -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
+        process.arguments = ["reset", "Accessibility", bundleIdentifier]
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus == 0
+        } catch {
+            return false
+        }
+    }
 
     init(
-        trustChecker: @escaping TrustChecker = { AXIsProcessTrusted() },
-        permissionPrompter: @escaping PermissionPrompter = {
-            let options = ["AXTrustedCheckOptionPrompt" as CFString: true] as CFDictionary
-            _ = AXIsProcessTrustedWithOptions(options)
-        },
-        permissionResetter: @escaping PermissionResetter = { bundleIdentifier in
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
-            process.arguments = ["reset", "Accessibility", bundleIdentifier]
-
-            do {
-                try process.run()
-                process.waitUntilExit()
-                return process.terminationStatus == 0
-            } catch {
-                return false
-            }
-        },
+        trustChecker: @escaping TrustChecker = AccessibilityTrustManager.defaultTrustChecker,
+        permissionPrompter: @escaping PermissionPrompter =
+            AccessibilityTrustManager.defaultPermissionPrompter,
+        permissionResetter: @escaping PermissionResetter =
+            AccessibilityTrustManager.defaultPermissionResetter,
         sleepFor: @escaping SleepClosure = { duration in
             try? await Task.sleep(for: duration)
         },
@@ -68,7 +98,7 @@ final class AccessibilityTrustManager {
 
     func refresh() {
         let wasTrusted = isTrusted
-        let trusted = trustChecker()
+        let trusted = debugTrustOverride ?? trustChecker()
         if isTrusted != trusted {
             isTrusted = trusted
         }
@@ -91,23 +121,6 @@ final class AccessibilityTrustManager {
         refresh()
     }
 
-    @discardableResult
-    func resetPermission(bundleIdentifier: String? = Bundle.main.bundleIdentifier) -> Bool {
-        guard let bundleIdentifier, !bundleIdentifier.isEmpty else { return false }
-
-        pollingTask?.cancel()
-        pollingTask = nil
-        hasPromptedForPermission = false
-        hasShownError = false
-        if lastError == Self.errorMessage {
-            lastError = nil
-        }
-
-        let didReset = permissionResetter(bundleIdentifier)
-        refresh()
-        return didReset
-    }
-
     func promptIfNeeded() {
         refresh()
         guard !isTrusted else { return }
@@ -117,6 +130,25 @@ final class AccessibilityTrustManager {
         permissionPrompter()
         startPolling()
         refresh()
+    }
+
+    @discardableResult
+    func resetPermission(bundleIdentifier: String? = Bundle.main.bundleIdentifier) -> Bool {
+        guard let bundleIdentifier, !bundleIdentifier.isEmpty,
+              permissionResetter(bundleIdentifier)
+        else {
+            return false
+        }
+
+        pollingTask?.cancel()
+        pollingTask = nil
+        hasPromptedForPermission = false
+        hasShownError = false
+        if lastError == Self.errorMessage {
+            lastError = nil
+        }
+        refresh()
+        return true
     }
 
     func setErrorIfNeeded() {
@@ -162,3 +194,14 @@ final class AccessibilityTrustManager {
         }
     }
 }
+
+#if DEBUG
+extension AccessibilityTrustManager {
+    /// Forces the trust verdict for tests, surviving subsequent `refresh()`
+    /// calls. Pass `nil` to restore the real `trustChecker`.
+    func debugSetTrustOverride(_ value: Bool?) {
+        debugTrustOverride = value
+        refresh()
+    }
+}
+#endif

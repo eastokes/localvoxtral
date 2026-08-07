@@ -5,18 +5,23 @@ import Foundation
 /// Gathered here so related values are visible side-by-side and
 /// the rationale for each can be documented once.
 enum TimingConstants {
-    /// Target PCM sample rate for the audio pipeline (16 kHz mono).
-    static let audioSampleRateHz: Double = 16_000
-
     // MARK: - Audio Send Loop
 
     /// Interval at which buffered PCM chunks are drained and sent to the WebSocket.
     static let audioSendInterval: TimeInterval = 0.1
 
+    /// Fixed cadence for periodic realtime commits (was a user setting, removed).
+    static let commitInterval: TimeInterval = 0.9
+
     // MARK: - Connection
 
     /// How long to wait for a WebSocket to reach `.connected` before timing out.
     static let connectTimeout: TimeInterval = 1.0
+
+    /// Short grace after the app-level connect timeout fires before presenting
+    /// a timeout. This lets URLSession deliver a terminal socket error that
+    /// raced the timer, so refused ports are not mislabeled as silent timeouts.
+    static let connectTimeoutSocketErrorGrace: TimeInterval = 0.15
 
     /// Duration the "recent failure" indicator stays visible after a connection error.
     static let recentFailureIndicatorDuration: TimeInterval = 5.0
@@ -44,17 +49,8 @@ enum TimingConstants {
     /// visible overlay text update before committing/hiding.
     static let overlayFinalWordVisibilityMinimum: TimeInterval = 0.5
 
-    // MARK: - Stop Finalization (mlx-audio path)
-
-    /// Hard timeout for the stop-finalization phase on the mlx-audio path.
-    /// Longer than the Realtime API path because mlx inference on 6-12 s of
-    /// audio can take 5+ seconds.
-    static let mlxStopFinalizationTimeout: TimeInterval = 25.0
-
-    /// Duration of silence appended after the user stops speaking, giving
-    /// the mlx-audio server enough trailing context to finalize.
-    static let mlxTrailingSilenceDuration: TimeInterval = 1.6
-
-    /// Per-chunk duration for the trailing silence frames.
-    static let mlxTrailingSilenceChunkDuration: TimeInterval = 0.1
+    /// How long the overlay's secure-input clipboard-fallback message stays
+    /// readable before the panel dismisses itself (the text is already safe
+    /// on the clipboard, so the panel must not persist like a real failure).
+    static let overlayClipboardFallbackVisibility: TimeInterval = 4.0
 }

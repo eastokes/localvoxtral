@@ -1,3 +1,4 @@
+import Carbon.HIToolbox
 import Foundation
 import XCTest
 @testable import localvoxtral
@@ -30,8 +31,9 @@ final class DictationViewModelOverlayLifecycleTests: XCTestCase {
         XCTAssertTrue(viewModel.isLiveAutoPasteModeEnabled)
     }
 
-    func testBeginDictationSessionUsesRequestedOutputMode() {
-        let settings = makeSettings(outputMode: .overlayBuffer)
+    func testExplicitOutputModeSurvivesBeginDictationSession() async {
+        let settings = makeSettings(outputMode: .liveAutoPaste)
+        settings.realtimeAPIEndpointURL = "ws://127.0.0.1:1/realtime"
         let overlayCoordinator = MockOverlayCoordinator()
         let viewModel = DictationViewModel(
             settings: settings,
@@ -40,12 +42,13 @@ final class DictationViewModelOverlayLifecycleTests: XCTestCase {
         )
         retainForTestProcessLifetime(viewModel)
 
-        viewModel.requestedSessionOutputMode = .liveAutoPaste
+        await viewModel.beginDictationSession(outputMode: .overlayBuffer)
 
-        viewModel.beginDictationSession()
+        XCTAssertEqual(viewModel.sessionOutputMode, .overlayBuffer)
+        XCTAssertTrue(viewModel.isOverlayBufferModeEnabled)
+        XCTAssertFalse(viewModel.isLiveAutoPasteModeEnabled)
 
-        XCTAssertEqual(viewModel.sessionOutputMode, .liveAutoPaste)
-        XCTAssertNil(viewModel.requestedSessionOutputMode)
+        viewModel.abortConnectingSession()
     }
 
     func testStopWithoutFinalizationStillCommitsOverlayUsingLatchedSessionMode() {
@@ -118,12 +121,11 @@ final class DictationViewModelOverlayLifecycleTests: XCTestCase {
             session.invalidateAndCancel()
         }
 
-        viewModel.activeClientSource = .realtimeAPI
         viewModel.isFinalizingStop = true
         viewModel.sessionOutputMode = .overlayBuffer
         viewModel.realtimeAPIClient.debugPrimeConnectedStateForTesting(task: task)
 
-        viewModel.handle(event: .transcriptionFinalized, source: .realtimeAPI)
+        viewModel.handle(event: .transcriptionFinalized)
 
         let timeoutAt = Date().addingTimeInterval(1.0)
         while viewModel.isFinalizingStop, Date() < timeoutAt {
@@ -131,7 +133,6 @@ final class DictationViewModelOverlayLifecycleTests: XCTestCase {
         }
 
         XCTAssertFalse(viewModel.isFinalizingStop)
-        XCTAssertNil(viewModel.activeClientSource)
         XCTAssertEqual(viewModel.statusText, "Ready")
         XCTAssertEqual(overlayCoordinator.commitCallCount, 1)
         XCTAssertEqual(overlayCoordinator.dismissAfterHoldCallCount, 1)
@@ -177,7 +178,7 @@ final class DictationViewModelOverlayLifecycleTests: XCTestCase {
         XCTAssertNotNil(viewModel.lastError)
         XCTAssertTrue(
             viewModel.lastError?.contains(
-                "No connection response received in \(Int(TimingConstants.connectTimeout)) seconds"
+                "No connection response received in \(Self.formattedTimeout(TimingConstants.connectTimeout))"
             ) == true
         )
     }
@@ -193,24 +194,22 @@ final class DictationViewModelOverlayLifecycleTests: XCTestCase {
         )
         retainForTestProcessLifetime(viewModel)
 
-        viewModel.activeClientSource = .realtimeAPI
         viewModel.isConnectingRealtimeSession = true
         viewModel.statusText = "Connecting to realtime backend..."
         viewModel.debugSetPushToTalkShortcutStateForTesting(isHeld: true, hasActiveSession: true)
 
         viewModel.debugHandleDictationShortcutReleaseForTesting()
-        viewModel.handle(event: .connected, source: .realtimeAPI)
+        viewModel.handle(event: .connected)
 
         XCTAssertFalse(viewModel.isConnectingRealtimeSession)
         XCTAssertFalse(viewModel.isDictating)
-        XCTAssertNil(viewModel.activeClientSource)
         XCTAssertEqual(viewModel.statusText, "Ready")
         XCTAssertEqual(viewModel.realtimeSessionIndicatorState, .idle)
     }
 
-    func testSendNowCommandInsertsPartialTextAndDeletesFinalizedCommand() {
-        let settings = makeSettings(outputMode: .liveAutoPaste)
-        settings.sendNowCommandEnabled = true
+    func testModifierOnlyHoldReleaseBeforeConnectSkipsDictationStartOnConnectedEvent() {
+        let settings = makeSettings(outputMode: .overlayBuffer)
+        settings.modifierOnlyHotKeyEnabled = true
         let overlayCoordinator = MockOverlayCoordinator()
         let viewModel = DictationViewModel(
             settings: settings,
@@ -219,52 +218,37 @@ final class DictationViewModelOverlayLifecycleTests: XCTestCase {
         )
         retainForTestProcessLifetime(viewModel)
 
-        var keyboardInsertedTexts: [String] = []
-        var accessibilityInsertedTexts: [String] = []
-        var accessibilityPIDs: [pid_t?] = []
-        var backspaceCalls: [(count: Int, pid: pid_t?)] = []
-        var returnPIDs: [pid_t?] = []
-        viewModel.textInsertion.debugConfigureInsertionHooks(
-            unicodePoster: { text in
-                keyboardInsertedTexts.append(text)
-                return false
-            },
-            accessibilityInserter: { text, preferredPID in
-                accessibilityInsertedTexts.append(text)
-                accessibilityPIDs.append(preferredPID)
-                return true
-            },
-            returnKeyPoster: { preferredPID in
-                returnPIDs.append(preferredPID)
-                return true
-            },
-            backspacePoster: { count, preferredPID in
-                backspaceCalls.append((count: count, pid: preferredPID))
-                return true
-            }
-        )
-
         viewModel.sessionOutputMode = .liveAutoPaste
-        viewModel.activeClientSource = .realtimeAPI
-        viewModel.isDictating = true
-        viewModel.liveAutoPasteTargetAppPID = 123
-        viewModel.liveAutoPasteTargetAppBundleID = "com.mitchellh.ghostty"
+        viewModel.isConnectingRealtimeSession = true
+        viewModel.statusText = "Connecting to realtime backend..."
+        viewModel.debugSetPushToTalkShortcutStateForTesting(isHeld: true, hasActiveSession: true)
+        viewModel.debugSetModifierOnlyHoldStateForTesting(isActive: true)
 
-        viewModel.handle(event: .partialTranscript("show me the failing test send now"), source: .realtimeAPI)
-        viewModel.handle(event: .finalTranscript("show me the failing test send now"), source: .realtimeAPI)
+        viewModel.debugHandleDictationShortcutReleaseForTesting()
+        viewModel.handle(event: .connected)
 
-        XCTAssertEqual(keyboardInsertedTexts, ["show me the failing test send now"])
-        XCTAssertEqual(accessibilityInsertedTexts, ["show me the failing test send now"])
-        XCTAssertEqual(accessibilityPIDs.first ?? nil, 123)
-        XCTAssertEqual(backspaceCalls.first?.count, 9)
-        XCTAssertEqual(backspaceCalls.first?.pid ?? nil, 123)
-        XCTAssertEqual(returnPIDs.first ?? nil, 123)
-        XCTAssertFalse(viewModel.textInsertion.hasPendingInsertionText)
+        XCTAssertFalse(viewModel.isConnectingRealtimeSession)
+        XCTAssertFalse(viewModel.isDictating)
+        XCTAssertEqual(viewModel.statusText, "Ready")
+        XCTAssertEqual(viewModel.realtimeSessionIndicatorState, .idle)
     }
 
-    func testSendNowCommandSuppressesPunctuationDeltaAfterLiveSubmit() {
-        let settings = makeSettings(outputMode: .liveAutoPaste)
-        settings.sendNowCommandEnabled = true
+    func testNoHotKeysRegisteredWhenOverlayAndLiveShortcutsAreDisabled() {
+        HotKeyManager.debugResetOverridesForTesting()
+        HotKeyManager.debugForceHandlerInstallResultForTesting(true)
+        HotKeyManager.debugForceRegisterStatusForTesting(hotKeyID: .overlay, status: noErr)
+        defer {
+            HotKeyManager.debugResetOverridesForTesting()
+        }
+
+        let settings = makeSettings(outputMode: .overlayBuffer)
+        settings.setDictationShortcut(SettingsStore.defaultDictationShortcut)
+        settings.setOverlayBufferShortcut(nil)
+        settings.setLivePasteShortcut(nil)
+        // The subject is "no shortcuts left to register" — the modifier-only
+        // gesture is a trigger of its own (seeded on for fresh installs), so it
+        // has to be off too for there to be nothing to register.
+        settings.modifierOnlyHotKeyEnabled = false
         let overlayCoordinator = MockOverlayCoordinator()
         let viewModel = DictationViewModel(
             settings: settings,
@@ -273,85 +257,10 @@ final class DictationViewModelOverlayLifecycleTests: XCTestCase {
         )
         retainForTestProcessLifetime(viewModel)
 
-        var keyboardInsertedTexts: [String] = []
-        var accessibilityInsertedTexts: [String] = []
-        var backspaceCounts: [Int] = []
-        var returnPIDs: [pid_t?] = []
-        viewModel.textInsertion.debugConfigureInsertionHooks(
-            unicodePoster: { text in
-                keyboardInsertedTexts.append(text)
-                return false
-            },
-            accessibilityInserter: { text, _ in
-                accessibilityInsertedTexts.append(text)
-                return true
-            },
-            returnKeyPoster: { preferredPID in
-                returnPIDs.append(preferredPID)
-                return true
-            },
-            backspacePoster: { count, _ in
-                backspaceCounts.append(count)
-                return true
-            }
-        )
+        viewModel.applyHotKeySettingsChange()
 
-        viewModel.sessionOutputMode = .liveAutoPaste
-        viewModel.activeClientSource = .realtimeAPI
-        viewModel.isDictating = true
-        viewModel.liveAutoPasteTargetAppPID = 123
-        viewModel.liveAutoPasteTargetAppBundleID = "com.mitchellh.ghostty"
-
-        viewModel.handle(event: .partialTranscript("Send now"), source: .realtimeAPI)
-        viewModel.handle(event: .partialTranscript("."), source: .realtimeAPI)
-
-        XCTAssertEqual(keyboardInsertedTexts, ["Send now"])
-        XCTAssertEqual(accessibilityInsertedTexts, ["Send now"])
-        XCTAssertEqual(backspaceCounts, [8])
-        XCTAssertEqual(returnPIDs.first ?? nil, 123)
-        XCTAssertFalse(viewModel.textInsertion.hasPendingInsertionText)
-    }
-
-    func testSendNowCommandDoesNotTypeFinalTranscriptDuringStopFinalization() {
-        let settings = makeSettings(outputMode: .liveAutoPaste)
-        settings.sendNowCommandEnabled = true
-        let overlayCoordinator = MockOverlayCoordinator()
-        let viewModel = DictationViewModel(
-            settings: settings,
-            overlayBufferCoordinator: overlayCoordinator,
-            startRuntimeServices: false
-        )
-        retainForTestProcessLifetime(viewModel)
-
-        var keyboardInsertedTexts: [String] = []
-        var backspaceCounts: [Int] = []
-        var returnPIDs: [pid_t?] = []
-        viewModel.textInsertion.debugConfigureInsertionHooks(
-            unicodePoster: { text in
-                keyboardInsertedTexts.append(text)
-                return true
-            },
-            returnKeyPoster: { preferredPID in
-                returnPIDs.append(preferredPID)
-                return true
-            },
-            backspacePoster: { count, _ in
-                backspaceCounts.append(count)
-                return true
-            }
-        )
-
-        viewModel.sessionOutputMode = .liveAutoPaste
-        viewModel.activeClientSource = .realtimeAPI
-        viewModel.isFinalizingStop = true
-        viewModel.liveAutoPasteTargetAppPID = 123
-        viewModel.liveAutoPasteTargetAppBundleID = "com.mitchellh.ghostty"
-
-        viewModel.handle(event: .finalTranscript("already typed conversation send now"), source: .realtimeAPI)
-
-        XCTAssertTrue(keyboardInsertedTexts.isEmpty)
-        XCTAssertTrue(backspaceCounts.isEmpty)
-        XCTAssertTrue(returnPIDs.isEmpty)
+        XCTAssertEqual(viewModel.debugCurrentHotKeyRegistrationKindForTesting, .none)
+        XCTAssertNil(viewModel.lastError)
     }
 
     func testCancelPolishingForNewSessionIfNeededResetsFinalizationState() {
@@ -484,6 +393,183 @@ final class DictationViewModelOverlayLifecycleTests: XCTestCase {
         XCTAssertEqual(overlayCoordinator.refreshCalls.last?.commitText, "PostgreSQL for localvoxtral")
         XCTAssertEqual(overlayCoordinator.commitCallCount, 1)
         XCTAssertEqual(viewModel.statusText, "Ready")
+    }
+
+    func testOverlayStreamingReplacementUpdatesDisplayAtWordBoundary() {
+        let settings = makeSettings(outputMode: .overlayBuffer)
+        settings.replacementDictionaryEnabled = true
+        let overlayCoordinator = MockOverlayCoordinator()
+        let viewModel = DictationViewModel(
+            settings: settings,
+            overlayBufferCoordinator: overlayCoordinator,
+            startRuntimeServices: false
+        )
+        viewModel.appConfigStore = MockAppConfigStore(
+            replacementDictionary: ReplacementDictionary(entries: [
+                ReplacementEntry(replaceWith: "PostgreSQL", matches: ["postgres"]),
+            ])
+        )
+        retainForTestProcessLifetime(viewModel)
+
+        viewModel.sessionOutputMode = .overlayBuffer
+        viewModel.isDictating = true
+
+        viewModel.handle(event: .partialTranscript("post"))
+        viewModel.handle(event: .partialTranscript("gres "))
+
+        XCTAssertEqual(overlayCoordinator.refreshCalls.map(\.displayText), [
+            "post",
+            "PostgreSQL ",
+        ])
+        XCTAssertEqual(overlayCoordinator.refreshCalls.map(\.commitText), [
+            "post",
+            "PostgreSQL ",
+        ])
+        XCTAssertEqual(viewModel.pendingSegmentText, "postgres ")
+        XCTAssertEqual(viewModel.currentDictationEventText, "")
+    }
+
+    func testOverlayFinalizeDoesNotDoubleApplyStreamingReplacementAndSavesRawRecord() {
+        let settings = makeSettings(outputMode: .overlayBuffer)
+        settings.replacementDictionaryEnabled = true
+        let overlayCoordinator = MockOverlayCoordinator()
+        let viewModel = DictationViewModel(
+            settings: settings,
+            overlayBufferCoordinator: overlayCoordinator,
+            startRuntimeServices: false
+        )
+        viewModel.appConfigStore = MockAppConfigStore(
+            replacementDictionary: ReplacementDictionary(entries: [
+                ReplacementEntry(replaceWith: "bar", matches: ["foo"]),
+                ReplacementEntry(replaceWith: "baz", matches: ["bar"]),
+            ])
+        )
+        var savedRecord: DictationSessionRecord?
+        viewModel.debugSavedSessionRecordSink = { savedRecord = $0 }
+        retainForTestProcessLifetime(viewModel)
+
+        viewModel.sessionOutputMode = .overlayBuffer
+        viewModel.isDictating = true
+        viewModel.handle(event: .partialTranscript("foo "))
+        viewModel.handle(event: .finalTranscript("foo "))
+        viewModel.isDictating = false
+        viewModel.isFinalizingStop = true
+
+        viewModel.finishStoppedSession(promotePendingSegment: false)
+
+        XCTAssertEqual(overlayCoordinator.refreshCalls.last?.displayText, "bar")
+        XCTAssertEqual(overlayCoordinator.refreshCalls.last?.commitText, "bar")
+        XCTAssertEqual(viewModel.currentDictationEventText, "bar")
+        XCTAssertEqual(viewModel.transcriptText, "foo")
+        XCTAssertEqual(savedRecord?.rawText, "foo")
+        XCTAssertEqual(savedRecord?.polishedText, "bar")
+        XCTAssertEqual(overlayCoordinator.commitCallCount, 1)
+    }
+
+    // MARK: - F6: polished badge flag + raw-transcript copy affordance
+
+    /// Shared completion wait for the F6 tests (poll-with-deadline, matching
+    /// the file's existing pattern). Known debt: the whole file's completion
+    /// waiting is wall-clock polling rather than an injected clock — new tests
+    /// at least share one helper instead of inlining more copies.
+    private func waitUntilStoppedSessionCompletes(_ viewModel: DictationViewModel) async {
+        let deadline = ContinuousClock.now + .seconds(1)
+        while viewModel.isCompletingStoppedSession, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
+    func testPolishChangedCommitFlagsBadgeAndRetainsRawTranscript() async {
+        let settings = makeSettings(outputMode: .overlayBuffer)
+        settings.llmPolishingEnabled = true
+        settings.llmPolishingEndpointURL = "https://example.com/v1/chat/completions"
+
+        let overlayCoordinator = MockOverlayCoordinator()
+        let polishingService = CapturingMockLLMPolishingService(resultText: "Hello world.")
+        let viewModel = DictationViewModel(
+            settings: settings,
+            overlayBufferCoordinator: overlayCoordinator,
+            startRuntimeServices: false
+        )
+        viewModel.appConfigStore = MockAppConfigStore()
+        viewModel.llmPolishingService = polishingService
+        retainForTestProcessLifetime(viewModel)
+
+        viewModel.sessionOutputMode = .overlayBuffer
+        viewModel.isFinalizingStop = true
+        viewModel.currentDictationEventText = "hello world"
+
+        viewModel.finishStoppedSession(promotePendingSegment: false)
+
+        await waitUntilStoppedSessionCompletes(viewModel)
+
+        XCTAssertEqual(viewModel.currentDictationEventText, "Hello world.")
+        XCTAssertEqual(
+            overlayCoordinator.markPolishedCalls.last, true,
+            "the overlay must be told the polish changed the text so it shows the badge"
+        )
+        XCTAssertEqual(
+            viewModel.lastPolishChangedRawTranscript, "hello world",
+            "the RAW pre-polish transcript is retained for the popover copy affordance"
+        )
+        XCTAssertTrue(viewModel.canCopyRawTranscript)
+    }
+
+    func testUnchangedPolishOffersNoBadgeOrRawCopy() async {
+        let settings = makeSettings(outputMode: .overlayBuffer)
+        settings.llmPolishingEnabled = true
+        settings.llmPolishingEndpointURL = "https://example.com/v1/chat/completions"
+
+        let overlayCoordinator = MockOverlayCoordinator()
+        // The model returns the input verbatim — no visible change to annotate.
+        let polishingService = CapturingMockLLMPolishingService(resultText: "hello world")
+        let viewModel = DictationViewModel(
+            settings: settings,
+            overlayBufferCoordinator: overlayCoordinator,
+            startRuntimeServices: false
+        )
+        viewModel.appConfigStore = MockAppConfigStore()
+        viewModel.llmPolishingService = polishingService
+        // Seed a stale affordance to prove the unchanged commit clears it.
+        viewModel.lastPolishChangedRawTranscript = "stale raw"
+        retainForTestProcessLifetime(viewModel)
+
+        viewModel.sessionOutputMode = .overlayBuffer
+        viewModel.isFinalizingStop = true
+        viewModel.currentDictationEventText = "hello world"
+
+        viewModel.finishStoppedSession(promotePendingSegment: false)
+
+        await waitUntilStoppedSessionCompletes(viewModel)
+
+        XCTAssertEqual(overlayCoordinator.markPolishedCalls.last, false)
+        XCTAssertNil(viewModel.lastPolishChangedRawTranscript)
+        XCTAssertFalse(viewModel.canCopyRawTranscript)
+    }
+
+    func testCopyRawTranscriptWritesRawTextThroughPasteboardSeam() {
+        let settings = makeSettings(outputMode: .overlayBuffer)
+        let viewModel = DictationViewModel(
+            settings: settings,
+            overlayBufferCoordinator: MockOverlayCoordinator(),
+            startRuntimeServices: false
+        )
+        retainForTestProcessLifetime(viewModel)
+
+        var written: [String] = []
+        viewModel.debugPasteboardWriteOverride = { written.append($0) }
+
+        // Nothing retained: the action is a no-op and writes nothing.
+        XCTAssertFalse(viewModel.canCopyRawTranscript)
+        viewModel.copyRawTranscript()
+        XCTAssertTrue(written.isEmpty)
+
+        viewModel.lastPolishChangedRawTranscript = "the raw words"
+        XCTAssertTrue(viewModel.canCopyRawTranscript)
+        viewModel.copyRawTranscript()
+
+        XCTAssertEqual(written, ["the raw words"], "the RAW transcript is what lands on the clipboard")
+        XCTAssertEqual(viewModel.statusText, "Raw transcript copied.")
     }
 
     func testFinishStoppedSessionSendsReplacementDictionaryInLLMRequest() async {
@@ -631,6 +717,12 @@ final class DictationViewModelOverlayLifecycleTests: XCTestCase {
         settings.replacementDictionaryEnabled = true
         settings.llmPolishingEnabled = true
         settings.llmPolishingEndpointURL = "https://example.com/v1/chat/completions"
+        // Pin external mode so the configured endpoint above is the one the
+        // request is sent to (and therefore the one the failure names). Under
+        // managed mode this test used to pass only because the failure message
+        // wrongly named the unused external-URL setting — the exact field bug
+        // DictationViewModelPolishFailureDiagnosticsTests now covers.
+        settings.polishingBackendMode = .externalURL
 
         let overlayCoordinator = MockOverlayCoordinator()
         let polishingService = NetworkFailingMockLLMPolishingService()
@@ -673,6 +765,12 @@ final class DictationViewModelOverlayLifecycleTests: XCTestCase {
         let settings = makeSettings(outputMode: .overlayBuffer)
         settings.llmPolishingEnabled = true
         settings.llmPolishingEndpointURL = "not a url"
+        // This test exercises external-mode endpoint validation (an invalid
+        // URL surfaces a config error before polishing runs). Pin external
+        // mode so the configured endpoint is validated; managed mode ignores
+        // the user-typed endpoint and is covered at the SettingsStore level
+        // (testLLMPolishingConfiguration_managedLocal_*).
+        settings.polishingBackendMode = .externalURL
 
         let overlayCoordinator = MockOverlayCoordinator()
         let viewModel = DictationViewModel(
@@ -760,6 +858,230 @@ final class DictationViewModelOverlayLifecycleTests: XCTestCase {
         XCTAssertEqual(configStore.loadLLMPromptTemplatesCallCount, 1)
     }
 
+    func testUnexpectedDisconnectDuringDictationResetsEscapeCancelFlag() {
+        // Regression: an unexpected realtime disconnect while actively dictating
+        // tears down the session (sets isDictating = false). It must also stop
+        // EscapeCancelHandler; otherwise the Carbon hotkey stays registered and
+        // swallows Escape system-wide until the next session ends.
+        let settings = makeSettings(outputMode: .overlayBuffer)
+        let overlayCoordinator = MockOverlayCoordinator()
+        let viewModel = DictationViewModel(
+            settings: settings,
+            overlayBufferCoordinator: overlayCoordinator,
+            startRuntimeServices: false
+        )
+        retainForTestProcessLifetime(viewModel)
+
+        viewModel.isDictating = true
+        viewModel.sessionOutputMode = .overlayBuffer
+        viewModel.currentDictationEventText = "hello"
+        let stopCountBefore = EscapeCancelHandler.stopCallCount
+
+        viewModel.handle(event: .disconnected)
+
+        XCTAssertFalse(viewModel.isDictating)
+        XCTAssertGreaterThan(EscapeCancelHandler.stopCallCount, stopCountBefore)
+    }
+
+    // The Escape Carbon hotkey is armed in a single shared code path
+    // (startAudioCaptureAfterConnection) used by BOTH output modes and BOTH
+    // shortcut modes (push-to-talk and toggle all funnel through
+    // beginDictationSession -> connect -> startAudioCaptureAfterConnection).
+    // What can regress is therefore the DISARM: every session-teardown path
+    // must call escapeCancelHandler.stop(), otherwise Escape is swallowed
+    // system-wide while the Carbon hotkey remains registered. These cover each
+    // teardown path in both output modes.
+
+    func testStopDictationClearsEscapeCancelArmingInOverlayBufferMode() {
+        assertStopDictationClearsEscapeCancelArming(outputMode: .overlayBuffer)
+    }
+
+    func testStopDictationClearsEscapeCancelArmingInLiveAutoPasteMode() {
+        assertStopDictationClearsEscapeCancelArming(outputMode: .liveAutoPaste)
+    }
+
+    private func assertStopDictationClearsEscapeCancelArming(outputMode: DictationOutputMode) {
+        let settings = makeSettings(outputMode: outputMode)
+        let overlayCoordinator = MockOverlayCoordinator()
+        let viewModel = DictationViewModel(
+            settings: settings,
+            overlayBufferCoordinator: overlayCoordinator,
+            startRuntimeServices: false
+        )
+        retainForTestProcessLifetime(viewModel)
+
+        viewModel.isDictating = true
+        viewModel.sessionOutputMode = outputMode
+        let stopCountBefore = EscapeCancelHandler.stopCallCount
+
+        viewModel.stopDictation(reason: "test", finalizeRemainingAudio: false)
+
+        XCTAssertFalse(viewModel.isDictating)
+        XCTAssertGreaterThan(EscapeCancelHandler.stopCallCount, stopCountBefore,
+                             "escapeCancelHandler.stop() must run on session teardown in \(outputMode) mode")
+    }
+
+    func testCancelDictationClearsEscapeCancelArmingInOverlayBufferMode() {
+        assertCancelDictationClearsEscapeCancelArming(outputMode: .overlayBuffer)
+    }
+
+    func testCancelDictationClearsEscapeCancelArmingInLiveAutoPasteMode() {
+        assertCancelDictationClearsEscapeCancelArming(outputMode: .liveAutoPaste)
+    }
+
+    private func assertCancelDictationClearsEscapeCancelArming(outputMode: DictationOutputMode) {
+        let settings = makeSettings(outputMode: outputMode)
+        let overlayCoordinator = MockOverlayCoordinator()
+        let viewModel = DictationViewModel(
+            settings: settings,
+            overlayBufferCoordinator: overlayCoordinator,
+            startRuntimeServices: false
+        )
+        retainForTestProcessLifetime(viewModel)
+
+        viewModel.isDictating = true
+        viewModel.sessionOutputMode = outputMode
+        let stopCountBefore = EscapeCancelHandler.stopCallCount
+
+        viewModel.cancelDictation()
+
+        XCTAssertFalse(viewModel.isDictating)
+        XCTAssertGreaterThan(EscapeCancelHandler.stopCallCount, stopCountBefore,
+                             "escapeCancelHandler.stop() must run on cancel in \(outputMode) mode")
+    }
+
+    func testAbortConnectingSessionClearsEscapeCancelArming() {
+        // Escape is also armed-ready during the connecting phase: if the user
+        // cancels (or Escape fires) while connecting, the connecting-session
+        // teardown must still disarm so no stale armed state survives.
+        let settings = makeSettings(outputMode: .overlayBuffer)
+        let overlayCoordinator = MockOverlayCoordinator()
+        let viewModel = DictationViewModel(
+            settings: settings,
+            overlayBufferCoordinator: overlayCoordinator,
+            startRuntimeServices: false
+        )
+        retainForTestProcessLifetime(viewModel)
+
+        viewModel.isConnectingRealtimeSession = true
+        let stopCountBefore = EscapeCancelHandler.stopCallCount
+
+        viewModel.abortConnectingSession()
+
+        XCTAssertFalse(viewModel.isConnectingRealtimeSession)
+        XCTAssertGreaterThan(EscapeCancelHandler.stopCallCount, stopCountBefore)
+    }
+
+    func testCancelWhileConnectingDoesNotLeakCancellationIntoNextSession() {
+        // Cancelling during the connecting phase routes through
+        // abortConnectingSession(), which never reaches stopped-session cleanup.
+        // A leaked wasCancelled would make the NEXT session silently skip
+        // segment promotion and the overlay commit, losing that dictation.
+        let settings = makeSettings(outputMode: .overlayBuffer)
+        let overlayCoordinator = MockOverlayCoordinator()
+        let viewModel = DictationViewModel(
+            settings: settings,
+            overlayBufferCoordinator: overlayCoordinator,
+            startRuntimeServices: false
+        )
+        retainForTestProcessLifetime(viewModel)
+
+        viewModel.isConnectingRealtimeSession = true
+        viewModel.cancelDictation()
+        XCTAssertFalse(viewModel.wasCancelled)
+
+        // Next session: a normal stop must still promote and commit.
+        viewModel.sessionOutputMode = .overlayBuffer
+        viewModel.isFinalizingStop = true
+        viewModel.currentDictationEventText = "hello"
+        viewModel.pendingSegmentText = " world"
+
+        viewModel.finishStoppedSession(promotePendingSegment: true)
+
+        XCTAssertEqual(viewModel.currentDictationEventText, "hello\nworld")
+        XCTAssertEqual(overlayCoordinator.commitCallCount, 1)
+    }
+
+    func testCancelledOverlaySessionSkipsSegmentPromotionAndCommit() {
+        // A cancelled overlay session must not promote the pending segment into
+        // the buffer, must not commit/insert anything, and must reset the overlay
+        // immediately. Compare with testStopWithoutFinalizationStillCommitsOverlayUsingLatchedSessionMode
+        // (same setup minus wasCancelled), which commits.
+        let settings = makeSettings(outputMode: .overlayBuffer)
+        let overlayCoordinator = MockOverlayCoordinator()
+        let viewModel = DictationViewModel(
+            settings: settings,
+            overlayBufferCoordinator: overlayCoordinator,
+            startRuntimeServices: false
+        )
+        retainForTestProcessLifetime(viewModel)
+
+        viewModel.sessionOutputMode = .overlayBuffer
+        viewModel.isFinalizingStop = true
+        viewModel.currentDictationEventText = "hello"
+        viewModel.pendingSegmentText = " world"
+        viewModel.wasCancelled = true
+
+        viewModel.finishStoppedSession(promotePendingSegment: true)
+
+        // Segment promotion skipped: display text never refreshed/merged.
+        XCTAssertEqual(overlayCoordinator.refreshCalls.count, 0)
+        XCTAssertEqual(viewModel.currentDictationEventText, "hello")
+        // No insertion / commit, overlay torn down immediately.
+        XCTAssertEqual(overlayCoordinator.commitCallCount, 0)
+        XCTAssertEqual(overlayCoordinator.resetCallCount, 1)
+        XCTAssertEqual(viewModel.statusText, "Ready")
+        XCTAssertNil(viewModel.sessionOutputMode)
+    }
+
+    func testCancelDictationDuringActiveDictationStopsWithoutOverlayCommit() {
+        let settings = makeSettings(outputMode: .overlayBuffer)
+        let overlayCoordinator = MockOverlayCoordinator()
+        let viewModel = DictationViewModel(
+            settings: settings,
+            overlayBufferCoordinator: overlayCoordinator,
+            startRuntimeServices: false
+        )
+        retainForTestProcessLifetime(viewModel)
+
+        viewModel.sessionOutputMode = .overlayBuffer
+        viewModel.isDictating = true
+        viewModel.currentDictationEventText = "hello"
+        viewModel.pendingSegmentText = " world"
+
+        viewModel.cancelDictation()
+
+        // Cancellation routes through stopDictation(finalizeRemainingAudio: false),
+        // which finalizes immediately with wasCancelled = true.
+        XCTAssertFalse(viewModel.isDictating)
+        XCTAssertFalse(viewModel.isFinalizingStop)
+        XCTAssertEqual(overlayCoordinator.refreshCalls.count, 0)
+        XCTAssertEqual(overlayCoordinator.commitCallCount, 0)
+        XCTAssertEqual(overlayCoordinator.resetCallCount, 1)
+        XCTAssertEqual(viewModel.statusText, "Ready")
+    }
+
+    func testCancelDictationIsNoOpWhenNoSessionActive() {
+        let settings = makeSettings(outputMode: .overlayBuffer)
+        let overlayCoordinator = MockOverlayCoordinator()
+        let viewModel = DictationViewModel(
+            settings: settings,
+            overlayBufferCoordinator: overlayCoordinator,
+            startRuntimeServices: false
+        )
+        retainForTestProcessLifetime(viewModel)
+
+        viewModel.currentDictationEventText = "hello"
+
+        viewModel.cancelDictation()
+
+        // Guard rejects: nothing changed, no overlay churn.
+        XCTAssertFalse(viewModel.wasCancelled)
+        XCTAssertEqual(overlayCoordinator.resetCallCount, 0)
+        XCTAssertEqual(overlayCoordinator.commitCallCount, 0)
+        XCTAssertEqual(viewModel.currentDictationEventText, "hello")
+    }
+
     private func makeSettings(outputMode: DictationOutputMode) -> SettingsStore {
         let suiteName = "localvoxtral.DictationViewModelOverlayLifecycleTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
@@ -775,6 +1097,11 @@ final class DictationViewModelOverlayLifecycleTests: XCTestCase {
 
     private func retainForTestProcessLifetime(_ viewModel: DictationViewModel) {
         Self.retainedViewModels.append(viewModel)
+    }
+
+    private static func formattedTimeout(_ timeout: TimeInterval) -> String {
+        let seconds = max(1, Int(timeout.rounded()))
+        return "\(seconds) \(seconds == 1 ? "second" : "seconds")"
     }
 }
 
@@ -886,6 +1213,10 @@ private final class MockAppConfigStore: AppConfigServing {
         loadLLMPromptTemplatesCallCount += 1
         return promptTemplates
     }
+
+    func loadTerminalAppBundleIDs() -> [String] {
+        []
+    }
 }
 
 private struct BufferCall {
@@ -904,7 +1235,9 @@ private final class MockOverlayCoordinator: OverlayBufferSessionCoordinating {
     var dismissAfterHoldCallCount = 0
     var lastDismissAfterHoldMinimumVisibility: TimeInterval?
     var resetCallCount = 0
+    var captureLiveCommitTargetAppPIDCallCount = 0
     var commitTargetAppPID: pid_t? = nil
+    var markPolishedCalls: [Bool] = []
 
     func resolveAnchorNow() -> OverlayAnchor {
         OverlayAnchor(
@@ -944,5 +1277,13 @@ private final class MockOverlayCoordinator: OverlayBufferSessionCoordinating {
 
     func reset() {
         resetCallCount += 1
+    }
+
+    func captureLiveCommitTargetAppPID() {
+        captureLiveCommitTargetAppPIDCallCount += 1
+    }
+
+    func markPolished(_ polished: Bool) {
+        markPolishedCalls.append(polished)
     }
 }

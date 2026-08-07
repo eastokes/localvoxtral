@@ -4,15 +4,13 @@ import os
 extension DictationViewModel {
     // MARK: - Realtime Event Routing
 
-    func handle(event: RealtimeEvent, source: ActiveClientSource) {
-        guard source == activeClientSource else {
-            // During stop-finalization, be permissive with disconnect routing.
-            // Some backends can close on a different callback path than expected.
-            if isFinalizingStop, case .disconnected = event {
-                handleDisconnectedEvent()
-            }
-            return
-        }
+    func handle(event: RealtimeEvent) {
+        // Instrument the raw, pre-processing delta stream first. This is the
+        // single choke point where every realtime event arrives on the main
+        // actor; logging here captures exactly what the backend delivered
+        // before FirstChunkPreprocessor / merge / insertion touch it. No-op
+        // unless the hidden `debug.log_realtime_deltas` toggle is set.
+        logRawRealtimeEventIfEnabled(event)
 
         switch event {
         case .connected:
@@ -22,13 +20,11 @@ extension DictationViewModel {
         case .status(let message):
             handleStatusEvent(message)
         case .partialTranscript(let delta):
-            handlePartialTranscriptEvent(delta, source: source)
+            handlePartialTranscriptEvent(delta)
         case .finalTranscript(let text):
-            handleFinalTranscriptEvent(text, source: source)
-        case .transcriptionFinalized where source == .realtimeAPI:
-            handleTranscriptionFinalizedEvent()
+            handleFinalTranscriptEvent(text)
         case .transcriptionFinalized:
-            break
+            handleTranscriptionFinalizedEvent()
         case .error(let message):
             handleErrorEvent(message)
         }
@@ -57,12 +53,7 @@ extension DictationViewModel {
         cancelConnectTimeout()
         if isConnectingRealtimeSession {
             abortConnectingSession(disconnectSocket: false)
-            handleConnectFailure(
-                status: "Failed to connect.",
-                message: "Unable to establish realtime connection.",
-                technicalDetails: lastError?.trimmed.isEmpty == false
-                    ? lastError : nil
-            )
+            handleConnectFailure(reason: .socketError(message: lastSocketErrorMessage))
             return
         }
 
@@ -82,6 +73,7 @@ extension DictationViewModel {
         isAwaitingMicrophonePermission = false
         microphone.stop()
         isDictating = false
+        escapeCancelHandler.stop()
         finishStoppedSession(promotePendingSegment: true)
         let message = "Connection lost. Dictation stopped."
         statusText = message
@@ -118,71 +110,51 @@ extension DictationViewModel {
         }
     }
 
-    private func handlePartialTranscriptEvent(_ delta: String, source: ActiveClientSource) {
+    private func handlePartialTranscriptEvent(_ delta: String) {
         guard acceptsRealtimeEvents else { return }
         let processedDelta = preprocessIncomingTranscriptChunk(delta)
         guard !processedDelta.isEmpty else { return }
-        let sendNowTriggerPhrase = settings.effectiveSendNowTriggerPhrase
-        if source == .mlxAudio {
-            handleMlxPartialTranscript(processedDelta)
-            return
-        }
         if isFinalizingStop {
             realtimeFinalizationLastActivityAt = Date()
         }
 
         pendingSegmentText.append(processedDelta)
         livePartialText = pendingSegmentText
-        if isSendNowCommandActive,
-           shouldSuppressSendNowPostSubmitPunctuation(processedDelta)
-        {
-            pendingSegmentText = ""
-            livePartialText = ""
-            refreshOverlayBufferSession()
-            return
+        if isSendNowCommandActive {
+            sendNowReceivedPartialSinceLastFinal = true
         }
-
-        if isLiveAutoPasteModeEnabled {
+        if isLiveAutoPasteModeEnabled, !isSendNowCommandActive {
             textInsertion.enqueueRealtimeInsertion(processedDelta)
             if let accessibilityError = textInsertion.lastAccessibilityError {
                 lastError = accessibilityError
-            }
-            if isSendNowCommandActive,
-               handleSendNowPartialCommandIfNeeded(triggerPhrase: sendNowTriggerPhrase)
-            {
-                return
             }
         }
         statusText = isFinalizingStop ? "Finalizing..." : "Transcribing..."
         refreshOverlayBufferSession()
     }
 
-    private func handleFinalTranscriptEvent(_ text: String, source: ActiveClientSource) {
+    private func handleFinalTranscriptEvent(_ text: String) {
         guard acceptsRealtimeEvents else { return }
         let processedText = preprocessIncomingTranscriptChunk(text)
-        if source == .mlxAudio {
-            handleMlxFinalTranscript(processedText)
-            return
-        }
         if isFinalizingStop {
             realtimeFinalizationLastActivityAt = Date()
         }
 
         let finalizedSegment = resolvedFinalizedSegment(from: processedText)
-        let sendNowTriggerPhrase = settings.effectiveSendNowTriggerPhrase
-        let hadLiveDelta = !pendingSegmentText.trimmed.isEmpty
-            || !livePartialText.trimmed.isEmpty
-        if isSendNowCommandActive,
-           isDuplicateSendNowLiveSubmittedSegment(
-               finalizedSegment,
-               triggerPhrase: sendNowTriggerPhrase
-           )
-        {
-            livePartialText = ""
-            pendingSegmentText = ""
-            refreshOverlayBufferSession()
+        if isSendNowCommandActive {
+            handleSendNowFinalizedSegment(finalizedSegment)
             return
         }
+
+        let hadLiveDelta = !pendingSegmentText.trimmed.isEmpty
+            || !livePartialText.trimmed.isEmpty
+        // Text already typed into the field by the live partial path. Derived
+        // from the same state the `hadLiveDelta` guard reads (accumulated
+        // pending text, with live-partial text as fallback) so it cannot drift
+        // from a parallel bookkeeping. Captured before the reset below.
+        let liveInsertedText = pendingSegmentText.trimmed.isEmpty
+            ? livePartialText
+            : pendingSegmentText
         guard !finalizedSegment.isEmpty else {
             livePartialText = ""
             pendingSegmentText = ""
@@ -200,21 +172,23 @@ extension DictationViewModel {
         pendingSegmentText = ""
         statusText = activeStatusText
 
-        if isSendNowCommandActive {
-            guard !isFinalizingStop else {
-                if isLiveAutoPasteModeEnabled, settings.autoCopyEnabled {
-                    copyLatestSegment(updateStatus: false)
-                }
-                refreshOverlayBufferSession()
-                return
+        if isLiveAutoPasteModeEnabled {
+            if !hadLiveDelta {
+                // No partials were typed live: insert the whole segment.
+                textInsertion.enqueueRealtimeInsertion(finalizedSegment)
+            } else if let liveSuffix = TextMergingAlgorithms.livePasteExtensionSuffix(
+                finalText: processedText,
+                liveInsertedText: liveInsertedText
+            ) {
+                // Partials were already typed live and the final is a pure
+                // extension of them (e.g. a trailing "." that only arrived in
+                // the final): insert only the missing suffix so the trailing
+                // addition reaches the field without duplicating earlier text.
+                // When the final revises earlier content the helper returns nil
+                // and nothing is inserted — live mode cannot rewrite already
+                // typed text.
+                textInsertion.enqueueRealtimeInsertion(liveSuffix)
             }
-            handleSendNowFinalizedSegment(
-                finalizedSegment,
-                textAlreadyInserted: hadLiveDelta,
-                triggerPhrase: sendNowTriggerPhrase
-            )
-        } else if !hadLiveDelta, isLiveAutoPasteModeEnabled {
-            textInsertion.enqueueRealtimeInsertion(finalizedSegment)
             if let accessibilityError = textInsertion.lastAccessibilityError {
                 lastError = accessibilityError
             }
@@ -229,17 +203,18 @@ extension DictationViewModel {
     private func handleTranscriptionFinalizedEvent() {
         guard isFinalizingStop else { return }
         debugLog("transcription finalized, disconnecting")
-        activeRealtimeClient().disconnect()
+        realtimeAPIClient.disconnect()
     }
 
     private func handleErrorEvent(_ message: String) {
+        lastSocketErrorMessage = message
         if isConnectingRealtimeSession {
             abortConnectingSession()
-            handleConnectFailure(
-                status: "Failed to connect.",
-                message: "Unable to establish realtime connection.",
-                technicalDetails: message
-            )
+            handleConnectFailure(reason: .socketError(message: message))
+            return
+        }
+        if isResolvingConnectTimeout {
+            handleConnectFailure(reason: .socketError(message: message))
             return
         }
         if !acceptsRealtimeEvents {
@@ -256,109 +231,17 @@ extension DictationViewModel {
         Log.dictation.error("Realtime error: \(message, privacy: .public)")
     }
 
-    // MARK: - mlx-audio Transcript Handling
-
-    func handleMlxPartialTranscript(_ delta: String) {
-        let mergedHypothesis = TextMergingAlgorithms.normalizeTranscriptionFormatting(
-            delta.trimmed
-        )
-        guard !mergedHypothesis.isEmpty else { return }
-        let insertionMode: MlxInsertionMode =
-            isLiveAutoPasteModeEnabled ? .realtime : .none
-        let result = mlxStabilizer.commitHypothesis(
-            mergedHypothesis,
-            isFinal: false,
-            insertionMode: insertionMode
-        )
-        currentDictationEventText = mlxStabilizer.committedEventText
-        pendingSegmentText = result.unstableTail
-        livePartialText = result.unstableTail
-
-        if isLiveAutoPasteModeEnabled,
-            let accessibilityError = textInsertion.lastAccessibilityError
-        {
-            lastError = accessibilityError
-        }
-        statusText = isFinalizingStop ? "Finalizing..." : "Transcribing..."
-        refreshOverlayBufferSession()
-    }
-
-    func handleMlxFinalTranscript(_ text: String) {
-        let hypothesis = TextMergingAlgorithms.normalizeTranscriptionFormatting(
-            text.trimmed
-        )
-        guard !hypothesis.isEmpty else {
-            livePartialText = ""
-            pendingSegmentText = ""
-            mlxStabilizer.resetSegment()
-            return
-        }
-
-        let insertionMode: MlxInsertionMode
-        if isLiveAutoPasteModeEnabled {
-            insertionMode = isFinalizingStop ? .finalized : .realtime
-        } else {
-            insertionMode = .none
-        }
-
-        _ = mlxStabilizer.commitHypothesis(
-            hypothesis,
-            isFinal: true,
-            insertionMode: insertionMode
-        )
-        currentDictationEventText = mlxStabilizer.committedEventText
-
-        let finalizedDelta = mlxStabilizer.consumeCommittedSinceLastFinal().trimmed
-        if !finalizedDelta.isEmpty {
-            appendToTranscript(finalizedDelta)
-            if isSendNowCommandActive, !isFinalizingStop {
-                handleSendNowFinalizedSegment(
-                    finalizedDelta,
-                    textAlreadyInserted: true,
-                    triggerPhrase: settings.effectiveSendNowTriggerPhrase
-                )
-            }
-        }
-
-        lastFinalSegment = currentDictationEventText
-        livePartialText = ""
-        pendingSegmentText = ""
-        mlxStabilizer.resetSegment()
-        statusText = activeStatusText
-
-        if isLiveAutoPasteModeEnabled, settings.autoCopyEnabled {
-            copyLatestSegment(updateStatus: false)
-        }
-        refreshOverlayBufferSession()
-    }
-
     // MARK: - Segment Promotion
-
-    @discardableResult
-    func promotePendingMlxTextToLatestSegment() -> String? {
-        let promotion = mlxStabilizer.promotePendingText()
-        currentDictationEventText = mlxStabilizer.committedEventText
-
-        if !promotion.allCommitted.isEmpty {
-            appendToTranscript(promotion.allCommitted)
-        }
-
-        lastFinalSegment = currentDictationEventText
-        livePartialText = ""
-        pendingSegmentText = ""
-        mlxStabilizer.resetSegment()
-
-        if isLiveAutoPasteModeEnabled, settings.autoCopyEnabled {
-            copyLatestSegment(updateStatus: false)
-        }
-
-        return promotion.newlyPromotedTail
-    }
 
     @discardableResult
     func promotePendingRealtimeTextToLatestSegment() -> String? {
         let pendingSegment = resolvedFinalizedSegment(from: "")
         guard !pendingSegment.isEmpty else { return nil }
+
+        if isSendNowCommandActive {
+            handleSendNowFinalizedSegment(pendingSegment)
+            return pendingSegment
+        }
 
         currentDictationEventText = TextMergingAlgorithms.appendToCurrentDictationEvent(
             segment: pendingSegment,
@@ -375,163 +258,99 @@ extension DictationViewModel {
         return pendingSegment
     }
 
-    @discardableResult
-    func handleSendNowFinalizedSegment(
-        _ segment: String,
-        textAlreadyInserted: Bool = false,
-        triggerPhrase: String
-    ) -> Bool {
-        guard isSendNowCommandActive else { return false }
-        let preferredPID = liveAutoPasteTargetAppPID
-
-        switch SendNowCommandParser.parse(segment, triggerPhrase: triggerPhrase) {
-        case .none:
-            return true
-
-        case .insertText(let text):
-            if textAlreadyInserted {
-                return true
-            }
-            return insertSendNowText(text, preferredPID: preferredPID)
-
-        case .pressReturn(let deleteCharacterCount):
-            if textAlreadyInserted,
-               !deleteSendNowText(count: deleteCharacterCount, preferredPID: preferredPID)
-            {
-                return false
-            }
-            return postSendNowReturn(preferredPID: preferredPID)
-
-        case .insertTextAndPressReturn(let text, let deleteCharacterCount):
-            if textAlreadyInserted {
-                guard deleteSendNowText(count: deleteCharacterCount, preferredPID: preferredPID) else {
-                    return false
-                }
-            } else {
-                guard insertSendNowText(text, preferredPID: preferredPID) else { return false }
-            }
-            return postSendNowReturn(preferredPID: preferredPID)
-        }
-    }
-
-    private func handleSendNowPartialCommandIfNeeded(triggerPhrase: String) -> Bool {
-        let liveSegment = pendingSegmentText.trimmed
-        guard SendNowCommandParser.containsReturnCommand(liveSegment, triggerPhrase: triggerPhrase)
-        else {
-            return false
-        }
-
-        let action = SendNowCommandParser.parse(liveSegment, triggerPhrase: triggerPhrase)
-        let submittedText: String
-        switch action {
-        case .insertTextAndPressReturn(let text, _):
-            submittedText = text
-        case .pressReturn:
-            submittedText = ""
-        case .insertText, .none:
-            return false
-        }
-
-        guard handleSendNowFinalizedSegment(
-            liveSegment,
-            textAlreadyInserted: true,
-            triggerPhrase: triggerPhrase
-        ) else {
-            return false
-        }
-
-        if !submittedText.isEmpty {
-            appendToTranscript(submittedText)
-            currentDictationEventText = TextMergingAlgorithms.appendToCurrentDictationEvent(
-                segment: submittedText,
-                existingText: currentDictationEventText
-            )
-            lastFinalSegment = currentDictationEventText
-        }
-
-        lastSendNowLiveSubmittedSegment = liveSegment
-        livePartialText = ""
-        pendingSegmentText = ""
-        statusText = activeStatusText
-        refreshOverlayBufferSession()
-        return true
-    }
-
-    private func shouldSuppressSendNowPostSubmitPunctuation(_ delta: String) -> Bool {
-        guard lastSendNowLiveSubmittedSegment != nil else { return false }
-        let trimmed = delta.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return false }
-        return trimmed.unicodeScalars.allSatisfy {
-            CharacterSet(charactersIn: ".,;:!?").contains($0)
-        }
-    }
-
-    private func isDuplicateSendNowLiveSubmittedSegment(
-        _ segment: String,
-        triggerPhrase: String
-    ) -> Bool {
-        guard let lastSendNowLiveSubmittedSegment else { return false }
-        let normalizedTriggerPhrase = SendNowCommandParser.normalizedCommandText(triggerPhrase)
-        guard !normalizedTriggerPhrase.isEmpty else { return false }
-        let normalizedSegment = SendNowCommandParser.normalizedCommandText(segment)
-        let normalizedLastSubmitted = SendNowCommandParser.normalizedCommandText(
-            lastSendNowLiveSubmittedSegment
-        )
-        guard !normalizedSegment.isEmpty,
-               normalizedSegment == normalizedLastSubmitted
-        else {
-            return false
-        }
-        self.lastSendNowLiveSubmittedSegment = nil
-        return true
-    }
-
-    private func insertSendNowText(_ text: String, preferredPID: pid_t?) -> Bool {
-        let primaryResult = textInsertion.insertTextPrioritizingKeyboard(
-            text,
-            preferredAppPID: preferredPID
-        )
-        if primaryResult.isSuccess {
-            return true
-        }
-
-        if textInsertion.pasteUsingCommandV(text, preferredAppPID: preferredPID) {
-            return true
-        }
-
-        if let accessibilityError = textInsertion.lastAccessibilityError {
-            lastError = accessibilityError
-        } else {
-            lastError = "Unable to insert finalized text into \(activeSendNowTargetName)."
-        }
-        return false
-    }
-
-    private func deleteSendNowText(count: Int, preferredPID: pid_t?) -> Bool {
-        guard textInsertion.postBackspace(count: count, preferredAppPID: preferredPID) else {
-            lastError = "Unable to remove the trigger phrase from \(activeSendNowTargetName)."
-            return false
-        }
-        return true
-    }
-
-    private var activeSendNowTargetName: String {
-        guard let bundleID = liveAutoPasteTargetAppBundleID else {
-            return "the selected app"
-        }
-        return settings.sendNowTargetApp(for: bundleID)?.displayName
-            ?? "the selected app"
-    }
-
-    private func postSendNowReturn(preferredPID: pid_t?) -> Bool {
-        guard textInsertion.postReturnKey(preferredAppPID: preferredPID) else {
-            lastError = "Unable to send Return to \(activeSendNowTargetName)."
-            return false
-        }
-        return true
-    }
-
     // MARK: - Helpers
+
+    var isSendNowCommandActive: Bool {
+        guard sessionSendNowEnabled,
+              isLiveAutoPasteModeEnabled,
+              sessionTargetIsTerminalLike,
+              overlayBufferCoordinator.commitTargetAppPID != nil,
+              let bundleIdentifier = resolveTargetAppBundleID()
+        else {
+            return false
+        }
+
+        return sessionSendNowTargetApps.contains {
+            $0.bundleIdentifiers.contains(bundleIdentifier)
+        }
+    }
+
+    private func handleSendNowFinalizedSegment(_ segment: String) {
+        defer {
+            livePartialText = ""
+            pendingSegmentText = ""
+            statusText = activeStatusText
+            refreshOverlayBufferSession()
+        }
+
+        guard !segment.isEmpty else { return }
+        let action = SendNowCommandParser.parse(
+            segment,
+            triggerPhrase: sessionSendNowTriggerPhrase
+        )
+        let preferredPID = overlayBufferCoordinator.commitTargetAppPID
+        defer { sendNowReceivedPartialSinceLastFinal = false }
+
+        switch action {
+        case .none:
+            return
+        case .insertText(let text):
+            lastSendNowSubmittedSegment = nil
+            guard insertSendNowText(text) else { return }
+            recordSendNowText(text)
+        case .pressReturn:
+            let normalized = SendNowCommandParser.normalizedCommandText(segment)
+            guard sendNowReceivedPartialSinceLastFinal
+                    || normalized != lastSendNowSubmittedSegment
+            else {
+                return
+            }
+            // Latch before posting: if Return fails, a duplicate final must not
+            // retry a destructive action or reinsert the same prompt.
+            lastSendNowSubmittedSegment = normalized
+            guard textInsertion.postReturnKey(preferredAppPID: preferredPID) else {
+                lastError = "Unable to send Return to the selected terminal."
+                return
+            }
+        case .insertTextAndPressReturn(let text, _):
+            let normalized = SendNowCommandParser.normalizedCommandText(segment)
+            guard sendNowReceivedPartialSinceLastFinal
+                    || normalized != lastSendNowSubmittedSegment
+            else {
+                return
+            }
+            // Treat the finalized command as consumed before any irreversible
+            // insertion so backend duplicates cannot type or submit it twice.
+            lastSendNowSubmittedSegment = normalized
+            guard insertSendNowText(text) else { return }
+            recordSendNowText(text)
+            guard textInsertion.postReturnKey(preferredAppPID: preferredPID) else {
+                lastError = "Unable to send Return to the selected terminal."
+                return
+            }
+        }
+
+        if settings.autoCopyEnabled {
+            copyLatestSegment(updateStatus: false)
+        }
+    }
+
+    private func insertSendNowText(_ text: String) -> Bool {
+        guard textInsertion.insertFinalizedRealtimeText(text) else {
+            lastError = "Unable to insert finalized text into the selected terminal."
+            return false
+        }
+        return true
+    }
+
+    private func recordSendNowText(_ text: String) {
+        appendToTranscript(text)
+        currentDictationEventText = TextMergingAlgorithms.appendToCurrentDictationEvent(
+            segment: text,
+            existingText: currentDictationEventText
+        )
+        lastFinalSegment = currentDictationEventText
+    }
 
     /// Append a finalized segment to the running transcript.
     private func appendToTranscript(_ segment: String) {
@@ -551,6 +370,73 @@ extension DictationViewModel {
 
     private func preprocessIncomingTranscriptChunk(_ chunk: String) -> String {
         firstChunkPreprocessor.preprocess(chunk)
+    }
+
+    // MARK: - Raw Delta Logging (issue #13 instrumentation)
+
+    /// Emit the raw payload of every received realtime event to `Log.deltas`
+    /// (notice level) BEFORE any processing, when the hidden
+    /// `SettingsStore.debugLogRealtimeDeltas` toggle is on. Each event within
+    /// a session carries a monotonic `sequence` that resets when a new session
+    /// connects, so the arrival order of deltas is unambiguous in the log.
+    ///
+    /// Partial/final transcript payloads are logged via `.debugDescription` so
+    /// the exact characters — including any leading/trailing/inner whitespace
+    /// and the punctuation placement under investigation — are visible, and
+    /// marked `.public` (see `debugLogRealtimeDeltas` docs for the privacy
+    /// rationale). No-op when the toggle is off.
+    private func logRawRealtimeEventIfEnabled(_ event: RealtimeEvent) {
+        guard settings.debugLogRealtimeDeltas else { return }
+
+        // A new realtime session starts the per-session sequence over.
+        if case .connected = event {
+            realtimeDeltaLogSequence = 0
+        }
+
+        let sequence = realtimeDeltaLogSequence
+        realtimeDeltaLogSequence &+= 1
+
+        switch event {
+        case .connected:
+            Log.deltas.notice(
+                "[delta-log seq=\(sequence)] session boundary: connected")
+            emitDeltaLogRecord(.sessionConnected, sequence: sequence, payload: nil)
+        case .disconnected:
+            Log.deltas.notice(
+                "[delta-log seq=\(sequence)] session boundary: disconnected")
+            emitDeltaLogRecord(.sessionDisconnected, sequence: sequence, payload: nil)
+        case .partialTranscript(let delta):
+            Log.deltas.notice(
+                "[delta-log seq=\(sequence)] partial delta: \(delta.debugDescription, privacy: .public)")
+            emitDeltaLogRecord(.partialDelta, sequence: sequence, payload: delta)
+        case .finalTranscript(let text):
+            Log.deltas.notice(
+                "[delta-log seq=\(sequence)] final transcript: \(text.debugDescription, privacy: .public)")
+            emitDeltaLogRecord(.finalTranscript, sequence: sequence, payload: text)
+        case .status(let message):
+            Log.deltas.notice(
+                "[delta-log seq=\(sequence)] status: \(message, privacy: .public)")
+            emitDeltaLogRecord(.status, sequence: sequence, payload: message)
+        case .error(let message):
+            Log.deltas.notice(
+                "[delta-log seq=\(sequence)] error: \(message, privacy: .public)")
+            emitDeltaLogRecord(.error, sequence: sequence, payload: message)
+        case .transcriptionFinalized:
+            Log.deltas.notice(
+                "[delta-log seq=\(sequence)] transcription finalized")
+            emitDeltaLogRecord(.transcriptionFinalized, sequence: sequence, payload: nil)
+        }
+    }
+
+    /// Mirror the delta-log emission to the `#if DEBUG` test sink. Defined on
+    /// the main type (the sink is invoked inline from production code, like
+    /// `TextInsertionService`'s `debugUnicodePoster`), so no compile-time DEBUG
+    /// guard is needed here: the sink is nil in release builds.
+    private func emitDeltaLogRecord(
+        _ kind: DebugRealtimeDeltaLogRecord.Kind, sequence: Int, payload: String?
+    ) {
+        debugDeltaLogSink?(
+            DebugRealtimeDeltaLogRecord(kind: kind, sequence: sequence, payload: payload))
     }
 
     // MARK: - Finalized Segment Resolution
@@ -590,18 +476,36 @@ extension DictationViewModel {
     }
 
     func currentOverlayDisplayText() -> String {
-        OverlayBufferTextAssembler.displayText(
-            committedText: currentDictationEventText,
-            pendingText: pendingSegmentText,
-            fallbackPendingText: livePartialText
+        overlayStreamingCorrectedText(
+            OverlayBufferTextAssembler.displayText(
+                committedText: currentDictationEventText,
+                pendingText: pendingSegmentText,
+                fallbackPendingText: livePartialText
+            )
         )
     }
 
     func currentOverlayCommitText() -> String {
-        OverlayBufferTextAssembler.commitText(
-            committedText: currentDictationEventText,
-            pendingText: pendingSegmentText,
-            fallbackPendingText: livePartialText
+        overlayStreamingCorrectedText(
+            OverlayBufferTextAssembler.commitText(
+                committedText: currentDictationEventText,
+                pendingText: pendingSegmentText,
+                fallbackPendingText: livePartialText
+            )
+        )
+    }
+
+    private func overlayStreamingCorrectedText(_ text: String) -> String {
+        guard isOverlayBufferModeEnabled,
+              !isCompletingStoppedSession,
+              let dictionary = replacementDictionaryForCurrentSession()
+        else {
+            return text
+        }
+
+        return LiveReplacementCorrector.completedBoundaryCorrectedText(
+            text,
+            dictionary: dictionary
         )
     }
 }

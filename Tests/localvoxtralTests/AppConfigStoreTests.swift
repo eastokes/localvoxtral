@@ -35,10 +35,67 @@ final class AppConfigStoreTests: XCTestCase {
                 atPath: configDirectory.appendingPathComponent("llm_user_prompt.toml").path
             )
         )
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: configDirectory.appendingPathComponent("terminal_apps.toml").path
+            )
+        )
 
         let templates = store.loadLLMPromptTemplates()
         XCTAssertFalse(templates.systemContent.trimmed.isEmpty)
         XCTAssertFalse(templates.userContent.trimmed.isEmpty)
+        // Bundled terminal_apps template ships an empty list.
+        XCTAssertEqual(store.loadTerminalAppBundleIDs(), [])
+    }
+
+    func testTerminalAppsConfigParsesBundleIDs() throws {
+        let directory = makeTemporaryConfigDirectory()
+        try write(
+            """
+            # apps that embed a terminal
+            bundle_ids = [
+                "com.cmuxterm.app", # agent manager
+                "com.microsoft.VSCode",
+                "  ",
+            ]
+            """,
+            named: "terminal_apps.toml",
+            in: directory
+        )
+        let store = AppConfigStore(configDirectoryOverride: directory)
+
+        XCTAssertEqual(
+            store.loadTerminalAppBundleIDs(),
+            ["com.cmuxterm.app", "com.microsoft.VSCode"]
+        )
+    }
+
+    func testInvalidTerminalAppsConfigFallsBackToEmptyList() throws {
+        let directory = makeTemporaryConfigDirectory()
+        try write(
+            """
+            bundle_ids = ["com.cmuxterm.app"
+            """,
+            named: "terminal_apps.toml",
+            in: directory
+        )
+        let store = AppConfigStore(configDirectoryOverride: directory)
+
+        XCTAssertEqual(store.loadTerminalAppBundleIDs(), [])
+    }
+
+    func testTerminalAppsConfigRejectsUnsupportedKeys() throws {
+        let directory = makeTemporaryConfigDirectory()
+        try write(
+            """
+            apps = ["com.cmuxterm.app"]
+            """,
+            named: "terminal_apps.toml",
+            in: directory
+        )
+        let store = AppConfigStore(configDirectoryOverride: directory)
+
+        XCTAssertEqual(store.loadTerminalAppBundleIDs(), [])
     }
 
     func testInvalidReplacementDictionaryFallsBackToBundledDefault() throws {
@@ -143,6 +200,78 @@ final class AppConfigStoreTests: XCTestCase {
 
         XCTAssertEqual(templates.systemContent, "system override")
         XCTAssertEqual(templates.userContent, "User override:\n{{input_text}}\n")
+    }
+
+    // MARK: - Agent-profile prompt templates
+
+    func testAgentProfileSeedsAndLoadsAgentTemplatesFromBundle() throws {
+        let directory = makeTemporaryConfigDirectory()
+        let store = AppConfigStore(configDirectoryOverride: directory)
+
+        let agentTemplates = store.loadLLMPromptTemplates(profile: .agent)
+        let standardTemplates = store.loadLLMPromptTemplates()
+
+        // Bootstrapped the agent files alongside the standard ones.
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: directory.appendingPathComponent("llm_system_prompt_agent.toml").path
+            )
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: directory.appendingPathComponent("llm_user_prompt_agent.toml").path
+            )
+        )
+
+        // Agent templates are distinct from standard and carry agent duties.
+        XCTAssertNotEqual(agentTemplates.systemContent, standardTemplates.systemContent)
+        XCTAssertNotEqual(agentTemplates.userContent, standardTemplates.userContent)
+        XCTAssertTrue(agentTemplates.systemContent.contains("--"))
+        XCTAssertTrue(agentTemplates.userContent.contains("{{input_text}}"))
+    }
+
+    func testStandardProfileReturnsStandardTemplates() throws {
+        let directory = makeTemporaryConfigDirectory()
+        let store = AppConfigStore(configDirectoryOverride: directory)
+
+        XCTAssertEqual(
+            store.loadLLMPromptTemplates(profile: .standard),
+            store.loadLLMPromptTemplates()
+        )
+    }
+
+    func testCorruptAgentUserPromptFallsBackToStandardTemplates() throws {
+        let fallbackStore = AppConfigStore(configDirectoryOverride: makeTemporaryConfigDirectory())
+        let standardTemplates = fallbackStore.loadLLMPromptTemplates()
+
+        let directory = makeTemporaryConfigDirectory()
+        try write(
+            #"content = "unterminated"#,
+            named: "llm_user_prompt_agent.toml",
+            in: directory
+        )
+        let store = AppConfigStore(configDirectoryOverride: directory)
+
+        XCTAssertEqual(store.loadLLMPromptTemplates(profile: .agent), standardTemplates)
+    }
+
+    func testAgentUserPromptMissingInputTextFallsBackToStandardTemplates() throws {
+        let fallbackStore = AppConfigStore(configDirectoryOverride: makeTemporaryConfigDirectory())
+        let standardTemplates = fallbackStore.loadLLMPromptTemplates()
+
+        let directory = makeTemporaryConfigDirectory()
+        try write(
+            """
+            content = "Agent rules only: {{replacement_dictionary}}"
+            """,
+            named: "llm_user_prompt_agent.toml",
+            in: directory
+        )
+        let store = AppConfigStore(configDirectoryOverride: directory)
+
+        // Placeholder validation fails -> the whole agent profile falls back to
+        // standard (never leaves polish promptless).
+        XCTAssertEqual(store.loadLLMPromptTemplates(profile: .agent), standardTemplates)
     }
 
     func testReplacementDictionary_singleWordReplacement() throws {
@@ -293,6 +422,103 @@ final class AppConfigStoreTests: XCTestCase {
                 PostgreSQL rocks
                 """,
             ]
+        )
+    }
+
+    /// An EMPTY dictionary must not leave its template line behind as a hole
+    /// of blank lines between the context blocks and `Working text:` (field
+    /// report 2026-07-21: the rendered message began with two blank lines).
+    /// The placeholder and one following blank line vanish together; a
+    /// non-empty dictionary renders byte-identically to before.
+    func testEmptyReplacementDictionaryLeavesNoBlankHole() {
+        let templates = LLMPromptTemplates(
+            systemContent: "ignored",
+            userContent: """
+            Static guidance.
+
+            {{replacement_dictionary}}
+
+            Working text:
+            {{input_text}}
+
+            Return only the final corrected text.
+            """
+        )
+
+        let rendered = templates.renderedUserPrompts(
+            inputText: "hello world",
+            replacementDictionary: ""
+        )
+
+        XCTAssertEqual(
+            rendered,
+            [
+                "Static guidance.\n\n",
+                """
+                Working text:
+                hello world
+
+                Return only the final corrected text.
+                """,
+            ]
+        )
+
+        let withDictionary = templates.renderedUserPrompts(
+            inputText: "hello world",
+            replacementDictionary: "Replacement dictionary:\n- PostgreSQL: postgres"
+        )
+        XCTAssertEqual(
+            withDictionary[1],
+            """
+            Replacement dictionary:
+            - PostgreSQL: postgres
+
+            Working text:
+            hello world
+
+            Return only the final corrected text.
+            """
+        )
+    }
+
+    /// The own-line-without-blank shape: the placeholder's line vanishes too,
+    /// not just the placeholder text (review finding on the first cut, whose
+    /// comment wrongly claimed the bare replacement covered this).
+    func testEmptyDictionaryOnItsOwnLineWithoutBlankAlsoLeavesNoHole() {
+        let templates = LLMPromptTemplates(
+            systemContent: "ignored",
+            userContent: "Guidance.\n{{replacement_dictionary}}\nWorking text:\n{{input_text}}"
+        )
+        let rendered = templates.renderedUserPrompts(
+            inputText: "hello",
+            replacementDictionary: ""
+        )
+        XCTAssertEqual(rendered.last, "Working text:\nhello")
+    }
+
+    /// The transcript is DICTATED CONTENT: a user talking about this app can
+    /// legitimately say the placeholder literal, and substitution must never
+    /// re-scan inserted transcript text (dictionary renders before input).
+    func testDictatedPlaceholderLiteralSurvivesRendering() {
+        let templates = LLMPromptTemplates(
+            systemContent: "ignored",
+            userContent: "{{replacement_dictionary}}\n\nWorking text:\n{{input_text}}"
+        )
+        let empty = templates.renderedUserPrompts(
+            inputText: "the slot is {{replacement_dictionary}} in the template",
+            replacementDictionary: ""
+        )
+        XCTAssertEqual(
+            empty.last,
+            "Working text:\nthe slot is {{replacement_dictionary}} in the template"
+        )
+        let full = templates.renderedUserPrompts(
+            inputText: "the slot is {{replacement_dictionary}} in the template",
+            replacementDictionary: "Replacement dictionary:\n- a: b"
+        )
+        XCTAssertEqual(
+            full.last,
+            "Replacement dictionary:\n- a: b\n\nWorking text:\nthe slot is {{replacement_dictionary}} in the template"
         )
     }
 

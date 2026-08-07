@@ -66,6 +66,40 @@ Then:
    - `Package.swift` and `Package.resolved` dependency changes.
    - `mise.toml`, `scripts/`, and `.github/workflows/` build, packaging, release, and installation behavior.
 6. Review incoming scripts, workflow permissions, dependency changes, network endpoints, and credential handling for security implications.
+7. Perform the model recommendation review below before deciding how to merge model, backend, settings, or packaging changes.
+
+### Model recommendation review
+
+Model changes can alter quality, latency, memory use, downloads, compatibility, and supply-chain exposure even when they merge without conflicts. Review them explicitly rather than treating catalog or pin updates as ordinary implementation details.
+
+Inspect model-related commits and effective changes on both sides, including renamed or newly introduced equivalents of:
+
+- `Sources/localvoxtral/Backends/SpeechModelCatalog.swift`
+- `Sources/localvoxtral/Backends/PolishModelCatalog.swift`
+- `Sources/localvoxtral/SettingsStore.swift`
+- `SpeechHelper/Package.swift` and `SpeechHelper/Package.resolved`
+- `PolishHelper/Package.swift` and `PolishHelper/Package.resolved`
+- model download, backend launch, packaging, documentation, and evaluation files
+
+For each speech or polishing model changed or introduced:
+
+1. Record its repository/model ID, exact revision or other immutable pin, display name, quantization, estimated disk/RAM requirements, and whether it is the upstream default, an alternative, or removed.
+2. Summarize upstream's stated reason for recommending it, including relevant evaluation results, performance claims, compatibility fixes, or hardware guidance. Distinguish measured evidence from comments or unverified claims.
+3. Compare the upstream recommendation with the personal branch's source-controlled defaults and choices. Do not inspect or modify live `UserDefaults`, Hugging Face caches, or other state outside the repository.
+4. Determine upgrade behavior from the code: whether an existing managed-model selection remains selected, whether only fresh installs adopt the new default, whether a migration rewrites persisted settings, and whether external URL/model configuration is unaffected.
+5. Review dependency and model pins for immutability and provenance. Flag floating branches, tags, unpinned model revisions, changed download hosts, missing lockfile changes, or a model that requires a helper/runtime revision not included in the same merge.
+6. Confirm packaging includes every helper and resource needed by the recommended models, and run model-focused tests or packaging validation when available.
+7. Do not silently change a personal model selection merely because upstream changed its default. Preserve explicit personal choices unless incompatibility requires a change; report that incompatibility and the available alternatives before proceeding.
+
+The analysis and final report must contain a **Model recommendations** section, even when no recommendation changed. State:
+
+- previous personal/source-controlled default or choice;
+- incoming upstream default and alternatives;
+- exact pin changes;
+- expected effect on existing versus fresh installs;
+- evidence or rationale for the recommendation;
+- any decision made during conflict resolution;
+- remaining manual comparison worth doing on the user's Mac.
 
 If `HEAD..upstream/main` contains no commits, report that the fork is already current and stop without creating a backup branch or merge commit.
 
@@ -140,6 +174,7 @@ Provide a concise report containing:
 - Upstream commits incorporated and a short impact summary.
 - Files changed on both sides and how any conflicts were resolved.
 - How key personal behaviors were preserved or adapted.
+- A **Model recommendations** section with defaults, alternatives, exact pins, migration effects, upstream rationale, and any personal-selection decision.
 - Tests and validation commands run, with outcomes.
 - Security findings, remaining uncertainties, and manual checks worth performing in the macOS app.
 - Final `git status` and whether anything was pushed (normally: no).

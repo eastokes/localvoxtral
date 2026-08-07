@@ -1,0 +1,162 @@
+name: Agent Dictation E2E Eval
+
+# The wide agent-dictation eval (owner decision 2026-07-11): nightly + manual
+# only, NEVER per-PR — it runs live TTS -> speechd ASR -> polishd inference
+# over the ~160-case EvalCorpus/agent-dictation corpus and takes many minutes.
+# The operator-only human-WAV baseline uses remote-build.sh's optional
+# recording-set argument; CI intentionally keeps the repeatable TTS source.
+# Required cases (the 7 migrated punctuation cases) assert individually;
+# everything else is XFAIL-tracked on the scoreboard. Local equivalent:
+# ./scripts/remote-build.sh eval-e2e (after `package`).
+on:
+  workflow_dispatch:
+  schedule:
+    # Nightly. ui-smoke moved to an evening lock-aware ladder (18:00–21:00
+    # UTC), so 04:45 no longer needs to dodge it — kept overnight because
+    # this lane needs no GUI session and the machine is idle then.
+    - cron: "45 4 * * *"
+
+concurrency:
+  group: eval-e2e
+  cancel-in-progress: false
+
+jobs:
+  eval-e2e:
+    # Self-hosted only, and there is no pull_request trigger above — fork code
+    # must never reach this runner (same invariant as ci.yml/ui-smoke.yml).
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Keep gitignored build state between runs on the persistent
+          # self-hosted runner (same rationale as ci.yml: default git clean
+          # would force a cold MLX C++ + Metal helper rebuild every night).
+          clean: false
+
+      - name: Decide whether this scheduled run proceeds (AC power probe)
+        # Enforced for schedule events only: workflow_dispatch is explicit
+        # operator intent and always runs. The runner is the owner's personal
+        # MacBook — the nightly must not drain the battery when the machine
+        # is unplugged (owner request, 2026-07-24). The decision logic lives
+        # in scripts/ci/ac-power-guard.sh (kept out of the workflow so it is
+        # testable — test-ac-power-guard.sh runs in ci.yml's shell-test
+        # step); it fails OPEN on probe errors so a broken probe can never
+        # silently disable the lane.
+        id: guard
+        if: github.event_name == 'schedule'
+        run: |
+          set -euo pipefail
+          DECISION="$(./scripts/ci/ac-power-guard.sh)"
+          echo "$DECISION" >> "$GITHUB_OUTPUT"
+          REASON="$(sed -n 's/^reason=//p' <<<"$DECISION")"
+          if [[ "$(sed -n 's/^run=//p' <<<"$DECISION")" == "true" ]]; then
+            echo "E2E eval nightly: RUNNING ($REASON)" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "E2E eval nightly: SKIPPED ($REASON)" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Clean stale outputs (keep build caches)
+        # Shared repair-and-clean for the persistent workspace (see the
+        # script for the removal list and .build.smoke-hidden rationale).
+        #
+        # The guard condition compares `!= 'false'` (not `== 'true'`) so a
+        # missing output fails OPEN: if the guard ever exits 0 without
+        # emitting run=..., the eval runs rather than every nightly silently
+        # skipping green forever (same pattern as ui-smoke.yml). Same
+        # condition on every step below.
+        if: github.event_name != 'schedule' || steps.guard.outputs.run != 'false'
+        run: ./scripts/ci/clean-stale-outputs.sh
+
+      - name: Ensure Metal toolchain
+        # Same probe as ci.yml: `xcrun --find metal` succeeding does NOT mean
+        # the component is installed; only invoking metal proves it.
+        if: github.event_name != 'schedule' || steps.guard.outputs.run != 'false'
+        run: |
+          if ! xcrun metal --version >/dev/null 2>&1; then
+            echo "Metal toolchain not active for $(whoami); installing component..."
+            for attempt in 1 2 3; do
+              xcodebuild -downloadComponent MetalToolchain && break
+              echo "catalog fetch failed (attempt $attempt); retrying in 10s..."
+              sleep 10
+            done
+            xcrun metal --version
+          fi
+
+      - name: Package app bundle (builds the polishing helper)
+        if: github.event_name != 'schedule' || steps.guard.outputs.run != 'false'
+        env:
+          LOCALVOXTRAL_CODESIGN_IDENTITY: localvoxtral-dev
+        run: ./scripts/package_app.sh release
+
+      - name: Warm on-demand speechd server
+        # Launch-on-demand infra (scripts/mac/lv-test-servers.sh): touch the
+        # trigger and block until port 8000 is healthy. `ensure speechd` works
+        # against either the retired voxmlx plist or the swapped-in speechd plist.
+        # Best-effort during rollout (a warm timeout must not mask the eval) —
+        # the eval itself fails loudly if the STT service is really down.
+        if: github.event_name != 'schedule' || steps.guard.outputs.run != 'false'
+        continue-on-error: true
+        run: |
+          if [ -d /Users/Shared/localvoxtral/run ]; then
+            ./scripts/mac/lv-test-servers.sh ensure speechd
+          else
+            echo "on-demand infra not installed (run dir absent) — relying on the" \
+                 "resident STT service; see scripts/mac/README.md to enable on-demand."
+          fi
+
+      - name: Run agent-dictation E2E eval
+        if: github.event_name != 'schedule' || steps.guard.outputs.run != 'false'
+        env:
+          LV_AGENT_EVAL_E2E_ENABLE: "1"
+          LV_AGENT_EVAL_E2E_HELPER_PATH: PolishHelper/.build/xcode/Build/Products/Release/localvoxtral-polishd
+          LV_AGENT_EVAL_E2E_ASR_MODEL: T0mSIlver/Voxtral-Mini-4B-Realtime-2602-4bit-qhead
+        run: |
+          mkdir -p logs
+          set -o pipefail
+          # --enable-code-coverage matches ci.yml's build flags in the SHARED
+          # .build (clean: false): without it this nightly rebuilt the whole
+          # app+test module uninstrumented, and the next morning's ci.yml
+          # unit step rebuilt it back — the same flag-flip PR #157 fixed
+          # inside ci.yml (PR #157 review finding).
+          swift test --filter AgentDictationE2EEvalTests --enable-code-coverage 2>&1 | tee logs/eval-e2e.log
+
+      - name: Scoreboard to step summary
+        # Extract the section between the scoreboard markers (kept in sync
+        # with AgentDictationE2EEvalSupport.scoreboardBeginMarker/EndMarker).
+        # `always() &&` keeps the scoreboard on eval failure but stays quiet
+        # on a guard-skipped nightly ("no eval log produced" would read as a
+        # failure there). Same on the two steps below.
+        if: always() && (github.event_name != 'schedule' || steps.guard.outputs.run != 'false')
+        run: |
+          if [[ -f logs/eval-e2e.log ]]; then
+            {
+              echo '```'
+              awk '/^== agent-dictation E2E eval scoreboard ==/{flag=1} flag{print} /^== end agent-dictation E2E eval scoreboard ==/{flag=0}' logs/eval-e2e.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "no eval log produced" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload eval log (scoreboard artifact)
+        if: always() && (github.event_name != 'schedule' || steps.guard.outputs.run != 'false')
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-e2e-scoreboard
+          path: logs/eval-e2e.log
+          retention-days: 30
+
+      - name: Process leak check (informational)
+        if: always() && (github.event_name != 'schedule' || steps.guard.outputs.run != 'false')
+        run: |
+          survivors="$(ps -axo pid,etime,ucomm \
+            | grep -iE 'localvoxtral|polishd|xctest|swiftpm-testing|XCBBuildService' \
+            | grep -v grep || true)"
+          if [[ -n "$survivors" ]]; then
+            echo "candidate processes still alive at job end:"
+            echo "$survivors"
+          else
+            echo "no candidate processes alive at job end"
+          fi

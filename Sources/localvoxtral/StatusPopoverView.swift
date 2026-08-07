@@ -1,8 +1,38 @@
 import AppKit
 import SwiftUI
 
+struct StatusPopoverConnectionFailurePresenter {
+    static func detail(statusText: String, lastError: String?, endpoint: String) -> String? {
+        guard isConnectionFailureStatus(statusText) else { return nil }
+        if statusText != "Invalid endpoint URL.",
+           lastError?.contains(endpoint) != true
+        {
+            return nil
+        }
+        return "Endpoint: \(endpoint)"
+    }
+
+    private static func isConnectionFailureStatus(_ statusText: String) -> Bool {
+        switch statusText {
+        case "Invalid endpoint URL.",
+             "Connection refused.",
+             "Host unreachable.",
+             "Connection timed out.",
+             "Endpoint path rejected.",
+             "Network lost. Dictation stopped.",
+             "Connection failed.":
+            return true
+        default:
+            return false
+        }
+    }
+}
+
 struct StatusPopoverView: View {
+    private static let contentWidth: CGFloat = 280
+
     @Environment(\.openSettings) private var openSettings
+    @State private var isConfirmingAccessibilityReset = false
 
     var viewModel: DictationViewModel
 
@@ -18,6 +48,28 @@ struct StatusPopoverView: View {
             return "Connecting..."
         }
         return viewModel.isDictating ? "Stop Dictation" : "Start Dictation"
+    }
+
+    private var connectionFailureDetail: String? {
+        StatusPopoverConnectionFailurePresenter.detail(
+            statusText: viewModel.statusText,
+            lastError: viewModel.lastError,
+            endpoint: sanitizedRealtimeEndpointDescription
+        )
+    }
+
+    private var sanitizedRealtimeEndpointDescription: String {
+        guard let endpoint = viewModel.settings.resolvedWebSocketURL(for: viewModel.settings.realtimeProvider) else {
+            return "<invalid endpoint>"
+        }
+        guard var components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false) else {
+            return endpoint.absoluteString
+        }
+        components.user = nil
+        components.password = nil
+        components.query = nil
+        components.fragment = nil
+        return components.string ?? endpoint.absoluteString
     }
 
     var body: some View {
@@ -52,6 +104,16 @@ struct StatusPopoverView: View {
             }
             .disabled(!hasLatestSegment)
 
+            // Polished commits can't be un-typed into the target app; offer the
+            // pre-polish raw transcript for one-tap copy instead (F6). Appears
+            // only after a polish-changed commit; a one-line action, never the
+            // transcript itself (owner rule: no long text in the popover).
+            if viewModel.canCopyRawTranscript {
+                Button("Copy Raw Transcript") {
+                    viewModel.copyRawTranscript()
+                }
+            }
+
             Divider()
 
             Button("Settings…") {
@@ -66,19 +128,33 @@ struct StatusPopoverView: View {
                 }
 
                 Button("Reset Accessibility Permission…") {
-                    viewModel.resetAccessibilityPermission()
-                    openAccessibilitySettings()
+                    isConfirmingAccessibilityReset = true
                 }
             }
 
             Divider()
 
+            // Prominent, single-source-of-truth "why can't I dictate right now"
+            // banner. Surfaces the Live Auto-Paste + Accessibility gap before the
+            // user speaks into the void; the affordance to fix it is right below.
+            if let warning = viewModel.liveAutoPasteAccessibilityWarning {
+                Text(warning)
+                    .foregroundStyle(.orange)
+                    .lineLimit(nil)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(width: Self.contentWidth, alignment: .leading)
+            }
+
             Text("Status: \(viewModel.statusText)")
                 .foregroundStyle(.secondary)
+                .lineLimit(nil)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(width: Self.contentWidth, alignment: .leading)
 
-            if let lastError = viewModel.lastError {
-                Text(lastError)
-                    .foregroundStyle(.red)
+            if let connectionFailureDetail {
+                statusDetailView(connectionFailureDetail)
+            } else if let lastError = viewModel.lastError {
+                statusDetailView("Error: \(lastError)")
             }
 
             Divider()
@@ -94,6 +170,29 @@ struct StatusPopoverView: View {
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             viewModel.refreshAccessibilityTrustState()
         }
+        .alert("Reset Accessibility Permission?", isPresented: $isConfirmingAccessibilityReset) {
+            Button("Cancel", role: .cancel) {}
+            Button("Reset Permission", role: .destructive) {
+                viewModel.resetAccessibilityPermission()
+                openAccessibilitySettings()
+            }
+        } message: {
+            Text("This revokes localvoxtral's Accessibility grant. You will need to enable it again in System Settings.")
+        }
+        .frame(width: Self.contentWidth, alignment: .leading)
+    }
+
+    // Same typography as the Status line so failure details read as part of
+    // the popover, not a styled callout. The popover never shows long text
+    // (AGENTS.md): callers pass one short sentence, and the line limit here
+    // is the backstop for any path that slips a long string through.
+    private func statusDetailView(_ detail: String) -> some View {
+        Text(detail)
+            .foregroundStyle(.secondary)
+            .lineLimit(2)
+            .truncationMode(.tail)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(width: Self.contentWidth, alignment: .leading)
     }
 
     private func openAccessibilitySettings() {
@@ -102,4 +201,5 @@ struct StatusPopoverView: View {
         }
         NSWorkspace.shared.open(url)
     }
+
 }

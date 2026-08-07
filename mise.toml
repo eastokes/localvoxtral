@@ -18,6 +18,10 @@ run = "swift package clean && rm -rf .build"
 description = "Run the Swift test suite"
 run = "swift test"
 
+[tasks.test-failures]
+description = "Run Swift tests and print only actionable failures"
+run = "./scripts/test-failures.sh"
+
 [tasks.package]
 description = "Package dist/localvoxtral.app"
 run = './scripts/package_app.sh release "$APP_VERSION" "$BUILD_NUMBER"'

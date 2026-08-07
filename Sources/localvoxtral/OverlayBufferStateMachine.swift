@@ -17,7 +17,6 @@ enum OverlayBufferPhase: Equatable {
     case buffering
     case finalizing
     case commitFailed
-    case cancelled
 }
 
 /// Assembles text for the overlay buffer display and insertion.
@@ -104,12 +103,20 @@ struct OverlayBufferStateMachine {
         let phase: OverlayBufferPhase
         let bufferText: String
         let errorMessage: String?
+        let secureInputActive: Bool
+        /// True once LLM polishing has changed the displayed text vs the raw
+        /// transcript for this session. Drives the subtle "Polished" badge shown
+        /// while the polished text is held before dismissal. Set only by the
+        /// stop-commit polish path; cleared on every new session.
+        let polished: Bool
         let anchor: OverlayAnchor
     }
 
     private(set) var phase: OverlayBufferPhase = .idle
     private(set) var bufferText = ""
     private(set) var errorMessage: String?
+    private(set) var secureInputActive = false
+    private(set) var polished = false
     private(set) var anchor: OverlayAnchor?
 
     var snapshot: Snapshot? {
@@ -118,6 +125,8 @@ struct OverlayBufferStateMachine {
             phase: phase,
             bufferText: bufferText,
             errorMessage: errorMessage,
+            secureInputActive: secureInputActive,
+            polished: polished,
             anchor: anchor
         )
     }
@@ -131,7 +140,29 @@ struct OverlayBufferStateMachine {
         phase = .buffering
         bufferText = ""
         errorMessage = nil
+        secureInputActive = false
+        polished = false
         self.anchor = anchor
+    }
+
+    /// Marks that LLM polishing changed the displayed text vs the raw
+    /// transcript. Set from the stop-commit polish path once the polished text
+    /// is on screen; the badge then rides the finalizing/hold snapshot. Ignored
+    /// when idle (no session to annotate); a new session clears it.
+    mutating func setPolished(_ value: Bool) {
+        guard phase != .idle else { return }
+        polished = value
+    }
+
+    /// Marks the buffering session as running under Secure Keyboard Entry.
+    /// The overlay view folds this into the phase title (an actionable
+    /// "select another field" hint) rather than a separate warning sentence —
+    /// a warning line under the transcript read as clutter (owner feedback
+    /// on #90). startSession resets it; it persists through finalizing so
+    /// the marker doesn't blink away while the commit is still pending.
+    mutating func setSecureInputWarning() {
+        guard phase == .buffering else { return }
+        secureInputActive = true
     }
 
     mutating func updateBuffer(text: String, anchor: OverlayAnchor?) {
@@ -163,6 +194,8 @@ struct OverlayBufferStateMachine {
         phase = .idle
         bufferText = ""
         errorMessage = nil
+        secureInputActive = false
+        polished = false
         anchor = nil
     }
 }

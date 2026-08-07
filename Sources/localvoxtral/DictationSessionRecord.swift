@@ -21,6 +21,17 @@ final class DictationSessionRecord {
     var targetAppBundleID: String?
     var status: String
     var commitSucceeded: Bool
+    /// Polishing prompt profile that ran for this session (`standard`/`agent`
+    /// rawValue), or nil when polishing did not run. Additive optional field:
+    /// SwiftData lightweight-migrates existing stores, and old records decode
+    /// with this as nil.
+    var polishProfile: String?
+    /// Count-only provenance for an attached clipboard polish context (e.g.
+    /// `clipboard:412ch`, or `clipboard:2000/5321ch` when the excerpt was
+    /// capped), or nil when no context was attached. Never holds clipboard
+    /// content — just character counts. Additive optional field: SwiftData
+    /// lightweight-migrates existing stores, and old records decode as nil.
+    var polishContextSummary: String?
 
     init(
         id: UUID = UUID(),
@@ -34,7 +45,9 @@ final class DictationSessionRecord {
         outputMode: String,
         targetAppBundleID: String? = nil,
         status: DictationSessionStatus,
-        commitSucceeded: Bool
+        commitSucceeded: Bool,
+        polishProfile: String? = nil,
+        polishContextSummary: String? = nil
     ) {
         self.id = id
         self.startedAt = startedAt
@@ -48,5 +61,7 @@ final class DictationSessionRecord {
         self.targetAppBundleID = targetAppBundleID
         self.status = status.rawValue
         self.commitSucceeded = commitSucceeded
+        self.polishProfile = polishProfile
+        self.polishContextSummary = polishContextSummary
     }
 }

@@ -1,5 +1,8 @@
 .DS_Store
+__pycache__/
 /.build
+/PolishHelper/.build
+/SpeechHelper/.build
 /Packages
 xcuserdata/
 DerivedData/
@@ -9,6 +12,27 @@ DerivedData/
 /dist
 /.codex
 
-/docs
-/CLAUDE.md
-/.pi
+# Local human-voice recordings for the agent-dictation eval. These can carry
+# biometric voice data and are synced to the private Mac build host only.
+/EvalRecordings/
+
+# Machine-local scratch (setup runbooks, handoff notes, drafts) — never
+# commit. Committed documentation lives in docs/, which is tracked normally.
+/local-notes/
+
+# Agent runtime dirs (opencode/Claude/Pi workers) — never commit
+.agent-runs/
+.opencode/
+/.pi/
+/.pi-subagents/
+
+# Transient enable markers written by remote-build.sh eval-llm /
+# integration-polishd / integration-speechd / eval-e2e / dogfood
+/.llm-polish-eval-enable.json
+/.polishd-integration-enable.json
+/.speechd-integration-enable.json
+/.agent-eval-e2e-enable.json
+# Compile gate for the dogfooding context capture (Package.swift reads it).
+# Never commit: its presence changes what the app is compiled to do.
+/.dogfood-capture-enable
+.fastcontext/

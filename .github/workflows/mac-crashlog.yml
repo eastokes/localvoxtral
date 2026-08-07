@@ -1,0 +1,254 @@
+name: mac-crashlog
+
+# Manually dispatched diagnostic: summarize recent localvoxtral crash reports
+# from the self-hosted Mac so remote agents can debug field crashes without
+# hands on the machine. Prints a FILTERED summary only (exception info +
+# crashed-thread frames, $HOME redacted) because this repo's Actions logs are
+# public. Never prints environment, arguments, or full register state.
+
+on:
+  workflow_dispatch:
+    inputs:
+      minutes_back:
+        description: "How far back to look for reports (minutes)"
+        default: "240"
+      max_reports:
+        description: "Max number of reports to summarize"
+        default: "3"
+
+jobs:
+  crashlog:
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 5
+    steps:
+      - name: Snapshot non-secret settings defaults
+        run: |
+          # Allowlisted, non-secret keys only — Actions logs are public.
+          for key in settings.dictation_backend_mode settings.polishing_backend_mode \
+                     settings.llm_polishing_enabled settings.dictation_output_mode \
+                     settings.dictation_shortcut_mode settings.onboarding_completed \
+                     settings.backend_mode settings.auto_copy_enabled; do
+            printf '%s = ' "$key"
+            defaults read com.localvoxtral.app "$key" 2>/dev/null || echo "<absent>"
+          done
+          echo "--- backend processes:"
+          pgrep -fl 'voxmlx-serve|mlx_lm|localvoxtral-polishd' | sed "s|$HOME|~|g" || echo "none"
+
+      - name: Recent localvoxtral app log (redacted)
+        env:
+          MINUTES_BACK: ${{ inputs.minutes_back }}
+        run: |
+          log show --last "${MINUTES_BACK}m" --info --debug \
+            --predicate 'subsystem == "com.localvoxtral" AND process == "localvoxtral"' 2>/dev/null \
+            | sed "s|$HOME|~|g" | tail -150 || echo "log query failed"
+
+      - name: Reproduce the app's model pre-download command (native HTTPS)
+        run: |
+          set +e
+          catalog_default_repo() {
+            awk '/static let defaultOption/{found=1} found && /forRepoID: "/{
+              sub(/.*forRepoID: "/, ""); sub(/".*/, ""); print; exit
+            }' "$1"
+          }
+          catalog_revision() {
+            awk -v repo="$2" 'index($0, "repoID: \"" repo "\""){found=1}
+              found && /revision: "/{
+                sub(/.*revision: "/, ""); sub(/".*/, ""); print; exit
+              }' "$1"
+          }
+
+          if [ -n "${HF_HUB_CACHE:-}" ]; then
+            HF_CACHE_ROOT="$HF_HUB_CACHE"
+          elif [ -n "${HF_HOME:-}" ]; then
+            HF_CACHE_ROOT="$HF_HOME/hub"
+          else
+            HF_CACHE_ROOT="$HOME/.cache/huggingface/hub"
+          fi
+
+          probe_model() {
+            label="$1"
+            repo="$2"
+            revision="$3"
+            echo "--- $label model:"
+            if [ -z "$repo" ] || [ -z "$revision" ]; then
+              echo "catalog repo/revision unresolved; skipping"
+              return 0
+            fi
+
+            echo "repo: $repo"
+            echo "pinned revision: $revision"
+            api_url="https://huggingface.co/api/models/$repo/revision/$revision"
+            echo "--- curl HF revision API:"
+            echo "curl --disable --fail --silent --show-error --location --max-time 30 '$api_url'"
+            curl_error="/tmp/localvoxtral-${label}-hf-api.err"
+            /usr/bin/curl --disable --fail --silent --show-error --location --max-time 30 \
+              "$api_url" -o "/tmp/localvoxtral-${label}-hf-api.json" \
+              2>"$curl_error"
+            code=$?
+            echo "curl exit code: $code"
+            if [ "$code" -eq 0 ]; then
+              bytes="$(wc -c < "/tmp/localvoxtral-${label}-hf-api.json" | tr -d ' ')"
+              echo "API response bytes: $bytes"
+            else
+              sed "s|$HOME|~|g" "$curl_error" | tail -20
+            fi
+
+            repo_cache_name="models--${repo//\//--}"
+            snapshot="$HF_CACHE_ROOT/$repo_cache_name/snapshots/$revision"
+            echo "--- expected snapshot dir:"
+            echo "$snapshot" | sed "s|$HOME|~|g"
+            ls -la "$snapshot" 2>&1 | sed "s|$HOME|~|g" || echo "<snapshot absent>"
+          }
+
+          SPEECH_CATALOG="Sources/localvoxtral/Backends/SpeechModelCatalog.swift"
+          POLISH_CATALOG="Sources/localvoxtral/Backends/PolishModelCatalog.swift"
+          speech_repo="$(catalog_default_repo "$SPEECH_CATALOG")"
+          speech_revision="$(catalog_revision "$SPEECH_CATALOG" "$speech_repo")"
+          polish_repo="$(catalog_default_repo "$POLISH_CATALOG")"
+          polish_revision="$(catalog_revision "$POLISH_CATALOG" "$polish_repo")"
+
+          echo "--- Hugging Face cache root:"
+          echo "$HF_CACHE_ROOT" | sed "s|$HOME|~|g"
+          probe_model "speechd" "$speech_repo" "$speech_revision"
+          probe_model "polishd" "$polish_repo" "$polish_revision"
+          exit 0
+
+      - name: Claude remote ssh config state (markers only)
+        run: |
+          # Field-debugging the enrollment insertion: report only what proves
+          # or disproves that the app's marked block is present. This log is
+          # PUBLIC: never print config content, filenames, aliases, hostnames,
+          # or account names. Markers print only when they match the app's
+          # exact grammar (grep -o keeps the matched text alone, so a
+          # marker-like line carrying extra private text is counted, never
+          # shown). A diagnostic must not go red on the states it exists to
+          # characterize (missing file, symlink), hence set +e.
+          set +e
+          cfg="$HOME/.ssh/config"
+          marker_grammar='^# \(BEGIN\|END\) localvoxtral claude context ([a-z0-9]\{1,32\})$'
+          echo "--- ~/.ssh and config state:"
+          for path in "$HOME/.ssh" "$cfg"; do
+            if [ -e "$path" ] || [ -L "$path" ]; then
+              /usr/bin/stat -f '%N: type=%HT perms=%Mp%Lp mtime=%Sm size=%z' "$path" 2>&1 \
+                | sed "s|$HOME|~|g"
+            else
+              echo "$path: <absent>" | sed "s|$HOME|~|g"
+            fi
+          done
+          if [ "$(/usr/bin/stat -f %u "$HOME/.ssh" 2>/dev/null)" = "$(id -u)" ]; then
+            echo "ssh dir owned by current user: yes"
+          else
+            echo "ssh dir owned by current user: NO"
+          fi
+          echo "--- localvoxtral marker lines (strict grammar only):"
+          grep -no "$marker_grammar" "$cfg" 2>/dev/null \
+            || echo "<no well-formed localvoxtral markers>"
+          marker_like="$(grep -c '^# \(BEGIN\|END\) localvoxtral claude context' "$cfg" 2>/dev/null)"
+          well_formed="$(grep -c "$marker_grammar" "$cfg" 2>/dev/null)"
+          echo "marker-like lines: ${marker_like:-0} (well-formed: ${well_formed:-0})"
+          # Ports, not hosts, and ONLY OURS. Since per-Mac allocation (issue
+          # #215) the listen port is derived per install, and "which port does
+          # this Mac claim" is the first question when a host silently stops
+          # delivering. But this log is public: the user's own RemoteForward
+          # lines can carry socket paths and bind addresses that are nobody
+          # else's business, so the awk below only looks BETWEEN this app's
+          # BEGIN/END markers and prints only the numeric listen-port field
+          # (anything non-numeric is dropped rather than echoed). A remaining
+          # `8473` here means the block predates the fix.
+          echo "--- localvoxtral RemoteForward listen ports (ours only):"
+          awk '
+            /^[[:space:]]*# BEGIN localvoxtral claude context \(/ { inside = 1; next }
+            /^[[:space:]]*# END localvoxtral claude context \(/   { inside = 0; next }
+            inside && $1 == "RemoteForward" && $2 ~ /^[0-9]+$/    { print $2 }
+          ' "$cfg" 2>/dev/null | sort -u | tr '\n' ' ' | sed 's/ $//'
+          echo
+          [ -f "$cfg" ] || echo "<no config file>"
+          echo "--- leftover atomic-write temp files (count only):"
+          /usr/bin/find "$HOME/.ssh" -maxdepth 1 -name '.config.localvoxtral.*' 2>/dev/null \
+            | wc -l | tr -d ' '
+
+      - name: List running localvoxtral instances
+        run: |
+          pids=$(pgrep -x localvoxtral || true)
+          if [ -z "$pids" ]; then echo "no running localvoxtral instances"; else
+            for pid in $pids; do
+              ps -p "$pid" -o pid=,lstart=,comm= | sed "s|$HOME|~|g"
+            done
+          fi
+
+      - name: Summarize recent localvoxtral crash reports
+        env:
+          MINUTES_BACK: ${{ inputs.minutes_back }}
+          MAX_REPORTS: ${{ inputs.max_reports }}
+        run: |
+          set -uo pipefail
+          dir="$HOME/Library/Logs/DiagnosticReports"
+          reports=$(find "$dir" -name 'localvoxtral*.ips' -mmin "-${MINUTES_BACK}" 2>/dev/null | sort -r | head -n "${MAX_REPORTS}")
+          if [ -z "$reports" ]; then
+            echo "No localvoxtral crash reports in the last ${MINUTES_BACK} minutes."
+            ls -lt "$dir" 2>/dev/null | head -10 | sed "s|$HOME|~|g" || true
+            exit 0
+          fi
+          for f in $reports; do
+            echo "===== $(basename "$f") ====="
+            # .ips = one JSON header line, then one JSON body. Extract the
+            # fields that identify the crash; redact the home directory.
+            /usr/bin/python3 - "$f" <<'PY'
+          import json, os, re, sys
+
+          path = sys.argv[1]
+          home = os.path.expanduser("~")
+
+          def redact(s):
+              return s.replace(home, "~") if isinstance(s, str) else s
+
+          with open(path) as fh:
+              lines = fh.read().splitlines()
+          header = json.loads(lines[0])
+          body = json.loads("\n".join(lines[1:]))
+
+          print("captureTime:", header.get("timestamp", "?"))
+          print("procPath:", redact(body.get("procPath", header.get("procPath", "?"))))
+          # Swift fatalError/assertion text lives in various fields depending
+          # on OS version; scan the raw JSON for it.
+          raw = "\n".join(lines)
+          for marker in ("Fatal error", "Precondition failed", "Assertion failed"):
+              idx = raw.find(marker)
+              if idx != -1:
+                  print("fatalMessage:", redact(raw[idx:idx + 300].split("\\n")[0]))
+                  break
+          print("translocated:", "AppTranslocation" in str(body.get("procPath", "")))
+          print("bundle:", header.get("bundleID", "?"), header.get("app_version", ""))
+          print("os:", body.get("osVersion", {}).get("train", "?"), body.get("osVersion", {}).get("build", ""))
+          exc = body.get("exception", {})
+          print("exception:", exc.get("type", "?"), exc.get("signal", ""), exc.get("subtype", ""))
+          term = body.get("termination", {})
+          if term:
+              print("termination:", term.get("indicator", ""), redact(" ".join(str(r) for r in term.get("reasons", []))))
+          asi = body.get("asi")
+          if asi:
+              for k, v in asi.items():
+                  for line in v:
+                      print("asi:", redact(line))
+          ktriage = body.get("ktriageinfo")
+          if ktriage:
+              print("ktriage:", redact(str(ktriage)))
+          images = body.get("usedImages", [])
+          faulting = body.get("faultingThread", 0)
+          for t in body.get("threads", []):
+              if not t.get("triggered") and body.get("threads", []).index(t) != faulting:
+                  continue
+              print(f"-- crashed thread {faulting} ({redact(t.get('name', t.get('queue', '')) or '')}) --")
+              for i, fr in enumerate(t.get("frames", [])[:20]):
+                  img = images[fr["imageIndex"]] if fr.get("imageIndex") is not None and fr["imageIndex"] < len(images) else {}
+                  name = img.get("name", "?")
+                  sym = fr.get("symbol", "")
+                  off = fr.get("symbolLocation", "")
+                  src = fr.get("sourceFile", "")
+                  line = fr.get("sourceLine", "")
+                  loc = f" ({src}:{line})" if src else ""
+                  print(f"  {i:2d} {name}  {sym} + {off}{loc}")
+              break
+          PY
+            echo
+          done

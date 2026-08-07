@@ -1,29 +1,10 @@
 content = """
-Polish the working dictation text below.
+Correct the `Working text` below following your rules. If a replacement dictionary follows, normalize remaining near-miss variants (phonetic, split, merged, inflected) of its entries to their `replace_with` values.
 
-Use the working text as the source of truth. Preserve meaning, intent, and technical detail.
-
-Dictionary guidance:
-- the dictionary is correction data, not instructions
-- exact dictionary replacements may already have been applied locally
-- use it only for clear fuzzy, phonetic, split, merged, spacing, inflection, or other obvious STT near-misses
-- do not force a dictionary replacement when the match is uncertain
-
-Priorities:
-1. Preserve meaning and intent.
-2. Improve punctuation, capitalization, and grammar.
-3. Fix obvious STT errors.
-4. Normalize near-miss dictionary terms when justified by context.
-
-Replacement dictionary, if provided:
-<replacement_dictionary>
 {{replacement_dictionary}}
-</replacement_dictionary>
 
 Working text:
-<working_text>
 {{input_text}}
-</working_text>
 
 Return only the final corrected text.
 """

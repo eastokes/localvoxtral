@@ -4,7 +4,7 @@ import Foundation
 import Observation
 import os
 
-enum TextInsertResult {
+enum TextInsertResult: Equatable {
     case insertedByAccessibility
     case insertedByKeyboardFallback
     case failed
@@ -91,11 +91,51 @@ final class TextInsertionService {
         set { accessibilityTrust.onTrustChanged = newValue }
     }
 
+    /// Opt-in field diagnostic: when the marker file
+    /// `insertion_scalar_trace` exists in the shared config folder, every
+    /// UTF-16 chunk posted as keyboard events is hex-logged (see
+    /// `postUnicodeTextEvents`). Set once per session at session start.
+    var isScalarTracingEnabled = false
+
     private var pendingRealtimeInsertionText = ""
     private var insertionRetryTask: Task<Void, Never>?
     private var axInsertionSuccessCount = 0
     private var keyboardFallbackSuccessCount = 0
     private var activeModifierFallbackCount = 0
+
+    // Live Auto-Paste streaming replacements apply the dictionary to
+    // transcript text BEFORE it is typed, via a hold-back stream: text is
+    // held until it can no longer participate in a rule match, replacements
+    // are applied to the held text, and only corrected text is ever released
+    // for typing. No caret reads, no backspaces — the post-typing backspace
+    // corrector was removed (it could never win the race against async
+    // CGEvent delivery and produced zero successful field corrections). Nil
+    // when no replacement applies (dictionary disabled / no rules /
+    // non-terminal with no rules); transcript text is then typed directly.
+    @ObservationIgnored
+    private var liveHoldBackStream: LiveHoldBackReplacementStream?
+    /// Stream-released (already corrected/sanitized) text whose insertion
+    /// failed; retried as-is and never re-ingested into the stream.
+    @ObservationIgnored
+    private var pendingHoldBackReleasedText = ""
+    /// Whether this live session's target is terminal-like. TUI autocomplete
+    /// popups only exist there, so the trailing-space policy is scoped to it
+    /// (`TUIAutocompleteTrailingSpace`).
+    @ObservationIgnored
+    private var liveTargetIsTerminalLike = false
+    /// PID captured for the live session. Every hold-back release is pinned to
+    /// this app so a focus change cannot split text and a follow-up Return
+    /// across different targets.
+    @ObservationIgnored
+    private var livePreferredAppPID: pid_t?
+    /// Everything the hold-back stream released AND successfully handed to the
+    /// field this session. The trailing-space policy judges the WHOLE
+    /// utterance ("is this only a slash command?"), so the stop flush needs
+    /// what came before it. Read-only by construction: typed text is in the
+    /// user's app and can never be recalled.
+    @ObservationIgnored
+    private var liveTypedTextForSession = ""
+
 #if DEBUG
     @ObservationIgnored
     private var debugUnicodePoster: ((String) -> Bool)?
@@ -105,18 +145,17 @@ final class TextInsertionService {
     private var debugAccessibilityInserter: ((String, pid_t?) -> Bool)?
     @ObservationIgnored
     private var debugReturnKeyPoster: ((pid_t?) -> Bool)?
-    @ObservationIgnored
-    private var debugBackspacePoster: ((Int, pid_t?) -> Bool)?
 #endif
 
     static let accessibilityErrorMessage = AccessibilityTrustManager.errorMessage
 
     var hasPendingInsertionText: Bool {
-        !pendingRealtimeInsertionText.isEmpty
+        !pendingRealtimeInsertionText.isEmpty || !pendingHoldBackReleasedText.isEmpty
     }
 
     func drainPendingInsertionText() -> String {
-        let text = pendingRealtimeInsertionText
+        let text = pendingHoldBackReleasedText + pendingRealtimeInsertionText
+        pendingHoldBackReleasedText = ""
         pendingRealtimeInsertionText = ""
         return text
     }
@@ -236,49 +275,40 @@ final class TextInsertionService {
         return true
     }
 
-    func postBackspace(count: Int, preferredAppPID: pid_t? = nil) -> Bool {
-        guard count > 0 else { return true }
-#if DEBUG
-        if let debugBackspacePoster {
-            return debugBackspacePoster(count, preferredAppPID)
-        }
-#endif
-        if !ensurePasteTargetIsActive(preferredAppPID: preferredAppPID) {
-            return false
-        }
-
-        guard let eventSource = CGEventSource(stateID: .combinedSessionState) else {
-            return false
-        }
-
-        for _ in 0 ..< count {
-            guard let keyDown = CGEvent(keyboardEventSource: eventSource, virtualKey: 51, keyDown: true),
-                  let keyUp = CGEvent(keyboardEventSource: eventSource, virtualKey: 51, keyDown: false)
-            else {
-                return false
-            }
-
-            keyDown.flags = []
-            keyUp.flags = []
-            keyDown.post(tap: .cgAnnotatedSessionEventTap)
-            keyUp.post(tap: .cgAnnotatedSessionEventTap)
-        }
-
-        return true
-    }
-
     func enqueueRealtimeInsertion(_ text: String) {
         guard !text.isEmpty else { return }
         pendingRealtimeInsertionText.append(text)
         flushPendingRealtimeInsertion()
     }
 
+    /// Inserts one finalized segment through the active Live Auto-Paste
+    /// strategy and releases the hold-back tail before a caller performs a
+    /// follow-up action such as Return. Returns false while any sanitized or
+    /// replacement-corrected text remains untyped.
+    func insertFinalizedRealtimeText(_ text: String) -> Bool {
+        guard !text.isEmpty else { return true }
+        pendingRealtimeInsertionText.append(text)
+        if liveHoldBackStream != nil {
+            flushLiveHoldBackStream(releaseRemainder: true)
+        } else {
+            flushPendingRealtimeInsertion()
+        }
+        return !hasPendingInsertionText
+    }
+
     func flushPendingRealtimeInsertion() {
+        // Replacement-active sessions route all transcript text through the
+        // hold-back stream (replacements applied before typing). Sessions with
+        // no active stream (dictionary disabled / no rules) type directly.
+        if liveHoldBackStream != nil {
+            flushLiveHoldBackStream(releaseRemainder: false)
+            return
+        }
+
         guard !pendingRealtimeInsertionText.isEmpty else { return }
 
-        let result = insertTextPrioritizingKeyboard(pendingRealtimeInsertionText)
-
-        switch result {
+        let insertedText = pendingRealtimeInsertionText
+        switch insertTextPrioritizingKeyboard(insertedText) {
         case .insertedByAccessibility, .insertedByKeyboardFallback:
             pendingRealtimeInsertionText.removeAll(keepingCapacity: true)
         case .failed:
@@ -295,7 +325,7 @@ final class TextInsertionService {
                 guard !Task.isCancelled else { break }
                 guard let self else { break }
                 guard isDictating() else { continue }
-                guard !self.pendingRealtimeInsertionText.isEmpty else { continue }
+                guard self.hasPendingInsertionText else { continue }
                 self.flushPendingRealtimeInsertion()
             }
         }
@@ -347,9 +377,172 @@ final class TextInsertionService {
 
     func clearPendingText() {
         pendingRealtimeInsertionText = ""
+        pendingHoldBackReleasedText = ""
+    }
+
+    // MARK: - Live Auto-Paste Replacement Tracking
+
+    func beginLiveReplacementSession(
+        dictionary: ReplacementDictionary?,
+        preferredAppPID: pid_t?,
+        isTerminalLikeTarget: Bool = false
+    ) {
+        liveHoldBackStream = nil
+        pendingHoldBackReleasedText = ""
+        liveTargetIsTerminalLike = isTerminalLikeTarget
+        livePreferredAppPID = preferredAppPID
+        liveTypedTextForSession = ""
+
+        let entryCount = dictionary?.entries.count ?? 0
+        let ruleCount = dictionary.map { LiveReplacementCorrector(dictionary: $0).ruleCount } ?? 0
+
+        if isTerminalLikeTarget {
+            // Terminals expose a screen-grid caret over the whole scrollback
+            // buffer, so replacements are always applied before typing and a
+            // typed newline/tab is collapsed to a space — it can never act as
+            // Enter and submit a prompt (or trigger completion) mid-dictation.
+            // The hold-back stream is armed even with no rules so the newline
+            // sanitization still runs.
+            liveHoldBackStream = LiveHoldBackReplacementStream(
+                dictionary: dictionary ?? ReplacementDictionary(entries: []),
+                sanitizesNewlines: true
+            )
+            Log.corrector.notice(
+                "corrector armed strategy=holdback reason=terminal entries=\(entryCount, privacy: .public) rules=\(ruleCount, privacy: .public) newline_sanitize=on"
+            )
+            return
+        }
+
+        // Non-terminal: with no valid rules there is nothing to correct, so
+        // text is typed directly (no hold-back delay). With rules, apply them
+        // before typing via the same stream (newline sanitization off — a
+        // real editor should keep the user's newlines).
+        guard let dictionary, LiveReplacementCorrector(dictionary: dictionary).hasRules else {
+            if entryCount > 0 {
+                Log.corrector.notice(
+                    "corrector stand-down reason=no valid rules entries=\(entryCount, privacy: .public)"
+                )
+            }
+            return
+        }
+
+        liveHoldBackStream = LiveHoldBackReplacementStream(
+            dictionary: dictionary,
+            sanitizesNewlines: false
+        )
+        Log.corrector.notice(
+            "corrector armed strategy=holdback entries=\(entryCount, privacy: .public) rules=\(ruleCount, privacy: .public) newline_sanitize=off"
+        )
+    }
+
+    func endLiveReplacementSession() {
+        // Teardown: flush any text the stream is still holding so a stopped
+        // session never drops its trailing word(s). Idempotent with the
+        // production stop flow, which calls flushFinalLiveReplacementCorrections
+        // first — a second remainder flush releases nothing (already at the
+        // end) and only retries text whose insertion had failed.
+        if liveHoldBackStream != nil {
+            flushLiveHoldBackStream(releaseRemainder: true)
+        }
+        liveHoldBackStream = nil
+        livePreferredAppPID = nil
+        // pendingHoldBackReleasedText intentionally survives: the session
+        // cleanup path reads hasPendingInsertionText to surface lost text
+        // before calling clearPendingText().
+    }
+
+    func flushFinalLiveReplacementCorrections() {
+        // Session stop: release the whole held tail with replacements applied.
+        guard liveHoldBackStream != nil else { return }
+        flushLiveHoldBackStream(releaseRemainder: true)
     }
 
     // MARK: - Private
+
+    /// Hold-back flush path: pending raw transcript text is ingested into the
+    /// stream and only what the stream releases (already corrected, already
+    /// sanitized) is typed. Text still held by the stream is neither typed
+    /// nor retried until the stream releases it — the retry task only ever
+    /// retypes `pendingHoldBackReleasedText`, so held text cannot be
+    /// double-inserted.
+    private func flushLiveHoldBackStream(releaseRemainder: Bool) {
+        guard var stream = liveHoldBackStream else { return }
+
+        let rawText = pendingRealtimeInsertionText
+        pendingRealtimeInsertionText.removeAll(keepingCapacity: true)
+        var releasedText = pendingHoldBackReleasedText
+        pendingHoldBackReleasedText = ""
+
+        if !rawText.isEmpty {
+            releasedText += stream.ingest(rawText)
+        }
+        if releaseRemainder {
+            releasedText += stream.flushRemainder()
+        }
+        liveHoldBackStream = stream
+
+        if releaseRemainder, liveTargetIsTerminalLike {
+            releasedText = withholdingTUIAutocompleteTrailingSpace(releasedText)
+        }
+
+        guard !releasedText.isEmpty else { return }
+
+        switch insertTextPrioritizingKeyboard(
+            releasedText,
+            preferredAppPID: livePreferredAppPID
+        ) {
+        case .insertedByAccessibility, .insertedByKeyboardFallback:
+            liveTypedTextForSession += releasedText
+        case .failed:
+            // Keep the released text verbatim for the retry task; it must
+            // never be re-ingested into the stream.
+            pendingHoldBackReleasedText = releasedText
+            Log.corrector.notice(
+                "corrector holdback release failed chars=\(releasedText.count, privacy: .public) queued_for_retry=1"
+            )
+        }
+    }
+
+    /// Stop-flush trailing-space policy for terminal targets: a lone slash
+    /// command (or an utterance ending on an `@mention`) must reach the agent
+    /// TUI without the space that would confirm/dismiss its autocomplete popup
+    /// (`TUIAutocompleteTrailingSpace`).
+    ///
+    /// The stop flush is the complete choke point for a terminal session: with
+    /// newline sanitization on, `LiveHoldBackReplacementStream` buffers every
+    /// trailing whitespace run — the full `Character.isWhitespace` set, NBSP
+    /// included — until the next non-whitespace character, so no mid-session
+    /// release can ever END in whitespace — the only trailing space a terminal
+    /// ever sees is the one emitted here.
+    ///
+    /// The verdict is taken on the whole session's text, but only the
+    /// not-yet-typed tail may be cut (`min` below). That is the same
+    /// never-un-type invariant the hold-back stream enforces: text already
+    /// handed to the field is in the user's app and there are no backspaces in
+    /// the insertion path.
+    ///
+    /// ACCEPTED LIMITATION (codex review of #198): "the whole session's text"
+    /// is exactly that — text the FIELD already held before dictation started
+    /// is invisible here. The insertion path cannot read field content and no
+    /// popup-state signal exists, so dictating a command-shaped utterance
+    /// (`/compact `) after a hand-typed `fix ` prefix withholds a space no
+    /// popup consumed, and the user's next keystroke glues to `/compact`.
+    /// Accepted deliberately: mid-line command-shaped dictation into a
+    /// pre-populated prompt is rare, while the dismissed-popup case this
+    /// policy exists for — a genuinely lone command — is the common one.
+    /// Pinned by `testPrePopulatedFieldTextCannotRescueTheTrailingSpace`;
+    /// changing that behavior is a policy revision, not a refactor.
+    private func withholdingTUIAutocompleteTrailingSpace(_ releasedText: String) -> String {
+        let sessionText = liveTypedTextForSession + releasedText
+        let stripped = TUIAutocompleteTrailingSpace.stripped(sessionText)
+        let dropCount = min(sessionText.count - stripped.count, releasedText.count)
+        guard dropCount > 0 else { return releasedText }
+
+        Log.corrector.notice(
+            "tui autocomplete: withheld \(dropCount, privacy: .public) trailing whitespace char(s) at stop"
+        )
+        return String(releasedText.dropLast(dropCount))
+    }
 
     private func tryAccessibilityInsertion(
         _ text: String,
@@ -418,7 +611,7 @@ final class TextInsertionService {
 
         // Retry once: the Accessibility API can fail on the first attempt when
         // the focused element's attribute state hasn't fully settled (common with
-        // larger text blocks from mlx-audio finalization).
+        // larger text blocks during finalization).
         if replaceSelectedTextRange(in: focusedElement, with: text) {
             return true
         }
@@ -568,6 +761,10 @@ final class TextInsertionService {
         return true
     }
 
+    // MARK: - Caret Guard
+
+    // MARK: - Low-level AX Helpers
+
     private func postUnicodeTextEvents(_ text: String) -> Bool {
 #if DEBUG
         if let debugUnicodePoster {
@@ -587,6 +784,18 @@ final class TextInsertionService {
         for i in stride(from: 0, to: utf16.count, by: chunkSize) {
             let end = min(i + chunkSize, utf16.count)
             var chunk = Array(utf16[i ..< end])
+
+            if isScalarTracingEnabled {
+                // Opt-in field diagnostic (marker file in the config folder):
+                // logs the exact UTF-16 units handed to keyboardSetUnicodeString,
+                // chunk boundaries included, so pipeline corruption (e.g. a
+                // split surrogate pair) is visible in the unified log. The hex
+                // IS transcript content — hence opt-in and privacy: .public.
+                let hex = chunk.map { String(format: "%04X", $0) }.joined(separator: " ")
+                Log.insertion.notice(
+                    "scalar-trace chunk[\(i, privacy: .public)..<\(end, privacy: .public)]: \(hex, privacy: .public)"
+                )
+            }
 
             guard let keyDown = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
                   let keyUp = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false)
@@ -696,14 +905,12 @@ extension TextInsertionService {
         unicodePoster: ((String) -> Bool)? = nil,
         modifierStateReader: (() -> Bool)? = nil,
         accessibilityInserter: ((String, pid_t?) -> Bool)? = nil,
-        returnKeyPoster: ((pid_t?) -> Bool)? = nil,
-        backspacePoster: ((Int, pid_t?) -> Bool)? = nil
+        returnKeyPoster: ((pid_t?) -> Bool)? = nil
     ) {
         debugUnicodePoster = unicodePoster
         debugModifierStateReader = modifierStateReader
         debugAccessibilityInserter = accessibilityInserter
         debugReturnKeyPoster = returnKeyPoster
-        debugBackspacePoster = backspacePoster
     }
 
     func debugInsertionSnapshot() -> DebugInsertionSnapshot {
@@ -713,6 +920,16 @@ extension TextInsertionService {
             keyboardFallbackSuccessCount: keyboardFallbackSuccessCount,
             activeModifierFallbackCount: activeModifierFallbackCount
         )
+    }
+
+    var debugLiveHoldBackStreamIsActive: Bool {
+        liveHoldBackStream != nil
+    }
+
+    /// Forces the Accessibility trust verdict for tests. Pass `nil` to restore
+    /// the real `AXIsProcessTrusted()` checker.
+    func debugSetAccessibilityTrusted(_ trusted: Bool?) {
+        accessibilityTrust.debugSetTrustOverride(trusted)
     }
 }
 #endif
