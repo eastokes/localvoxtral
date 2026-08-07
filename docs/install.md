@@ -1,10 +1,10 @@
 # Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/T0mSIlver/localvoxtral/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/eastokes/localvoxtral/main/scripts/install.sh | bash
 ```
 
-Or download the latest `.dmg` from [Releases](https://github.com/T0mSIlver/localvoxtral/releases/latest).
+Or download the latest `.dmg` from [Releases](https://github.com/eastokes/localvoxtral/releases/latest).
 
 On first launch, a setup wizard walks you through the microphone and
 Accessibility permissions and downloads the local engine with live progress.

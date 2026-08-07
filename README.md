@@ -17,12 +17,15 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/T0mSIlver/localvoxtral/stargazers"><img src="https://img.shields.io/github/stars/T0mSIlver/localvoxtral?style=social" alt="GitHub stars" /></a>
+  <a href="https://github.com/eastokes/localvoxtral/stargazers"><img src="https://img.shields.io/github/stars/eastokes/localvoxtral?style=social" alt="GitHub stars" /></a>
   &nbsp;
-  <a href="https://github.com/T0mSIlver/localvoxtral/releases/latest"><img src="https://img.shields.io/github/v/release/T0mSIlver/localvoxtral?label=release" alt="Latest release" /></a>
+  <a href="https://github.com/eastokes/localvoxtral/releases/latest"><img src="https://img.shields.io/github/v/release/eastokes/localvoxtral?label=release" alt="Latest release" /></a>
   &nbsp;
-  <a href="LICENSE"><img src="https://img.shields.io/github/license/T0mSIlver/localvoxtral" alt="License" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/eastokes/localvoxtral" alt="License" /></a>
 </p>
+
+> [!NOTE]
+> This is Emlyn Stokes's personal fork of [T0mSIlver/localvoxtral](https://github.com/T0mSIlver/localvoxtral). It tracks upstream while carrying additional terminal-dictation workflows, accessibility recovery, personal defaults, and local development tooling. See [Personal fork additions](#personal-fork-additions) for the maintained differences.
 
 https://github.com/user-attachments/assets/81a341ff-0c53-4fcf-9b7f-ef148b24dfae
 
@@ -31,10 +34,10 @@ Unlike tools that transcribe after you stop speaking, localvoxtral streams text 
 ## Install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/T0mSIlver/localvoxtral/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/eastokes/localvoxtral/main/scripts/install.sh | bash
 ```
 
-Or download the latest `.dmg` from [Releases](https://github.com/T0mSIlver/localvoxtral/releases/latest). Requires an Apple Silicon Mac on macOS 15+. A first-launch wizard handles permissions and the engine download; if Gatekeeper complains about a hand-installed DMG, see the [install guide](docs/install.md).
+Or download the latest `.dmg` from [Releases](https://github.com/eastokes/localvoxtral/releases/latest). Requires an Apple Silicon Mac on macOS 15+. A first-launch wizard handles permissions and the engine download; if Gatekeeper complains about a hand-installed DMG, see the [install guide](docs/install.md).
 
 ## Features
 
