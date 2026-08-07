@@ -4,6 +4,12 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+if ! command -v mise >/dev/null 2>&1; then
+  echo "Missing required command: mise"
+  echo "Install it with 'brew install mise', then run 'mise trust' from repo root."
+  exit 1
+fi
+
 TAG="${1:-}"
 if [[ -z "$TAG" ]]; then
   echo "Usage: ./scripts/release.sh v0.3.0"
@@ -47,11 +53,11 @@ ARCHIVE_PATH="dist/localvoxtral-${TAG}.zip"
 DMG_PATH="dist/localvoxtral-${TAG}.dmg"
 
 echo "Running build and tests..."
-swift build -c release
-swift test
+mise run build
+mise run test
 
 echo "Packaging app..."
-./scripts/package_app.sh release "$VERSION" 1
+APP_VERSION="$VERSION" BUILD_NUMBER=1 mise run package
 
 echo "Creating archive $ARCHIVE_PATH..."
 mkdir -p dist

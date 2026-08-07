@@ -28,3 +28,11 @@ matches = ["mize"]
 [[replacement]]
 replace_with = "PostgreSQL"
 matches = ["postgres", "post gres sql", "postgress"]
+
+[[replacement]]
+replace_with = "Louie"
+matches = ["louis"]
+
+[[replacement]]
+replace_with = "Kalynn"
+matches = ["kalen"]

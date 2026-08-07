@@ -519,7 +519,7 @@ extension DictationViewModel {
         guard let bundleID = liveAutoPasteTargetAppBundleID else {
             return "the selected app"
         }
-        return settings.sendNowTargetApp(for: bundleIdentifier: bundleID)?.displayName
+        return settings.sendNowTargetApp(for: bundleID)?.displayName
             ?? "the selected app"
     }
 

@@ -274,7 +274,9 @@ private struct DictationSettingsPane: View {
                     subtitle: "Copy the finalized segment to the clipboard after dictation stops.",
                     isOn: $settings.autoCopyEnabled
                 )
+            }
 
+            SettingsGroup(title: "Send Now") {
                 ToggleSettingRow(
                     title: "Send-now command",
                     subtitle: "In Live Auto-Paste, speak a trigger phrase to press Return in selected apps.",
@@ -315,7 +317,7 @@ private struct DictationSettingsPane: View {
                 }
             }
 
-            SettingsGroup(title: "Shortcut") {
+            SettingsGroup(title: "Shortcuts") {
                 SettingsFieldRow(title: "Dictation shortcut") {
                     HStack(alignment: .center, spacing: 8) {
                         ShortcutRecorderField(

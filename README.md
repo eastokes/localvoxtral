@@ -47,12 +47,25 @@ Download the latest `.dmg` from [Releases](https://github.com/T0mSIlver/localvox
 
 If macOS blocks first launch, go to **System Settings -> Privacy & Security** and click **Open Anyway** for `localvoxtral`.
 
-### Alternatively, build from source as an app bundle
+### Alternatively, build from source with `mise`
 
 ```bash
-./scripts/package_app.sh release
-open ./dist/localvoxtral.app
+brew install mise
+mise --version
+mise trust
+mise run build
+mise run package
+mise run install-local
 ```
+
+This repo uses `mise` as the shared task runner for common local commands.
+The tasks still use the Swift/Xcode toolchain already installed on your Mac.
+If `mise run build` cannot locate `swift`, install or re-select Apple's
+developer tools with `xcode-select --install` or by opening Xcode once.
+
+- `mise run build` builds the release binary with SwiftPM.
+- `mise run package` creates `dist/localvoxtral.app`.
+- `mise run install-local` copies the packaged app to `~/Applications/localvoxtral.app`.
 
 ## Settings
 

@@ -49,14 +49,20 @@ jobs:
         with:
           swift-version: "6.2"
 
+      - name: Setup mise
+        uses: jdx/mise-action@1648a7812b9aeae629881980618f079932869151 # v4.0.1
+
       - name: Build
-        run: swift build -c release
+        run: mise run build
 
       - name: Test
-        run: swift test
+        run: mise run test
 
       - name: Package app bundle
-        run: ./scripts/package_app.sh release "${{ steps.meta.outputs.version }}" "${{ github.run_number }}"
+        run: mise run package
+        env:
+          APP_VERSION: ${{ steps.meta.outputs.version }}
+          BUILD_NUMBER: ${{ github.run_number }}
 
       - name: Smoke test packaged app launch
         run: |

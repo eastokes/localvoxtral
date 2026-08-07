@@ -11,11 +11,11 @@ Pipeline steps:
 
 1. Check out source (`push` ref or selected tag).
 2. Derive `tag` and `version` metadata (version is tag without the `v` prefix).
-3. Install Swift 6.2.
-4. Run `swift build -c release`.
-5. Run `swift test`.
+3. Install Swift 6.2 and `mise`.
+4. Run `mise run build`.
+5. Run `mise run test`.
 6. Package app bundle with:
-   - `./scripts/package_app.sh release <version> <github_run_number>`
+   - `APP_VERSION=<version> BUILD_NUMBER=<github_run_number> mise run package`
 7. Zip app bundle to:
    - `dist/localvoxtral-<tag>.zip`
 8. Create/update GitHub release for the tag and upload the zip asset.
@@ -31,7 +31,7 @@ Use this from repo root:
 What it does:
 
 1. Verifies clean git state and `main` branch.
-2. Runs local build/tests.
-3. Packages and zips local app artifact.
+2. Runs local `mise` build/test tasks.
+3. Packages and zips the local app artifact.
 4. Pushes `main`.
 5. Creates and pushes the tag, which triggers `release.yml`.

@@ -1,0 +1,28 @@
+# Shared task surface for local development and CI. Swift still comes from the
+# installed macOS/Xcode toolchain.
+min_version = "2026.4.20"
+
+[env]
+APP_VERSION = "0.0.0-local"
+BUILD_NUMBER = "1"
+
+[tasks.build]
+description = "Build the app in release mode"
+run = "swift build -c release"
+
+[tasks.clean]
+description = "Remove SwiftPM build artifacts"
+run = "swift package clean && rm -rf .build"
+
+[tasks.test]
+description = "Run the Swift test suite"
+run = "swift test"
+
+[tasks.package]
+description = "Package dist/localvoxtral.app"
+run = './scripts/package_app.sh release "$APP_VERSION" "$BUILD_NUMBER"'
+
+[tasks.install-local]
+description = "Install the packaged app into ~/Applications"
+depends = ["package"]
+run = "./scripts/install_local.sh"
