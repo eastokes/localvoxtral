@@ -81,6 +81,9 @@ final class TextInsertionService {
     private let accessibilityTrust = AccessibilityTrustManager()
 
     var isAccessibilityTrusted: Bool { accessibilityTrust.isTrusted }
+    var isAccessibilityRestartRequired: Bool {
+        accessibilityTrust.requiresRestartAfterReset
+    }
     var lastAccessibilityError: String? {
         get { accessibilityTrust.lastError }
         set { accessibilityTrust.lastError = newValue }

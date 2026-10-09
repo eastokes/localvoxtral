@@ -124,6 +124,8 @@ final class DictationViewModel {
         static let awaitingMicrophonePermission = "Awaiting microphone permission..."
         static let requestingMicrophonePermission = "Requesting microphone permission..."
         static let waitingForAccessibilityPermission = "Waiting for Accessibility permission."
+        static let accessibilityPermissionReset =
+            "Accessibility reset — quit and reopen localvoxtral, then grant access."
         static let pasteBlockedByAccessibilityPermission = "Paste blocked by Accessibility permission."
         static let networkLostDictationStopped = "Network lost. Dictation stopped."
         static let liveDictationBlockedBySecureInput = "Blocked: Secure Keyboard Entry is on."
@@ -203,6 +205,9 @@ final class DictationViewModel {
     var onRequestReRunOnboarding: (() -> Void)?
 
     var isAccessibilityTrusted: Bool { textInsertion.isAccessibilityTrusted }
+    var isAccessibilityRestartRequired: Bool {
+        textInsertion.isAccessibilityRestartRequired
+    }
     var currentStatusToken: StatusToken { StatusToken.from(statusText) }
     var currentErrorToken: ErrorToken? {
         guard let lastError else { return nil }
@@ -1866,6 +1871,11 @@ final class DictationViewModel {
     }
 
     func requestAccessibilityPermission() {
+        guard !textInsertion.isAccessibilityRestartRequired else {
+            statusText = StatusStrings.accessibilityPermissionReset
+            return
+        }
+
         textInsertion.requestAccessibilityPermission()
 
         if textInsertion.isAccessibilityTrusted {
@@ -1881,9 +1891,8 @@ final class DictationViewModel {
             return
         }
 
-        statusText = StatusStrings.waitingForAccessibilityPermission
+        statusText = StatusStrings.accessibilityPermissionReset
         lastError = nil
-        textInsertion.requestAccessibilityPermission()
     }
 
     /// Re-read the live microphone authorization status into the observable

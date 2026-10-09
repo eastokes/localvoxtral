@@ -121,7 +121,9 @@ struct StatusPopoverView: View {
                 openSettings()
             }
 
-            if !viewModel.isAccessibilityTrusted {
+            if !viewModel.isAccessibilityTrusted,
+               !viewModel.isAccessibilityRestartRequired
+            {
                 Button("Enable Accessibility…") {
                     viewModel.requestAccessibilityPermission()
                     openAccessibilitySettings()
@@ -174,10 +176,9 @@ struct StatusPopoverView: View {
             Button("Cancel", role: .cancel) {}
             Button("Reset Permission", role: .destructive) {
                 viewModel.resetAccessibilityPermission()
-                openAccessibilitySettings()
             }
         } message: {
-            Text("This revokes localvoxtral's Accessibility grant. You will need to enable it again in System Settings.")
+            Text("This revokes localvoxtral's Accessibility grant. After resetting, quit and reopen the app, then grant access to the current build.")
         }
         .frame(width: Self.contentWidth, alignment: .leading)
     }

@@ -47,7 +47,7 @@ final class AccessibilityTrustManagerTests: XCTestCase {
         XCTAssertEqual(promptCount, 2)
     }
 
-    func testResetPermission_clearsPromptGateAndUsesBundleIdentifier() {
+    func testResetPermission_requiresRestartAndDoesNotReprompt() {
         var promptCount = 0
         var resetBundleIdentifier: String?
         let manager = AccessibilityTrustManager(
@@ -68,7 +68,8 @@ final class AccessibilityTrustManagerTests: XCTestCase {
         manager.promptIfNeeded()
 
         XCTAssertEqual(resetBundleIdentifier, "com.localvoxtral.app")
-        XCTAssertEqual(promptCount, 2)
+        XCTAssertEqual(promptCount, 1)
+        XCTAssertTrue(manager.requiresRestartAfterReset)
     }
 
     func testResetPermission_withoutBundleIdentifierFailsWithoutResetting() {
@@ -85,6 +86,42 @@ final class AccessibilityTrustManagerTests: XCTestCase {
 
         XCTAssertFalse(manager.resetPermission(bundleIdentifier: nil))
         XCTAssertEqual(resetCount, 0)
+    }
+
+    func testResetPermission_successForcesUntrustedWithoutReReadingCachedTCCState() {
+        var trustCheckCount = 0
+        let manager = AccessibilityTrustManager(
+            trustChecker: {
+                trustCheckCount += 1
+                return true
+            },
+            permissionPrompter: {},
+            permissionResetter: { _ in true },
+            pollingTimeoutSeconds: 0
+        )
+        manager.refresh()
+        XCTAssertTrue(manager.isTrusted)
+
+        XCTAssertTrue(manager.resetPermission(bundleIdentifier: "com.localvoxtral.app"))
+        manager.refresh()
+
+        XCTAssertFalse(manager.isTrusted)
+        XCTAssertTrue(manager.requiresRestartAfterReset)
+        XCTAssertEqual(trustCheckCount, 1)
+    }
+
+    func testResetPermission_failurePreservesCurrentTrustState() {
+        let manager = AccessibilityTrustManager(
+            trustChecker: { true },
+            permissionPrompter: {},
+            permissionResetter: { _ in false },
+            pollingTimeoutSeconds: 0
+        )
+        manager.refresh()
+
+        XCTAssertFalse(manager.resetPermission(bundleIdentifier: "com.localvoxtral.app"))
+        XCTAssertTrue(manager.isTrusted)
+        XCTAssertFalse(manager.requiresRestartAfterReset)
     }
 
     func testRefresh_whenTrustBecomesGranted_clearsErrorAndNotifies() {

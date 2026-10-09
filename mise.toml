@@ -26,7 +26,15 @@ run = "./scripts/test-failures.sh"
 description = "Package dist/localvoxtral.app"
 run = './scripts/package_app.sh release "$APP_VERSION" "$BUILD_NUMBER"'
 
+[tasks.package-local]
+description = "Package with a stable local identity so Accessibility survives rebuilds"
+run = '''
+LOCALVOXTRAL_CODESIGN_IDENTITY="${LOCALVOXTRAL_CODESIGN_IDENTITY:-localvoxtral-dev}" \
+LOCALVOXTRAL_REQUIRE_CODESIGN_IDENTITY=1 \
+  ./scripts/package_app.sh release "$APP_VERSION" "$BUILD_NUMBER"
+'''
+
 [tasks.install-local]
-description = "Install the packaged app into ~/Applications"
-depends = ["package"]
+description = "Install the identity-signed app into ~/Applications"
+depends = ["package-local"]
 run = "./scripts/install_local.sh"

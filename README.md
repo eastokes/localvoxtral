@@ -59,7 +59,7 @@ This fork keeps upstream's current architecture and adds a few local workflows a
 - an opt-in, configurable **Send Now** voice command for selected terminal apps in Live Auto-Paste;
 - an explicit **Reset Accessibility Permission** troubleshooting action;
 - personal replacement-dictionary entries under `Sources/localvoxtral/Resources/Config/`;
-- `mise run build`, `mise run test`, `mise run test-failures`, `mise run package`, and `mise run install-local` tasks for local development. `test-failures` keeps successful runs concise and retains the full log when tests fail; `install-local` changes `~/Applications` and is never run during automated validation.
+- `mise run build`, `mise run test`, `mise run test-failures`, `mise run package`, `mise run package-local`, and `mise run install-local` tasks for local development. `test-failures` keeps successful runs concise and retains the full log when tests fail; `package-local` requires stable code signing so Accessibility survives rebuilds; `install-local` changes `~/Applications` and is never run during automated validation.
 
 Upstream synchronization is merge-based and documented in `.agents/skills/sync-upstream/SKILL.md`.
 

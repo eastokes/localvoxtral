@@ -16,6 +16,7 @@ final class AccessibilityTrustManager {
         "Enable Accessibility for localvoxtral in System Settings > Privacy & Security > Accessibility."
 
     private(set) var isTrusted = false
+    private(set) var requiresRestartAfterReset = false
     var lastError: String?
 
     var onTrustChanged: (() -> Void)?
@@ -97,6 +98,14 @@ final class AccessibilityTrustManager {
     }
 
     func refresh() {
+        // A successful reset revokes this process's grant, but TCC can keep
+        // returning its pre-reset cached verdict until relaunch. Never let that
+        // stale value make the UI look granted again in the same process.
+        guard !requiresRestartAfterReset else {
+            isTrusted = false
+            return
+        }
+
         let wasTrusted = isTrusted
         let trusted = debugTrustOverride ?? trustChecker()
         if isTrusted != trusted {
@@ -116,6 +125,7 @@ final class AccessibilityTrustManager {
     }
 
     func requestPermission() {
+        guard !requiresRestartAfterReset else { return }
         permissionPrompter()
         startPolling()
         refresh()
@@ -123,7 +133,7 @@ final class AccessibilityTrustManager {
 
     func promptIfNeeded() {
         refresh()
-        guard !isTrusted else { return }
+        guard !requiresRestartAfterReset, !isTrusted else { return }
         guard !hasPromptedForPermission else { return }
         hasPromptedForPermission = true
 
@@ -147,7 +157,11 @@ final class AccessibilityTrustManager {
         if lastError == Self.errorMessage {
             lastError = nil
         }
-        refresh()
+        // TCC invalidation can lag behind a successful tccutil exit. The reset
+        // itself is authoritative: do not re-read the old cached verdict or
+        // prompt again from the process whose grant was revoked.
+        requiresRestartAfterReset = true
+        isTrusted = false
         return true
     }
 

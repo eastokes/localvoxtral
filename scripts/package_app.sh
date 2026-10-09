@@ -49,8 +49,9 @@ if [[ "$CODESIGN_IDENTITY" != "-" ]] \
     echo "       but is not visible to user '$(id -un)' via 'security find-identity -v -p codesigning'." >&2
     echo "       Refusing to fall back to ad-hoc: that changes the designated requirement every" >&2
     echo "       build and invalidates the app's Accessibility (TCC) grant on each rebuild." >&2
-    echo "       Import the cert + private key into this user's login keychain (or unset" >&2
-    echo "       LOCALVOXTRAL_REQUIRE_CODESIGN_IDENTITY for an intentionally ad-hoc build)." >&2
+    echo "       Ensure the certificate + private key are in this user's login keychain and" >&2
+    echo "       Code Signing is set to Always Trust (do not run the check with sudo)." >&2
+    echo "       Or unset LOCALVOXTRAL_REQUIRE_CODESIGN_IDENTITY for an intentionally ad-hoc build." >&2
     exit 1
   fi
   echo "Signing identity '$CODESIGN_IDENTITY' not found in keychain; falling back to ad-hoc signing." >&2

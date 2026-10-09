@@ -47,7 +47,7 @@ struct PermissionRowsView: View {
             title: "Accessibility",
             subtitle: "Lets localvoxtral type transcribed text into other apps.",
             isGranted: viewModel.isAccessibilityTrusted,
-            statusText: viewModel.isAccessibilityTrusted ? "Granted" : "Not granted",
+            statusText: accessibilityStatusText,
             action: accessibilityAction
         )
     }
@@ -84,8 +84,17 @@ struct PermissionRowsView: View {
 
     // MARK: - Accessibility state
 
+    private var accessibilityStatusText: String {
+        if viewModel.isAccessibilityRestartRequired { return "Restart required" }
+        return viewModel.isAccessibilityTrusted ? "Granted" : "Not granted"
+    }
+
     private var accessibilityAction: PermissionRow.Action? {
-        guard !viewModel.isAccessibilityTrusted else { return nil }
+        guard !viewModel.isAccessibilityTrusted,
+              !viewModel.isAccessibilityRestartRequired
+        else {
+            return nil
+        }
         return PermissionRow.Action(label: "Grant Access") {
             viewModel.requestAccessibilityPermission()
             Self.openSettings(Self.accessibilitySettingsURL)
