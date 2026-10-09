@@ -181,6 +181,39 @@ enum LLMPolishEvalSupport {
             input: "then run `git rebase -i` to squash the commits .",
             mustContain: ["`git rebase -i`"]
         ),
+        // Style discipline (2026-09-20). The polisher must not restyle speech
+        // into assistant prose. Measured on 35 dogfood captures of the owner's
+        // own dictations through zai-glm-5-3: the polisher inserted an em dash
+        // in 10 of them and a semicolon in 3, and nothing else on the AI-tell
+        // list moved (no added connectives, bold, curly quotes, synonym
+        // upgrades, or length growth). The two marks below are therefore the
+        // whole rule, and these cases are what score it. Inputs are shaped
+        // after real captures. Added colons are deliberately NOT scored: the
+        // ones the model added read correctly and the owner wants them
+        // (2026-09-20 ruling).
+        //
+        // Cases start here (printed, not asserted) and promote to
+        // `requiredCases` only under the usual two-server-state rule.
+        LLMPolishEvalCase(
+            id: "style-no-em-dash-added",
+            input: "and center everything on the page the search box the actual LLM answer",
+            mustContain: ["center everything on the page"],
+            mustNotContain: ["\u{2014}", "\u{2013}"]
+        ),
+        // An em dash already in the transcript must be replaced, not kept.
+        LLMPolishEvalCase(
+            id: "style-em-dash-in-input-replaced",
+            input: "I like the plan \u{2014} the timeline is the problem.",
+            mustContain: ["the timeline is the problem"],
+            mustNotContain: ["\u{2014}", "\u{2013}"]
+        ),
+        // Two statements running together get a period, never a semicolon.
+        LLMPolishEvalCase(
+            id: "style-no-semicolon-added",
+            input: "being built twice because of an error in their API is unacceptable we won't build that",
+            mustContain: ["we won't build that"],
+            mustNotContain: [";"]
+        ),
     ]
 
     /// Print-only technical-dictation cases for model differentiation.
@@ -322,7 +355,8 @@ enum LLMPolishEvalSupport {
         model: String,
         requestShapeModel: String? = nil,
         thinkingBudgetTokens: Int? = nil,
-        passthroughExtraParameters: Bool = false
+        passthroughExtraParameters: Bool = false,
+        requestShape: LLMPolishingRequestShape = .openAICompatible
     ) -> LLMPolishingConfiguration {
         let option = PolishModelCatalog.option(forRepoID: requestShapeModel ?? model)
         return LLMPolishingConfiguration(
@@ -332,7 +366,8 @@ enum LLMPolishEvalSupport {
             samplingDefaults: option?.samplingDefaults,
             chatTemplateArguments: option?.chatTemplateArguments,
             thinkingBudgetTokens: thinkingBudgetTokens,
-            passthroughExtraParameters: passthroughExtraParameters
+            passthroughExtraParameters: passthroughExtraParameters,
+            requestShape: requestShape
         )
     }
 
@@ -421,6 +456,49 @@ enum LLMPolishEvalSupport {
             input: "lance le script avec dash dash verbose",
             mustContain: ["--verbose"]
         ),
+        // Style discipline in the agent profile (2026-09-20) — same rules as
+        // the standard corpus' `style-*` cases. A dictated prompt for another
+        // agent must keep the speaker's punctuation, not acquire dashes.
+        LLMPolishEvalCase(
+            id: "agent-style-no-em-dash-added",
+            input: "add a retry loop around the fetch call three attempts should be enough for now",
+            mustContain: ["retry loop"],
+            mustNotContain: ["\u{2014}", "\u{2013}"]
+        ),
+        LLMPolishEvalCase(
+            id: "agent-style-em-dash-in-input-replaced",
+            input: "run the migration first \u{2014} the schema changed yesterday",
+            mustContain: ["the schema changed"],
+            mustNotContain: ["\u{2014}", "\u{2013}"]
+        ),
+        // A spoken issue or PR number becomes a GitHub reference (#718): the
+        // word stays, `#` is added, the number is what was said.
+        LLMPolishEvalCase(
+            id: "agent-pr-reference-glued",
+            input: "rebase this branch on PR349 before you push",
+            mustContain: ["PR #349"],
+            mustNotContain: ["PR349"],
+            caseSensitive: true
+        ),
+        LLMPolishEvalCase(
+            id: "agent-issue-reference-words",
+            input: "look at issue five sixty three it has the repro steps for the crash",
+            mustContain: ["issue #563"],
+            caseSensitive: true
+        ),
+        LLMPolishEvalCase(
+            id: "agent-fr-pull-request-reference",
+            input: "regarde la pull request 712 et dis-moi pourquoi le job linux a échoué",
+            mustContain: ["pull request #712"],
+            caseSensitive: true
+        ),
+        // A position in a stack is not a reference.
+        LLMPolishEvalCase(
+            id: "agent-pr-position-not-reference",
+            input: "this is PR 2 of 3 in the stack so keep main as the base branch",
+            mustContain: ["PR 2 of 3"],
+            mustNotContain: ["#"]
+        ),
     ]
 
     /// The bundled default templates, loaded through the production config
@@ -431,6 +509,7 @@ enum LLMPolishEvalSupport {
             .appendingPathComponent("lv-polish-eval-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let templates = AppConfigStore(configDirectoryOverride: directory).loadLLMPromptTemplates()
+            .withReferenceGuide()
         return (templates, { try? FileManager.default.removeItem(at: directory) })
     }
 
@@ -443,6 +522,7 @@ enum LLMPolishEvalSupport {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let templates = AppConfigStore(configDirectoryOverride: directory)
             .loadLLMPromptTemplates(profile: .agent)
+            .withReferenceGuide()
         return (templates, { try? FileManager.default.removeItem(at: directory) })
     }
 
@@ -450,15 +530,8 @@ enum LLMPolishEvalSupport {
     /// (U+202F narrow no-break, U+00A0 no-break) with a plain space,
     /// collapses runs, and lowercases, so assertions accept any of them.
     static func normalized(_ text: String) -> String {
-        normalizedSpacing(text)
+        AgentDictationEvalCorpus.normalizedSpacing(text)
             .lowercased()
-    }
-
-    static func normalizedSpacing(_ text: String) -> String {
-        text
-            .replacingOccurrences(of: "\u{202F}", with: " ")
-            .replacingOccurrences(of: "\u{00A0}", with: " ")
-            .replacingOccurrences(of: " +", with: " ", options: .regularExpression)
     }
 
     static func runCase(
@@ -482,7 +555,7 @@ enum LLMPolishEvalSupport {
             let result = try await service.polish(request: request, configuration: configuration)
             outputForLog = result.polishedText
             let output = evalCase.caseSensitive
-                ? normalizedSpacing(result.polishedText)
+                ? AgentDictationEvalCorpus.normalizedSpacing(result.polishedText)
                 : normalized(result.polishedText)
 
             if let expectedText = evalCase.expectedText {
@@ -490,7 +563,7 @@ enum LLMPolishEvalSupport {
                 // outputs with prepended labels ("Corrected: …") or trailing
                 // commentary that the prompt forbids.
                 let expected = evalCase.caseSensitive
-                    ? normalizedSpacing(expectedText)
+                    ? AgentDictationEvalCorpus.normalizedSpacing(expectedText)
                     : normalized(expectedText)
                 if output != expected {
                     let expectedForLog = expectedText.replacingOccurrences(of: "\n", with: "\\n")
@@ -499,13 +572,13 @@ enum LLMPolishEvalSupport {
             } else {
                 for needle in evalCase.mustContain
                 where !output.contains(
-                    evalCase.caseSensitive ? normalizedSpacing(needle) : normalized(needle)
+                    evalCase.caseSensitive ? AgentDictationEvalCorpus.normalizedSpacing(needle) : normalized(needle)
                 ) {
                     caseFailures.append("missing \"\(needle)\"")
                 }
                 for needle in evalCase.mustNotContain
                 where output.contains(
-                    evalCase.caseSensitive ? normalizedSpacing(needle) : normalized(needle)
+                    evalCase.caseSensitive ? AgentDictationEvalCorpus.normalizedSpacing(needle) : normalized(needle)
                 ) {
                     caseFailures.append("still contains \"\(needle)\"")
                 }

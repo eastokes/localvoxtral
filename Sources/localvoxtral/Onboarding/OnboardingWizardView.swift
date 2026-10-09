@@ -1,8 +1,8 @@
 import SwiftUI
 
-/// The first-launch onboarding wizard: Welcome → Permissions → Downloads →
-/// Finish. All state and side effects live in `OnboardingViewModel`; this view
-/// is presentation only.
+/// The first-launch onboarding wizard: Welcome → Permissions → Engine →
+/// Downloads → Finish (the Mistral path skips Downloads). All state and side
+/// effects live in `OnboardingViewModel`; this view is presentation only.
 struct OnboardingWizardView: View {
     @Bindable var model: OnboardingViewModel
 
@@ -31,10 +31,12 @@ struct OnboardingWizardView: View {
             WelcomePage()
         case .permissions:
             PermissionsPage(viewModel: model.viewModel)
+        case .engine:
+            EnginePage(model: model)
         case .downloads:
             DownloadsPage(model: model)
         case .finish:
-            FinishPage(summary: model.triggerSummary)
+            FinishPage(summary: model.triggerSummary, engineSummary: model.engineSummary)
         }
     }
 
@@ -54,12 +56,13 @@ struct OnboardingWizardView: View {
                 performPrimaryAction()
             }
             .keyboardShortcut(.defaultAction)
+            .disabled(!model.canContinue)
         }
     }
 
     private var primaryActionTitle: String {
         if model.page == .downloads, !model.downloadsStarted {
-            return "Begin Download"
+            return "Begin download"
         }
         return model.isFinalPage ? "Get Started" : "Continue"
     }
@@ -76,15 +79,28 @@ struct OnboardingWizardView: View {
 // MARK: - Header
 
 private struct OnboardingHeader: View {
-    let systemImage: String
+    enum Icon {
+        case symbol(String)
+        /// The bundle's dock icon, `AppIcon.icns` in a packaged build.
+        case app
+    }
+
+    let icon: Icon
     let title: String
     let subtitle: String
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Image(systemName: systemImage)
-                .font(.system(size: 34, weight: .regular))
-                .foregroundStyle(.tint)
+            switch icon {
+            case .symbol(let name):
+                Image(systemName: name)
+                    .font(.system(size: 34, weight: .regular))
+                    .foregroundStyle(.tint)
+            case .app:
+                Image(nsImage: NSApplication.shared.applicationIconImage)
+                    .resizable()
+                    .frame(width: 64, height: 64)
+            }
 
             Text(title)
                 .font(.system(size: 22, weight: .semibold))
@@ -104,45 +120,10 @@ private struct WelcomePage: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
             OnboardingHeader(
-                systemImage: "waveform.circle",
+                icon: .app,
                 title: "Welcome to localvoxtral",
-                subtitle:
-                    "Realtime dictation for macOS. Start dictation, speak, and text appears as you talk — right in the app you're using."
+                subtitle: "Dictate into any app from the menu bar."
             )
-
-            VStack(alignment: .leading, spacing: 12) {
-                FeatureBullet(
-                    systemImage: "menubar.arrow.up.rectangle",
-                    text: "Lives in your menu bar and opens instantly.")
-                FeatureBullet(
-                    systemImage: "bolt.horizontal.circle",
-                    text: "Streams words while you're still speaking.")
-                FeatureBullet(
-                    systemImage: "lock.laptopcomputer",
-                    text: "Runs fully on-device with the managed local engine.")
-            }
-
-            Text("This quick setup grants permissions and downloads the local engine.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-    }
-}
-
-private struct FeatureBullet: View {
-    let systemImage: String
-    let text: String
-
-    var body: some View {
-        HStack(alignment: .center, spacing: 10) {
-            Image(systemName: systemImage)
-                .font(.system(size: 15))
-                .foregroundStyle(.tint)
-                .frame(width: 22)
-            Text(text)
-                .font(.system(size: 13))
-                .fixedSize(horizontal: false, vertical: true)
         }
     }
 }
@@ -155,21 +136,120 @@ private struct PermissionsPage: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
             OnboardingHeader(
-                systemImage: "hand.raised.circle",
+                icon: .symbol("hand.raised.circle"),
                 title: "Grant permissions",
-                subtitle:
-                    "localvoxtral needs the microphone to hear you, and Accessibility to type text into other apps."
+                subtitle: "Allow microphone recording and typing into other apps."
             )
 
             PermissionRowsView(viewModel: viewModel)
 
             Text(
-                "You can continue without granting these now and enable them later in Settings ▸ General."
+                "You can grant these later in Settings > General."
             )
             .font(.caption)
             .foregroundStyle(.secondary)
             .fixedSize(horizontal: false, vertical: true)
         }
+    }
+}
+
+// MARK: - Engine
+
+private struct EnginePage: View {
+    @Bindable var model: OnboardingViewModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            OnboardingHeader(
+                icon: .symbol("cpu"),
+                title: "Choose your engine",
+                subtitle: "Where dictation and polishing run. You can change this later in Settings."
+            )
+
+            EngineChoiceRow(
+                title: "Run locally",
+                detail: "Downloads Voxtral and a polishing model to this Mac. Nothing leaves your Mac.",
+                isSelected: model.engineChoice == .local
+            ) {
+                model.engineChoice = .local
+            }
+
+            EngineChoiceRow(
+                title: "Mistral API",
+                detail:
+                    "Uses Mistral's hosted Voxtral and Mistral Medium 3.5 with your API key. Audio and text are sent to Mistral.",
+                isSelected: model.engineChoice == .mistralAPI
+            ) {
+                model.engineChoice = .mistralAPI
+            }
+
+            if model.engineChoice == .mistralAPI {
+                VStack(alignment: .leading, spacing: 8) {
+                    SecureField(
+                        "Paste a key from console.mistral.ai",
+                        text: $model.mistralAPIKeyDraft
+                    )
+                    .textFieldStyle(.roundedBorder)
+                    .accessibilityIdentifier("onboarding.mistral.apiKey")
+
+                    HStack(spacing: 10) {
+                        Button("Check key") { model.checkMistralAPIKeyDraft() }
+                            .controlSize(.small)
+                            .disabled(
+                                model.mistralAPIKeyDraft.trimmed.isEmpty
+                                    || model.mistralAPIKeyCheckState.isChecking
+                            )
+                            .accessibilityIdentifier("onboarding.mistral.verify")
+
+                        if let statusLine = model.mistralAPIKeyCheckState.statusLine {
+                            Text(statusLine)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .accessibilityIdentifier("onboarding.mistral.verify.status")
+                        }
+                    }
+
+                    if let failure = model.mistralAPIKeySaveFailure {
+                        Text(failure)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                            .lineLimit(1)
+                            .accessibilityIdentifier("onboarding.mistral.saveFailure")
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct EngineChoiceRow: View {
+    let title: String
+    let detail: String
+    let isSelected: Bool
+    let select: () -> Void
+
+    var body: some View {
+        Button(action: select) {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: isSelected ? "largecircle.fill.circle" : "circle")
+                    .foregroundStyle(isSelected ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(title)
+                        .font(.system(size: 13, weight: .medium))
+                    Text(detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Spacer(minLength: 0)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(isSelected ? [.isSelected] : [])
     }
 }
 
@@ -187,10 +267,9 @@ private struct DownloadsPage: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
             OnboardingHeader(
-                systemImage: "arrow.down.circle",
+                icon: .symbol("arrow.down.circle"),
                 title: "Set up the local engine",
-                subtitle:
-                    "localvoxtral will prepare the bundled dictation engine and download its Voxtral model. Nothing downloads until you start it below."
+                subtitle: "Start the model download when you are ready."
             )
 
             Toggle(isOn: $model.polishingConsent) {
@@ -198,7 +277,7 @@ private struct DownloadsPage: View {
                     Text("Also set up LLM polishing")
                         .font(.system(size: 13, weight: .medium))
                     Text(
-                        "Downloads a small polishing model for the built-in engine. You can decline and turn it on later in Settings."
+                        "Downloads a small polishing model. You can add it later in Settings."
                     )
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -219,7 +298,7 @@ private struct DownloadsPage: View {
 
             if model.downloadsStarted {
                 Text(
-                    "Downloads continue in the background — you can press Continue while they finish."
+                    "You can continue while downloads finish in the background."
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -246,9 +325,6 @@ private struct DownloadItemRow: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text(item.title)
                     .font(.system(size: 13, weight: .medium))
-                Text(item.detail)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
 
                 if case .working(let detail, let fraction) = state ?? .pending {
                     HStack(spacing: 8) {
@@ -300,14 +376,20 @@ private struct DownloadItemRow: View {
 
 private struct FinishPage: View {
     let summary: DictationTriggerSummary
+    let engineSummary: String
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
             OnboardingHeader(
-                systemImage: "checkmark.circle",
+                icon: .symbol("checkmark.circle"),
                 title: "You're all set",
-                subtitle: "Here's how to start dictating."
+                subtitle: "Try your dictation trigger in any text field."
             )
+
+            Text(engineSummary)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
 
             VStack(alignment: .leading, spacing: 6) {
                 Text(summary.primary)
@@ -324,14 +406,14 @@ private struct FinishPage: View {
                     .fill(Color(nsColor: .quaternarySystemFill))
             }
 
-            Text("Press it in any text field to try it out. Escape cancels a dictation.")
+            Text("Tab changes where the words go. Escape cancels a dictation.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
             if !summary.isModifierOnly {
                 Text(
-                    "Prefer a single key? The trigger can be just a modifier like Fn / Globe — tap it for the overlay, hold it to type live. Switch anytime in Settings ▸ Dictation."
+                    "For one-key control, choose Fn / Globe in Settings > Dictation. Tap to dictate, or hold and let go when done."
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)

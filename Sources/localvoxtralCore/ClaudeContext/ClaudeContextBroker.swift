@@ -1,0 +1,1036 @@
+import ClaudeContextWire
+import Foundation
+import Synchronization
+
+#if canImport(Darwin)
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+#elseif canImport(Glibc)
+import Glibc
+#endif
+
+public struct ClaudeBrokerLimits: Sendable, Equatable {
+    /// Concurrent connections we will service. Hook publishers connect, write
+    /// one line, and leave, so this only needs to absorb bursts.
+    public var maxConcurrentConnections: Int
+    /// listen(2) backlog.
+    public var backlog: Int32
+    /// Per-connection read deadline. A peer that connects and says nothing must
+    /// not hold a slot.
+    public var readTimeout: TimeInterval
+    /// Records accepted from one connection before we close it. A publisher
+    /// sends exactly one; more than a handful means something is wrong.
+    public var maxRecordsPerConnection: Int
+    public var wire: ClaudeHookLimits
+    /// How long a `localvoxtral` command request may take to answer, and to
+    /// write back. A caller that stops reading must not hold a slot.
+    public var agentCLITimeout: TimeInterval
+
+    public init(
+        maxConcurrentConnections: Int = 8,
+        backlog: Int32 = 16,
+        readTimeout: TimeInterval = 2.0,
+        maxRecordsPerConnection: Int = 8,
+        wire: ClaudeHookLimits = .default,
+        agentCLITimeout: TimeInterval = 10.0
+    ) {
+        self.maxConcurrentConnections = maxConcurrentConnections
+        self.backlog = backlog
+        self.readTimeout = readTimeout
+        self.maxRecordsPerConnection = maxRecordsPerConnection
+        self.wire = wire
+        self.agentCLITimeout = agentCLITimeout
+    }
+
+    public static let `default` = ClaudeBrokerLimits()
+}
+
+#if canImport(Darwin) || canImport(Glibc)
+
+/// Raw AF_UNIX ingest for Claude Code hook records.
+///
+/// Design constraints, all load-bearing:
+///
+/// * **Raw POSIX sockets, not `Network.framework`.** NWListener cannot expose
+///   peer credentials for a local UNIX socket, and peer-UID verification is the
+///   whole authentication story here. There is no substitute.
+/// * **No `FileHandle.availableData`.** Banned repo-wide: it throws an
+///   uncatchable ObjC exception on descriptor errors and takes the app with it
+///   (field crash, PR #60).
+/// * **Trust from transport only.** The broker labels each record's origin from
+///   `getpeereid`, and the record has no origin field to argue with.
+///
+/// Threading: one accept thread, one short-lived thread per connection, and a
+/// `Mutex` for state — matching the repo's "no custom actors" convention.
+public final class ClaudeContextBroker: Sendable {
+    private struct State {
+        var isRunning = false
+        var admission = ConnectionAdmission()
+        /// Write end of the self-pipe that wakes a blocked accept loop.
+        var wakeWriteFD: Int32 = -1
+        /// Signalled by the accept loop's `defer` on EVERY exit — requested or
+        /// spontaneous. `stop()` waits on it so a caller that stops and
+        /// immediately restarts cannot race the outgoing loop for the socket.
+        var loopExit: DispatchSemaphore?
+        /// The socket inode this broker bound. Cleanup unlinks the path only
+        /// while it still names this inode (#1603).
+        var boundSocket: StoredFileStamp?
+    }
+
+    private let state = Mutex(State())
+    private let socketPath: String
+    private let registry: ClaudeSessionRegistry
+    private let limits: ClaudeBrokerLimits
+    private let uptimeNanos: @Sendable () -> UInt64
+    /// Answers the `localvoxtral` command's requests (#721). Nil answers every
+    /// request with an error.
+    private let agentCLI: (@Sendable (AgentCLIRequest) async -> AgentCLIResponse)?
+    /// Holds the channels sessions' mods attach (#1408). Nil refuses every
+    /// attach and drops every reply.
+    private let modChannels: ClaudeModChannelHub?
+
+    #if DEBUG
+    /// Test seam: fires after each record is accepted or rejected, so a socket
+    /// integration test can await a deterministic signal instead of polling the
+    /// registry on a wall clock (AGENTS: no wall-clock in tests). Never used in
+    /// production paths.
+    private let debugIngestHook = Mutex<(@Sendable (Result<ClaudeHookRecord, ClaudeHookWireError>) -> Void)?>(nil)
+    private let debugReadHook = Mutex<(@Sendable (Int) -> Void)?>(nil)
+
+    public func debugConfigureIngestHook(
+        _ hook: (@Sendable (Result<ClaudeHookRecord, ClaudeHookWireError>) -> Void)?
+    ) {
+        debugIngestHook.withLock { $0 = hook }
+    }
+
+    public func debugConfigureReadHook(_ hook: (@Sendable (Int) -> Void)?) {
+        debugReadHook.withLock { $0 = hook }
+    }
+
+    /// Test seam: fires on a connection's thread before anything is done with
+    /// it, so a test can let the peer leave first.
+    private let debugServeHook = Mutex<(@Sendable () -> Void)?>(nil)
+
+    public func debugConfigureServeHook(_ hook: (@Sendable () -> Void)?) {
+        debugServeHook.withLock { $0 = hook }
+    }
+
+    /// Test seam: fires in `start()` after the probe found the path stale and
+    /// before it is unlinked, with the bind lock held.
+    private let debugStaleRecoveryHook = Mutex<(@Sendable () -> Void)?>(nil)
+    /// Test seam: fires in `start()` right before it waits for the bind lock.
+    private let debugBindLockHook = Mutex<(@Sendable () -> Void)?>(nil)
+
+    package func debugConfigureStaleRecoveryHook(_ hook: (@Sendable () -> Void)?) {
+        debugStaleRecoveryHook.withLock { $0 = hook }
+    }
+
+    package func debugConfigureBindLockHook(_ hook: (@Sendable () -> Void)?) {
+        debugBindLockHook.withLock { $0 = hook }
+    }
+
+    private func debugNotify(_ result: Result<ClaudeHookRecord, ClaudeHookWireError>) {
+        let hook = debugIngestHook.withLock { $0 }
+        hook?(result)
+    }
+    #endif
+
+    public init(
+        socketPath: String,
+        registry: ClaudeSessionRegistry,
+        limits: ClaudeBrokerLimits = .default,
+        uptimeNanos: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds },
+        agentCLI: (@Sendable (AgentCLIRequest) async -> AgentCLIResponse)? = nil,
+        modChannels: ClaudeModChannelHub? = nil
+    ) {
+        self.socketPath = socketPath
+        self.registry = registry
+        self.limits = limits
+        self.uptimeNanos = uptimeNanos
+        self.agentCLI = agentCLI
+        self.modChannels = modChannels
+    }
+
+    public enum StartFailure: Error, Equatable {
+        case pathTooLong(String)
+        case socketCreationFailed(errno: Int32)
+        case bindFailed(errno: Int32)
+        case listenFailed(errno: Int32)
+        case alreadyRunning
+        /// Another live process of ours already owns this socket. Distinct from
+        /// `bindFailed(EADDRINUSE)`, which cannot tell a live owner from a
+        /// leftover file — and the two demand opposite responses.
+        case socketOwnedByLiveInstance(String)
+    }
+
+    public var socketURL: URL { URL(fileURLWithPath: socketPath) }
+
+    /// Bind, secure, and start accepting. Every failure is reported, never
+    /// swallowed — a silent failure path here is exactly how the ensureReady
+    /// bug cost an hour of remote probing (AGENTS: keep new paths loud).
+    public func start() throws {
+        let directory = (socketPath as NSString).deletingLastPathComponent
+        try ClaudeSocketGuard.prepareDirectory(at: directory)
+
+        // Every running copy of the app binds this one path. The probe, the
+        // unlink of a stale file and the bind are one step under a lock the
+        // copies share (#1603): two copies that both probed the same stale
+        // file would otherwise each unlink and rebind, the second removing
+        // the first's live socket.
+        #if DEBUG
+        debugBindLockHook.withLock { $0 }?()
+        #endif
+        let bindLock = Self.takeBindLock(beside: socketPath)
+        defer { withExtendedLifetime(bindLock) {} }
+
+        let (listenerFD, wakeReadFD, exitSignal): (Int32, Int32, DispatchSemaphore) =
+            try state.withLock { state in
+                guard !state.isRunning else { throw StartFailure.alreadyRunning }
+
+            var address = sockaddr_un()
+            address.sun_family = sa_family_t(AF_UNIX)
+            let pathBytes = Array(socketPath.utf8)
+            let capacity = MemoryLayout.size(ofValue: address.sun_path)
+            guard pathBytes.count < capacity else { throw StartFailure.pathTooLong(socketPath) }
+            withUnsafeMutableBytes(of: &address.sun_path) { raw in
+                raw.copyBytes(from: pathBytes)
+                raw[pathBytes.count] = 0
+            }
+            POSIXSocket.setLength(of: &address)
+
+            let fd = socket(AF_UNIX, POSIXSocket.stream, 0)
+            guard fd >= 0 else { throw StartFailure.socketCreationFailed(errno: errno) }
+
+            // Bind under a restrictive umask so the socket is never briefly
+            // world-reachable between bind() and chmod().
+            //
+            // Returns errno ALONGSIDE the result rather than leaving the caller
+            // to read it: `umask` runs between the bind and the return, and a
+            // caller reading `errno` afterwards is reading whatever the last
+            // syscall left there, not the bind's. That is the same trap
+            // `ClaudeSocketGuard.prepareDirectory` documents, and EADDRINUSE
+            // getting lost here would mean silently unlinking a live instance's
+            // socket — the exact failure this code exists to prevent.
+            func attemptBind() -> (result: Int32, code: Int32) {
+                let previousMask = umask(0o177)
+                let result = withUnsafePointer(to: &address) { pointer in
+                    pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+                        bind(fd, sockaddrPointer, socklen_t(MemoryLayout<sockaddr_un>.size))
+                    }
+                }
+                let code = errno
+                umask(previousMask)
+                return (result, code)
+            }
+
+            // Bind FIRST; only investigate if the path is taken.
+            //
+            // The previous code unlinked unconditionally, reasoning that the
+            // directory is ours and private so nothing else could have put a
+            // file there. True — but WE could have: a second live localvoxtral
+            // running as the same user owns a perfectly legitimate socket at
+            // this path, and unlinking it silently severed that instance from
+            // every hook publisher on the machine. It kept accepting on an
+            // unlinked inode, publishers connected to our new socket, and
+            // nothing anywhere reported a problem.
+            //
+            // So: EADDRINUSE is ambiguous, and the way to disambiguate is to ask
+            // the socket. A live owner accepts a connection; a leftover file
+            // from a crashed run refuses it (ECONNREFUSED — nothing is
+            // listening). Only the latter is ours to remove.
+            var bound = attemptBind()
+            if bound.result != 0, bound.code == EADDRINUSE {
+                if Self.isSocketLive(atPath: socketPath) {
+                    close(fd)
+                    throw StartFailure.socketOwnedByLiveInstance(socketPath)
+                }
+                #if DEBUG
+                debugStaleRecoveryHook.withLock { $0 }?()
+                #endif
+                Log.claudeContext.info("Removing stale Claude broker socket")
+                unlink(socketPath)
+                bound = attemptBind()
+            }
+            guard bound.result == 0 else {
+                close(fd)
+                throw StartFailure.bindFailed(errno: bound.code)
+            }
+            // Belt and braces: umask should have produced 0600 already, but
+            // macOS has historically been inconsistent about umask on AF_UNIX
+            // binds, and this is cheap.
+            chmod(socketPath, 0o600)
+            let boundSocket = StoredFileStamp.of(URL(fileURLWithPath: socketPath))
+
+            guard listen(fd, limits.backlog) == 0 else {
+                let code = errno
+                close(fd)
+                unlink(socketPath)
+                throw StartFailure.listenFailed(errno: code)
+            }
+
+            // Self-pipe: the only reliable way to wake a blocked accept loop.
+            // shutdown() on a LISTENING socket is not specified to return a
+            // blocked accept() on Darwin, and closing the fd underneath the
+            // loop is a use-after-close race — the accept thread could be about
+            // to call accept() on a number the kernel has already recycled to
+            // some other part of the app. Polling both the listener and this
+            // pipe means stop() just writes a byte and the loop leaves on its
+            // own terms.
+            var wakePipe: [Int32] = [-1, -1]
+            guard pipe(&wakePipe) == 0 else {
+                let code = errno
+                close(fd)
+                unlink(socketPath)
+                throw StartFailure.socketCreationFailed(errno: code)
+            }
+            // stop() writes to this pipe; the accept loop's defer closes the
+            // read end. Without NOSIGPIPE a stop() racing a loop that already
+            // exited would kill the whole app with SIGPIPE.
+            POSIXSocket.suppressSIGPIPE(onPipe: wakePipe[1])
+            state.wakeWriteFD = wakePipe[1]
+            let exitSignal = DispatchSemaphore(value: 0)
+            state.loopExit = exitSignal
+            state.boundSocket = boundSocket
+            state.isRunning = true
+                return (fd, wakePipe[0], exitSignal)
+            }
+
+        // Started OUTSIDE the lock: the accept loop's first act is to read
+        // `isRunning`, and this mutex is not reentrant. Spawning it while still
+        // holding the lock would park the new thread until start() returned —
+        // harmless today, but exactly the kind of ordering that becomes a
+        // deadlock the moment someone adds a join or a synchronous handshake.
+        let thread = Thread { [weak self] in
+            self?.acceptLoop(listenerFD: listenerFD, wakeReadFD: wakeReadFD, exitSignal: exitSignal)
+        }
+        thread.name = "com.localvoxtral.claude-broker"
+        thread.stackSize = 512 * 1024
+        thread.start()
+
+        Log.claudeContext.info("Claude context broker listening")
+    }
+
+    /// Stop accepting, and do not return until the accept loop is gone.
+    ///
+    /// The listener fd and the socket file are NOT touched here — the accept
+    /// loop owns both and releases them in its `defer`, on every exit path. That
+    /// keeps cleanup in ONE place: a stop-driven exit and a spontaneous one (a
+    /// failed poll, a dead listener) previously cleaned up differently, so a
+    /// loop that died on its own left the socket file on disk and the wake pipe's
+    /// write end open forever.
+    ///
+    /// Waiting is what makes `stop(); start()` safe. Without it, start() can bind
+    /// while the outgoing loop is still between its last accept() and its unlink
+    /// — and that unlink then deletes the NEW socket, leaving a running broker
+    /// nobody can reach.
+    public func stop() {
+        let (wakeFD, exitSignal): (Int32, DispatchSemaphore?) = state.withLock { state in
+            guard state.isRunning else { return (-1, nil) }
+            state.isRunning = false
+            let wakeFD = state.wakeWriteFD
+            // Taken under the lock so the loop's defer sees -1 and does not
+            // close it a second time. Exactly one of us owns this fd.
+            state.wakeWriteFD = -1
+            let exitSignal = state.loopExit
+            state.loopExit = nil
+            return (wakeFD, exitSignal)
+        }
+        guard wakeFD >= 0 else { return }
+        modChannels?.closeAll()
+        var byte: UInt8 = 1
+        _ = retryingOnEINTRInt { write(wakeFD, &byte, 1) }
+        close(wakeFD)
+        exitSignal?.wait()
+        Log.claudeContext.info("Claude context broker stopped")
+    }
+
+    public var isRunning: Bool { state.withLock { $0.isRunning } }
+
+    /// The lock every copy takes around binding or removing the socket. Nil
+    /// when the lock file cannot be opened: the caller goes on unlocked, as
+    /// before the lock existed, and says so.
+    private static func takeBindLock(beside socketPath: String) -> StoredFileLock? {
+        let lock = StoredFileLock.holding(beside: URL(fileURLWithPath: socketPath))
+        if lock == nil {
+            Log.claudeContext.error(
+                "Could not take the Claude broker socket lock shared with other running copies; going on without it"
+            )
+        }
+        return lock
+    }
+
+    private func removeSocketFile(ifStill boundSocket: StoredFileStamp?, thenClose listenerFD: Int32) {
+        let lock = Self.takeBindLock(beside: socketPath)
+        defer {
+            close(listenerFD)
+            withExtendedLifetime(lock) {}
+        }
+        guard let boundSocket,
+              let current = StoredFileStamp.of(URL(fileURLWithPath: socketPath)),
+              current.device == boundSocket.device, current.inode == boundSocket.inode
+        else {
+            Log.claudeContext.info("Claude broker socket path no longer names this copy's socket; leaving it")
+            return
+        }
+        unlink(socketPath)
+    }
+
+    /// Is something actually listening on this socket path?
+    ///
+    /// The only reliable answer is to connect. `stat` tells us a file exists,
+    /// which is true of both a live socket and the corpse of a crashed run;
+    /// those need opposite handling, and guessing wrong either steals a live
+    /// instance's socket or refuses to ever start again.
+    ///
+    /// Connecting to our own broker is harmless: it accepts, we send nothing, and
+    /// the connection closes. The serve thread reads EOF and exits.
+    package static func isSocketLive(atPath path: String) -> Bool {
+        guard let metadata = ClaudeSocketGuard.metadata(ofPath: path) else {
+            // Only a definite absence licenses cleanup. Any other lstat error
+            // is indeterminate, so assume a live owner and do not unlink.
+            return errno != ENOENT
+        }
+        // A symlink is never ours to follow or unlink. A non-socket inode in
+        // this already-validated private directory cannot belong to a live
+        // broker, so it is stale junk and may be replaced.
+        if metadata.isSymlink { return true }
+        guard metadata.isSocket else { return false }
+
+        var address = sockaddr_un()
+        address.sun_family = sa_family_t(AF_UNIX)
+        let pathBytes = Array(path.utf8)
+        guard pathBytes.count < MemoryLayout.size(ofValue: address.sun_path) else { return true }
+        withUnsafeMutableBytes(of: &address.sun_path) { raw in
+            raw.copyBytes(from: pathBytes)
+            raw[pathBytes.count] = 0
+        }
+        POSIXSocket.setLength(of: &address)
+
+        let probe = socket(AF_UNIX, POSIXSocket.stream, 0)
+        guard probe >= 0 else { return true }
+        defer { close(probe) }
+        let connected = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+                retryingOnEINTRInt32 {
+                    connect(probe, sockaddrPointer, socklen_t(MemoryLayout<sockaddr_un>.size))
+                }
+            }
+        }
+        guard connected != 0 else { return true }
+        let code = errno
+        switch code {
+        case ECONNREFUSED:
+            // The file is there but nobody is home: a corpse from a crashed run.
+            // This is the one answer that licenses removing it.
+            return false
+        case ENOENT:
+            // Nothing is there at all. Not live, and nothing to remove either.
+            return false
+        default:
+            // Anything else (EACCES, a timeout, EPERM) is a state we do not
+            // understand, and the safe reading of "I do not understand" is
+            // "assume it is live and do not delete it". Refusing to start is
+            // recoverable; deleting a live instance's socket is not.
+            return true
+        }
+    }
+
+    // MARK: - Accept
+
+    private func acceptLoop(listenerFD: Int32, wakeReadFD: Int32, exitSignal: DispatchSemaphore?) {
+        defer {
+            // The loop owns every resource start() handed it, and releases them
+            // all here — on EVERY exit, not just a stop() request. The loop can
+            // also leave on a failed poll or a dead listener, and that path used
+            // to clear `isRunning` and nothing else: the wake pipe's write end
+            // stayed open for the life of the process, and the socket file
+            // stayed on disk advertising a broker that no longer existed.
+            let (wakeWriteFD, boundSocket): (Int32, StoredFileStamp?) = state.withLock { state in
+                state.isRunning = false
+                let fd = state.wakeWriteFD
+                state.wakeWriteFD = -1
+                state.loopExit = nil
+                let bound = state.boundSocket
+                state.boundSocket = nil
+                return (fd, bound)
+            }
+            // Non-negative only on a SPONTANEOUS exit: stop() takes this fd
+            // under the same lock before writing to it, so exactly one of us
+            // ever closes it.
+            if wakeWriteFD >= 0 { close(wakeWriteFD) }
+            close(wakeReadFD)
+            // Ours to remove only while the path still names the inode we
+            // bound: another copy may have replaced it (#1603). The check and
+            // the unlink hold the bind lock, and the listener closes only
+            // after them: until then another copy's probe finds this socket
+            // live, so it cannot unlink it and bind a successor that reuses
+            // its inode number. stop() waits for this defer rather than
+            // unlinking itself, so a subsequent start() in this process
+            // cannot lose its socket here.
+            removeSocketFile(ifStill: boundSocket, thenClose: listenerFD)
+            exitSignal?.signal()
+        }
+        /// Consecutive accept() failures we could not attribute. Used only to
+        /// stop a hard-failing listener from becoming a hot loop.
+        var stickyErrors = 0
+
+        while state.withLock({ $0.isRunning }) {
+            var fds = [
+                pollfd(fd: listenerFD, events: Int16(POLLIN), revents: 0),
+                pollfd(fd: wakeReadFD, events: Int16(POLLIN), revents: 0),
+            ]
+            let ready = retryingOnEINTRInt32 { poll(&fds, 2, -1) }
+            if ready < 0 {
+                Log.claudeContext.error("Accept loop poll failed (\(errno, privacy: .public)); stopping")
+                return
+            }
+            // Wake byte, or the pipe's write end closed: either way, leave.
+            if fds[1].revents != 0 { return }
+            guard fds[0].revents & Int16(POLLIN) != 0 else {
+                if fds[0].revents & Int16(POLLERR | POLLHUP | POLLNVAL) != 0 {
+                    Log.claudeContext.error("Listener socket failed; stopping accept loop")
+                    return
+                }
+                continue
+            }
+
+            let fd = retryingOnEINTRInt32 { accept(listenerFD, nil, nil) }
+            guard fd >= 0 else {
+                let code = errno
+                switch code {
+                case EAGAIN, EWOULDBLOCK, ECONNABORTED:
+                    // The peer left between poll() and accept(). Routine.
+                    continue
+                case EMFILE, ENFILE:
+                    // Out of descriptors. poll() will keep reporting the same
+                    // pending connection immediately, so retrying in a tight
+                    // loop burns a core until the process-wide fd pressure
+                    // clears. Yield instead of spinning.
+                    Log.claudeContext.error("Accept hit the descriptor limit; backing off")
+                    usleep(100_000)
+                    continue
+                default:
+                    // An error we do not understand and that poll() will very
+                    // likely report again on the next iteration — the exact
+                    // shape of a 100%-CPU spin. Two in a row and we stop.
+                    stickyErrors += 1
+                    Log.claudeContext.error(
+                        "Accept failed (\(code, privacy: .public)); sticky=\(stickyErrors, privacy: .public)"
+                    )
+                    if stickyErrors >= 2 {
+                        Log.claudeContext.error("Accept loop stopping on repeated errors")
+                        return
+                    }
+                    continue
+                }
+            }
+            stickyErrors = 0
+            let decision = state.withLock { state -> ConnectionAdmission.Decision? in
+                guard state.isRunning else { return nil }
+                return state.admission.admit(limit: limits.maxConcurrentConnections)
+            }
+            switch decision {
+            case .refused(first: true):
+                Log.claudeContext.error(
+                    "Claude context broker at its cap of \(self.limits.maxConcurrentConnections, privacy: .public) connections: refusing new ones until one ends"
+                )
+            case .admitted(let refused) where refused > 0:
+                Log.claudeContext.error(
+                    "Claude context broker refused \(refused, privacy: .public) connections while at its cap; each lost a context update"
+                )
+            default:
+                break
+            }
+            guard case .admitted = decision else {
+                // Over the cap: drop immediately. The publisher fails open and
+                // the user loses one context update — the correct trade against
+                // unbounded thread growth.
+                close(fd)
+                continue
+            }
+            let thread = Thread { [weak self] in
+                guard let self else {
+                    close(fd)
+                    return
+                }
+                // A held mod channel gives its slot back when it attaches.
+                if !self.serve(connectionFD: fd) {
+                    self.state.withLock { $0.admission.release() }
+                }
+            }
+            thread.name = "com.localvoxtral.claude-broker.conn"
+            thread.stackSize = 512 * 1024
+            thread.start()
+        }
+    }
+
+    /// - Returns: whether the connection already gave its slot back, which a
+    ///   mod channel does once it attaches.
+    @discardableResult
+    private func serve(connectionFD fd: Int32) -> Bool {
+        defer { close(fd) }
+        #if DEBUG
+        debugServeHook.withLock { $0 }?()
+        #endif
+
+        // A reply to a peer that already left raises SIGPIPE, which kills the
+        // app, unless the socket has SO_NOSIGPIPE; Darwin refuses that option
+        // once the peer has closed (#791). Nobody is left to answer then.
+        guard POSIXSocket.suppressSIGPIPE(onSocket: fd) else {
+            Log.claudeContext.error("Dropping Claude broker connection: the peer left before it was served")
+            return false
+        }
+
+        // Authenticate BEFORE reading a single byte.
+        guard let peerUID = ClaudeSocketGuard.peerUID(ofDescriptor: fd) else {
+            Log.claudeContext.error("Rejected connection: peer credentials unavailable")
+            return false
+        }
+        guard peerUID == UInt32(geteuid()) else {
+            Log.claudeContext.error("Rejected connection from foreign uid \(peerUID, privacy: .public)")
+            return false
+        }
+        let origin = ClaudeTransportOrigin.localAuthenticated(peerUID: peerUID)
+        // Kernel-verified peer pid, read once per connection. Used only for
+        // the per-agent pid cross-check in `handle` — see peerPID's doc for
+        // why it applies to opencode records and cannot apply to Claude's.
+        let peerPID = ClaudeSocketGuard.peerPID(ofDescriptor: fd)
+
+        let deadline = uptimeNanos() &+ UInt64(max(0, limits.readTimeout) * 1_000_000_000)
+
+        var pending = Data()
+        var recordCount = 0
+        var chunk = [UInt8](repeating: 0, count: 8 * 1024)
+
+        while true {
+            guard readMore(fd: fd, into: &pending, using: &chunk, deadline: deadline) else {
+                break
+            }
+
+            // Split FIRST, then bound only what is left over. The cap is on a
+            // single LINE, not on how much a peer may send: a publisher is free
+            // to deliver several complete records in one chunk, and checking
+            // the pre-split buffer would drop that connection for the crime of
+            // being efficient. What must stay bounded is an unterminated line —
+            // i.e. the remainder.
+            let (lines, remainder) = ClaudeHookWireCodec.splitLines(pending)
+            pending = remainder
+            if pending.count > limits.wire.maxLineBytes {
+                Log.claudeContext.error("Dropping connection: unterminated line over cap")
+                return false
+            }
+
+            for line in lines where !line.isEmpty {
+                // A mod's channel holds the connection until it ends, and is
+                // the connection's only line.
+                if ClaudeModChannelWire.isAttach(line) {
+                    return holdModChannel(line: line, fd: fd)
+                }
+                // A command request is answered and ends the connection. It
+                // never reaches the registry: a hook record has no `cli` key.
+                if AgentCLIWire.isRequest(line) {
+                    answerAgentCLI(line: line, fd: fd)
+                    return false
+                }
+                recordCount += 1
+                if recordCount > limits.maxRecordsPerConnection {
+                    Log.claudeContext.error("Dropping connection: too many records")
+                    return false
+                }
+                if ClaudeModChannelWire.isReply(line) {
+                    deliverModReply(line)
+                    continue
+                }
+                if ClaudeModChannelWire.isBye(line) {
+                    deliverModBye(line)
+                    continue
+                }
+                let handled = handle(line: line, origin: origin, peerPID: peerPID)
+                reply(to: fd, accepted: handled.accepted, version: handled.replyVersion)
+            }
+        }
+        return false
+    }
+
+    // MARK: - Mod channels
+
+    /// Attaches the connection as `line`'s session's mod channel and holds
+    /// it until either end closes it. Only a session the registry already
+    /// has from a local hook may attach: the channel carries what the person
+    /// dictates, so it goes nowhere a hook did not first name.
+    ///
+    /// - Returns: whether the slot was given back (true once attached).
+    private func holdModChannel(line: Data, fd: Int32) -> Bool {
+        guard let modChannels,
+              let attach = ClaudeModChannelWire.decode(ClaudeModChannelWire.Attach.self, from: line)
+        else {
+            Log.claudeContext.error("Mod channel: refused an unreadable attach")
+            answerAttach(fd: fd, accepted: false)
+            return false
+        }
+        guard let snapshot = registry.snapshot(sessionID: attach.sessionID),
+              snapshot.origin.isLocalAuthenticated
+        else {
+            Log.claudeContext.info("Mod channel: refused an attach for a session no local hook has named")
+            answerAttach(fd: fd, accepted: false)
+            return false
+        }
+
+        // Writes come from the hub's callers. One at a time, so two lines
+        // never interleave, and bounded, so a mod that stops reading cannot
+        // hold a sender.
+        var sendTimeout = timeval(tv_sec: 2, tv_usec: 0)
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &sendTimeout, socklen_t(MemoryLayout<timeval>.size))
+        let descriptor = HeldDescriptor(fd)
+        let channel = ClaudeModChannelHub.Channel(
+            write: { [weak self] data in
+                guard let self else { return false }
+                return descriptor.use { self.writeAll(fd: $0, data: data) == data.count } ?? false
+            },
+            close: { _ = descriptor.use { shutdown($0, Int32(SHUT_RDWR)) } }
+        )
+        // The answer must be the connection's first line: a send that starts
+        // the moment the hub has the channel waits for it on the lock.
+        let token: UInt64? = descriptor.use { fd in
+            // Admitted under the broker's lock, which `stop` takes to clear
+            // `isRunning` before it closes every channel: a channel registers
+            // before that sweep or not at all.
+            let token = state.withLock { state -> UInt64? in
+                guard state.isRunning else { return nil }
+                return modChannels.attach(sessionID: attach.sessionID, channel: channel)
+            }
+            guard let token else {
+                return nil
+            }
+            answerAttach(fd: fd, accepted: true)
+            return token
+        } ?? nil
+        guard let token else {
+            answerAttach(fd: fd, accepted: false)
+            return false
+        }
+        state.withLock { $0.admission.release() }
+        registry.modChannelAttached(sessionID: attach.sessionID, claudePID: attach.claudePID, token: token)
+
+        // The publisher sends nothing after its attach, so any readable
+        // event is the end: EOF, an error, a shutdown, or a peer that broke
+        // the protocol.
+        var pollDescriptor = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+        while retryingOnEINTRInt32({ poll(&pollDescriptor, 1, -1) }) == 0 {}
+        // Before `serve` closes the number: a send still holding the channel
+        // must not write to whatever connection gets it next.
+        descriptor.retire()
+        let ended = modChannels.detach(sessionID: attach.sessionID, token: token)
+        registry.modChannelDetached(sessionID: attach.sessionID, token: token, sessionEnded: ended)
+        return true
+    }
+
+    private func answerAttach(fd: Int32, accepted: Bool) {
+        guard let line = ClaudeModChannelWire.encodeLine(ClaudeModChannelWire.AttachReply(accepted: accepted)) else {
+            return
+        }
+        _ = writeAll(fd: fd, data: line)
+    }
+
+    private func deliverModBye(_ line: Data) {
+        guard let bye = ClaudeModChannelWire.decode(ClaudeModChannelWire.Bye.self, from: line) else {
+            Log.claudeContext.error("Mod channel: dropped an unreadable bye")
+            return
+        }
+        modChannels?.bye(sessionID: bye.sessionID)
+    }
+
+    private func deliverModReply(_ line: Data) {
+        guard let reply = ClaudeModChannelWire.decode(ClaudeModChannelWire.Reply.self, from: line) else {
+            Log.claudeContext.error("Mod channel: dropped an unreadable reply")
+            return
+        }
+        modChannels?.deliver(reply)
+    }
+
+    /// Append one chunk under a whole-connection monotonic deadline. A
+    /// per-syscall `SO_RCVTIMEO` resets after every byte and lets a slowloris
+    /// retain a connection slot forever.
+    private func readMore(
+        fd: Int32,
+        into buffer: inout Data,
+        using chunk: inout [UInt8],
+        deadline: UInt64
+    ) -> Bool {
+        let current = uptimeNanos()
+        guard current < deadline else {
+            Log.claudeContext.error("Dropping Claude broker connection: read deadline expired")
+            return false
+        }
+        let remainingMillis = (deadline - current) / 1_000_000
+        var descriptor = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+        let timeout = Int32(min(remainingMillis, UInt64(Int32.max)))
+        let ready = poll(&descriptor, 1, timeout)
+        if ready < 0, errno == EINTR {
+            // Re-enter rather than retry with the same timeout: the caller
+            // loops straight back in and the remaining budget is recomputed,
+            // so a late signal cannot extend the absolute deadline.
+            return true
+        }
+        guard ready != 0 else {
+            Log.claudeContext.error("Dropping Claude broker connection: read deadline expired")
+            return false
+        }
+        guard ready > 0 else {
+            Log.claudeContext.error("Claude broker connection poll failed (\(errno, privacy: .public))")
+            return false
+        }
+
+        let count = retryingOnEINTRInt { read(fd, &chunk, chunk.count) }
+        guard count >= 0 else {
+            Log.claudeContext.error("Claude broker connection read failed (\(errno, privacy: .public))")
+            return false
+        }
+        guard count > 0 else { return false }
+        #if DEBUG
+        debugReadHook.withLock { $0 }?(count)
+        #endif
+        buffer.append(contentsOf: chunk[0..<count])
+        return true
+    }
+
+    /// Send the receipt back to the publisher.
+    ///
+    /// The reply is a RECEIPT and nothing more: which wire version we answered
+    /// in, and whether the record was committed. It carries no channel that
+    /// could put bytes on the caller's terminal, which is why no per-agent or
+    /// per-surface rule needs to gate it — there is nothing here to withhold.
+    ///
+    /// Best-effort by design — a publisher that has already exited is normal,
+    /// not an error.
+    private func reply(to fd: Int32, accepted: Bool, version: Int) {
+        guard let line = ClaudeBrokerResponse.encodeLine(
+            // Echo the REQUEST's wire version (review C4): an already-installed
+            // v1 publisher rejects any reply that does not say v1, so replying
+            // with the broker's own version would make its `--statusline` read
+            // "not connected" for every stale plugin install until it updated.
+            // `accepted` rides along in every reply shape — old decoders
+            // ignore the unknown key (synthesized Codable), so no bump.
+            ClaudeBrokerResponse(version: version, accepted: accepted)
+        ) else { return }
+        _ = writeAll(fd: fd, data: line)
+    }
+
+    /// Answers one `localvoxtral` command request on the connection's thread.
+    ///
+    /// Unlike a hook receipt, this reply is data: history, terms, status. It
+    /// goes to the peer the uid check already let in, which is the user's own
+    /// process and could read the same store from disk.
+    private func answerAgentCLI(line: Data, fd: Int32) {
+        var response: AgentCLIResponse
+        do {
+            let request = try AgentCLIWire.decodeRequest(line)
+            if let agentCLI {
+                response = Self.wait(for: request, answeredBy: agentCLI, timeout: limits.agentCLITimeout)
+                    ?? .failure(.busy, "the app did not answer in time")
+            } else {
+                response = .failure(.busy, "this app does not answer commands")
+            }
+        } catch let error as AgentCLIError {
+            response = AgentCLIResponse(error: error)
+        } catch {
+            response = .failure(.badRequest, "unreadable request")
+        }
+        if let error = response.error {
+            Log.backends.error("CLI: request refused: \(error.code.rawValue, privacy: .public)")
+        }
+        var encoded = AgentCLIWire.encodeLine(response)
+        if (encoded?.count ?? 0) > AgentCLIWire.maxResponseBytes {
+            Log.backends.error("CLI: answer over \(AgentCLIWire.maxResponseBytes, privacy: .public) bytes")
+            encoded = AgentCLIWire.encodeLine(
+                AgentCLIResponse.failure(.badRequest, "the answer is too large; lower --limit")
+            )
+        }
+        guard let encoded else { return }
+        var sendTimeout = timeval(tv_sec: Int(limits.agentCLITimeout), tv_usec: 0)
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &sendTimeout, socklen_t(MemoryLayout<timeval>.size))
+        if writeAll(fd: fd, data: encoded) < encoded.count {
+            Log.backends.error("CLI: caller left before the answer was written")
+        }
+    }
+
+    /// Runs an async answer from a connection thread, which has nothing else
+    /// to do while it waits. Nil when it does not finish in time.
+    private static func wait(
+        for request: AgentCLIRequest,
+        answeredBy answer: @escaping @Sendable (AgentCLIRequest) async -> AgentCLIResponse,
+        timeout: TimeInterval
+    ) -> AgentCLIResponse? {
+        let result = Mutex<AgentCLIResponse?>(nil)
+        let done = DispatchSemaphore(value: 0)
+        let task = Task {
+            let response = await answer(request)
+            result.withLock { $0 = response }
+            done.signal()
+        }
+        guard done.wait(timeout: .now() + timeout) == .success else {
+            task.cancel()
+            return nil
+        }
+        return result.withLock { $0 }
+    }
+
+    /// Writes everything it can; returns how many bytes went.
+    private func writeAll(fd: Int32, data: Data) -> Int {
+        data.withUnsafeBytes { raw -> Int in
+            guard let base = raw.baseAddress else { return 0 }
+            var offset = 0
+            while offset < raw.count {
+                let written = retryingOnEINTRInt {
+                    send(fd, base.advanced(by: offset), raw.count - offset, POSIXSocket.sendFlags)
+                }
+                if written <= 0 { return offset } // Peer gone: nothing to do.
+                offset += written
+            }
+            return offset
+        }
+    }
+
+    /// - Returns: whether the record was committed to the registry
+    ///   (`accepted` — carried back in the reply so a publisher can
+    ///   distinguish "read" from "took effect"), and the wire version to shape
+    ///   the reply as (the request's own — see `reply`).
+    ///
+    /// `accepted` is truthful for every layer that still produces a reply. A
+    /// reply is per complete LINE, so exactly three rejection layers can
+    /// answer `false`:
+    ///   1. wire-shape rejection of a complete line (`decodeLine` throws —
+    ///      malformed JSON, unsupported version, over-limit fields);
+    ///   2. the opencode peer-pid cross-check below;
+    ///   3. the registry refusing the record (`ingest` returns nil: focus
+    ///      declarations/clears for sessions it has never seen, origin or
+    ///      agent mismatch, `SessionEnd` for an unknown session, and the
+    ///      namespace-prefix aliasing drop).
+    /// Connection-level rejections (foreign uid, unterminated over-cap line,
+    /// too many records, read deadline) drop the connection WITHOUT a reply,
+    /// unchanged — publishers observe those as an error/close, not a verdict.
+    ///
+    /// The one line that is not an ingest at all: a `StatusQuery` record is a
+    /// read-only probe whose reply reuses `accepted` to mean "that session is
+    /// live in the registry right now". It never reaches `ingest`.
+    @discardableResult
+    private func handle(
+        line: Data,
+        origin: ClaudeTransportOrigin,
+        peerPID: pid_t?
+    ) -> (accepted: Bool, replyVersion: Int) {
+        do {
+            let record = try ClaudeHookWireCodec.decodeLine(line, limits: limits.wire)
+            // A status probe (`--statusline` mode) is answered here and NEVER
+            // ingested: `accepted` carries "is that session live in the
+            // registry", and nothing is created or refreshed by asking.
+            // `snapshot(sessionID:)` applies the same TTL + pid-liveness
+            // answer every join uses.
+            if record.event == .statusQuery {
+                let scopedID = ClaudeAgentSessionScope.scopedSessionID(
+                    agent: record.agent, sessionID: record.sessionID
+                )
+                let live = registry.snapshot(sessionID: scopedID) != nil
+                Log.claudeContext.debug("Status query: \(live ? "live" : "unknown", privacy: .public)")
+                // Deliberately NOT debugNotify: that seam means "a record was
+                // ingested or rejected", and a probe is neither — status-line
+                // traffic firing it would inflate any test counting real
+                // ingestions.
+                return (live, record.version)
+            }
+            // Per-agent pid cross-check against the KERNEL's answer. The
+            // opencode plugin runs inside the agent process and dials this
+            // socket from it, so the pid its records claim must be the pid on
+            // the other end of the connection — a same-user process forging
+            // opencode records for a pid it does not own is cut off here.
+            // Claude records cannot be held to this: their publisher is a
+            // transient child of the session, never the session process
+            // itself, which is exactly why the claude pid rides in the record
+            // (see ClaudeSocketGuard.peerPID). The residual same-user threat
+            // for THAT path is accepted and documented in
+            // docs/agent/invariants.md — trust is transport-derived, and
+            // every local peer shares this uid.
+            if record.agent == .opencode {
+                guard let peerPID, record.process?.claudePID == peerPID else {
+                    Log.claudeContext.error(
+                        "Rejected opencode record: claimed pid does not match socket peer"
+                    )
+                    #if DEBUG
+                    debugNotify(.failure(.malformed))
+                    #endif
+                    return (false, record.version)
+                }
+            }
+            let snapshot = registry.ingest(record, origin: origin)
+            let accepted = snapshot != nil
+            // Content is never logged — only its shape. A hook record carries
+            // the user's prompt and their file paths.
+            if accepted {
+                Log.claudeContext.debug("Ingested \(record.event.rawValue, privacy: .public)")
+            } else {
+                Log.claudeContext.debug("Registry refused \(record.event.rawValue, privacy: .public)")
+            }
+            #if DEBUG
+            debugNotify(.success(record))
+            #endif
+            return (accepted, record.version)
+        } catch let error as ClaudeHookWireError {
+            Log.claudeContext.error("Rejected record: \(String(describing: error), privacy: .public)")
+            #if DEBUG
+            debugNotify(.failure(error))
+            #endif
+            // The current version is as good as any guess for the reply
+            // shape of a record we could not decode a version out of.
+            return (false, ClaudeHookWire.version)
+        } catch {
+            Log.claudeContext.error("Rejected record: undecodable")
+            #if DEBUG
+            debugNotify(.failure(.malformed))
+            #endif
+            return (false, ClaudeHookWire.version)
+        }
+    }
+}
+
+/// A held mod channel's descriptor, as the hub's callers reach it: one use
+/// at a time, and none once the connection's thread retires it, so a late
+/// send never touches a number the kernel gave to another connection.
+private final class HeldDescriptor: @unchecked Sendable {
+    private let lock = NSLock()
+    private var fd: Int32?
+
+    init(_ fd: Int32) { self.fd = fd }
+
+    /// Runs `body` on the descriptor, or answers nil once it is retired.
+    func use<Value>(_ body: (Int32) -> Value) -> Value? {
+        lock.withLock { fd.map(body) }
+    }
+
+    func retire() {
+        lock.withLock { fd = nil }
+    }
+}
+
+/// EINTR-safe wrappers. A signal must not look like a socket failure.
+@inline(__always)
+private func retryingOnEINTRInt32(_ body: () -> Int32) -> Int32 {
+    while true {
+        let result = body()
+        if result == -1 && errno == EINTR { continue }
+        return result
+    }
+}
+
+@inline(__always)
+private func retryingOnEINTRInt(_ body: () -> Int) -> Int {
+    while true {
+        let result = body()
+        if result == -1 && errno == EINTR { continue }
+        return result
+    }
+}
+
+#endif

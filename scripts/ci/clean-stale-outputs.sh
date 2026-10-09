@@ -26,8 +26,13 @@ fi
 
 rm -rf dist logs format-lint.txt default.profraw
 
+# The removed dogfood suite's cache (#792). It built there on this
+# runner until #545 moved it to a hosted job; nothing builds there now.
+rm -rf .build-dogfood
+
 # Transient eval enable markers (gitignored, marker-through-the-tree
 # pattern): clean: false preserves them across runs, and a stray one would
 # flip a marker-gated live suite ON in a plain unit step.
 rm -f .agent-eval-e2e-enable.json .llm-polish-eval-enable.json \
-  .polishd-integration-enable.json .speechd-integration-enable.json
+  .polishd-integration-enable.json .speechd-integration-enable.json \
+  .herdr-integration-enable.json

@@ -2,12 +2,20 @@
 
 | Tier | What | When | Cost |
 |---|---|---|---|
-| 0 | Unit suite (500+ tests) + PolishHelper/SpeechHelper unit suites + packaging + launch smoke | every non-fast-path PR/push, CI (helper unit suites: self-hosted lanes only) | ~1 min |
-| 1 | `RealtimeAPIVLLMIntegrationTests` vs the live local speechd STT test service: real inference through the production websocket client, word-accuracy asserted | every non-fast-path PR/push on the self-hosted runner; locally via `remote-build.sh integration` | ~20 s |
+| 0 | Unit suite (3,900+ tests, one xctest process per core, each running whole test classes: `scripts/lib/unit-test-shards.sh`, the same shape `remote-build.sh test` drives over ssh) + shell gate suites (run in parallel by `scripts/ci/run-shell-suites.sh`; a new suite is one more argument there, and `test-ui-gate.sh` runs on a PR only when `scripts/ci/ui-gate-suite-filter.sh` says the diff touches a file it reads) + format lint + coverage (the unit suite skips `PolishContextPreparationTests`, the row below) | every non-fast-path PR/push, in CI's `build-test` job on **GitHub-hosted macOS** (owner decision 2026-09-05 — same-repo PRs too, not just forks; the Mac is the queue bottleneck and hosted runners are free for public repos) | ~4 min hosted, ~0 s queue |
+| 0 | `PolishContextPreparationTests`: the cost budgets of clipboard-context preparation — how much work grounding, excerpt selection and the containment sweep do on a realistic code-heavy buffer | every non-fast-path PR/push, in its own required step of `build-test` right after the unit suite (same `--enable-code-coverage`, so it reuses that binary). It is out of the unit suite because its assertions ARE about cost, so it cannot be made fast without deleting them (#430). Locally: `remote-build.sh test-cost-budgets` | ~6 s |
+| 0 | Packaging + launch smoke of the **signed** bundle, and the installable artifact | every non-fast-path dispatch, and every same-repo PR that is NOT a draft and whose diff reaches the bundle (pushes to main skip `mac-lanes`; a draft builds no bundle unless its body carries `[mac-lanes]`; a PR of tests, docs, CI scripts or other workflows builds none unless a lane that reads the bundle runs: `scripts/ci/mac-package-filter.sh`), in CI's `mac-lanes` job on the self-hosted Mac — the `localvoxtral-dev` identity is what keeps the owner's TCC grant valid across `try-pr.sh` installs. Fork PRs get an ad-hoc-signed equivalent inside `build-test` instead, since `mac-lanes` never runs for them | ~1 min |
+| 0 | PolishHelper / SpeechHelper unit suites (Metal-free: router, cache locator, watchdog; codec/delta contract) | self-hosted lanes only, and path-gated per helper — a PR runs a helper's suite only when the diff touches that helper's directory or the shared CI plumbing (a `ci.yml` edit counts only inside the `mac-lanes` job); `workflow_dispatch` runs both (`scripts/ci/helper-lane-filter.sh`, no marker; pushes to main skip `mac-lanes`). Locally: `remote-build.sh test --package-path PolishHelper` / `SpeechHelper` | 144 s + 206 s cold, ~25 s warm: the step compiles the helper package first ([why](#why-the-helper-unit-suites-are-path-gated)) |
+| 1 | `RealtimeAPIVLLMIntegrationTests` vs the live local speechd STT test service: real inference through the production websocket client, word-accuracy asserted. Two classes of that name: the client half in the core suite, which also runs on Linux against the dev box's vLLM (`VLLM_REALTIME_TEST_ENABLE=1 scripts/core-tests-linux.sh --filter RealtimeAPIVLLMIntegrationTests`, `say` tests excluded), and the microphone half in the app suite | conditional in CI (self-hosted): a PR runs it when the diff touches what the lane can see (the realtime client family, its scorer and fixture, the package pins, the CI plumbing: `scripts/ci/stt-lane-filter.sh`; a `Package.swift` edit counts only when it changes a dependency, pin, platform or build-setting line, and a `ci.yml` edit only inside the `mac-lanes` job, both read by `scripts/ci/lane-diff-facts.sh`) or opts in with `[run-stt-integration]`; every dispatch and every release run it. The service it talks to is the helper installed on the build host, not the PR's build, so a SpeechHelper diff is the next row's business; locally via `remote-build.sh integration` | ~50 s |
 | 1 | `PolishHelperIntegrationTests`: the packaged polishing helper vs the real pinned model — production request path, shared eval baseline, parent-pid tether | conditional in CI (self-hosted, after packaging): only when the diff touches LLM-relevant paths or the PR opts in with `[run-llm-eval]` — see "When must the LLM lanes run?"; locally via `remote-build.sh integration-polishd` | minutes (4B weights + live inference) |
 | 1 | `SpeechHelperIntegrationTests`: packaged speechd vs real spoken audio/model through the production realtime client — word accuracy, append-only delta/done parity, parent-pid tether | conditional in CI (self-hosted, after packaging): only when the diff touches speechd-relevant paths or the PR opts in with `[run-speechd-integration]`; locally via `remote-build.sh integration-speechd` | minutes (4B weights + live inference) |
-| 2 | `ui-smoke.yml` AX smoke drill (status item, settings tabs, lazy managed-backend launch invariant); dictation-with-audio remains future work | evening lock-aware slots (18:00/19:30/21:00 UTC; `ui-smoke-guard.sh` skips green when the Mac is on battery, the screen is locked, or a slot's drill already ran and passed that day — the drill needs an unlocked GUI session) + manual on the self-hosted GUI runner | — |
-| 2 | `AgentDictationE2EEvalTests` (`eval-e2e.yml`): wide agent-dictation eval — human WAVs or TTS(`say`) → live speechd ASR → bundled polishd through the production stop-commit path, scored against `EvalCorpus/agent-dictation/` (7 migrated required cases asserted; the rest XFAIL; WER informational; raw-model pre-safety diagnostic column) | nightly (skips green when the Mac is on battery — `ac-power-guard.sh`, owner rule 2026-07-24: scheduled lanes never run unplugged; manual dispatch always runs) + manual, NEVER per-PR (owner decision 2026-07-11); locally via `remote-build.sh eval-e2e [EvalRecordings/agent-dictation/<set>]` (run `package` first) | many minutes (live ASR/4B polish over ~160 cases; TTS WAVs cached on the host) |
+| 1 | `HerdrIntegrationTests`: the remote-herdr join machinery vs a LIVE `herdr` server over a REAL `ssh -L` forward — real socket client, real forward coordinator, real `ssh -G` canonicalization, real herdr `config.toml` patch (the fixture server's own, beside any herdr the account runs); the only fixture is the focused surface (a real herdr client on a pty) | conditional in CI (self-hosted): only when the diff touches herdr-relevant paths or the PR opts in with `[run-herdr-integration]`; locally via `remote-build.sh integration-herdr [ssh-destination]` | ~1 min (no model weights) |
+| 1 | `MistralRealtimeIntegrationTests`: the realtime client vs the LIVE hosted Mistral transcription API — handshake, synthetic spoken audio through the production frames, word accuracy, delta/done parity, and the 401 rejection path | NEVER in CI (the runner holds no Mistral key and the lane bills per minute of audio); by hand from the dev box via `MISTRAL_API_KEY=... ./scripts/remote-build.sh integration-mistral` | ~1 min + a few cents |
+| 2 | `ui-smoke.yml`, two jobs. The AX smoke drill (`scripts/ui-smoke.sh`: status item, settings tabs, no managed backend warmup logged or process spawned at launch in External URL mode, clean quit) runs on a GitHub-hosted `macos-latest` runner on an ad-hoc-signed bundle without the MLX helpers, launched from a copy outside the workspace with `.build` hidden (#87); it reaches no backend and needs no microphone. Then `scripts/e2e-dictation.sh` on the owner's Mac: the packaged harness app dictates from a WAV in place of the microphone into a throwaway target window, once per scenario file in `scripts/e2e/scenarios/` (Live Auto-Paste, Overlay Buffer), and the inserted text is scored against the spoken phrase. The only check that launches the packaged app AND dictates; polishing is off and `MicrophoneCaptureService` is bypassed. Exit 3 = the Mac could not run it (locked, no STT server, a speech service lagging past what the app waits for): green with a warning on the owner's dispatch on main, red on a branch dispatch or the label. Exit 4 = the app under test has no Accessibility grant: red on every run, because the grant does not come back by itself (`scripts/ci/e2e-dictation-outcome.sh`) | no schedule. The owner dispatches it on main when he is at the Mac (the GitHub app's "Run workflow" button or `gh workflow run ui-smoke.yml`); `ui-smoke-guard.sh` skips that run green when the Mac is on battery or the screen is locked. Agents dispatch on a branch through `scripts/ui-smoke-dispatch.sh`; the owner adds the `needs-ui-smoke` label. The drill runs on every dispatch and label, hosted | drill: ~5.5 min hosted (4.5 min cold packaging, 1 min drill); dictation: a few minutes of the Mac |
+| 2 | `AgentDictationE2EEvalTests` (`eval-e2e.yml`): wide agent-dictation eval — human WAVs or TTS(`say`) → live speechd ASR → bundled polishd through the production stop-commit path, scored against `EvalCorpus/agent-dictation/` (7 migrated required cases asserted; the rest XFAIL; WER informational; raw-model pre-safety diagnostic column) | dispatch only, never scheduled (owner decision 2026-10-08: a run on an unchanged prompt measures nothing) and NEVER per-PR (owner decision 2026-07-11); locally via `remote-build.sh eval-e2e [EvalRecordings/agent-dictation/<set>]` (run `package` first) | many minutes (live ASR/4B polish over ~160 cases; TTS WAVs cached on the host) |
+| 2 | `TermRecallEvalTests`: the speech engine alone on the owner's technical terms — `say` or human WAVs → one live speech test service, scored by `TermRecallScorer` for term recall, false insertions of listed terms and non-term WER, English and French apart; also scores a file of hypotheses and pairs two runs. In the core suite, so it also runs on Linux against the dev box's vLLM with a recorded set (`EvalCorpus/term-recall/README.md`). PRIVATE cases | by hand only, never in CI (the cases never leave the owner's machines): `remote-build.sh eval-term-recall [--asr <name>]`. Required proof for engine term biasing (#316, #521) and a second pass on stop (#524) | 260 cases: ~10 min on Nemotron, ~35 min on Voxtral (measured 2026-09-25; TTS WAVs cached on the host) |
+| 2 | `AgentDictationASREvalTests`: the speech stage of the agent-dictation eval alone — a recorded set → one live speech service through the production client, no polish; word accuracy and the ASR-only stratum's tokens. For the dev box's vLLM (BF16, not the shipped engine) | by hand only, on Linux: marker `.agent-eval-asr-enable.json` (`EvalCorpus/agent-dictation/README.md`, "ASR-only runs on Linux"). Direction only; `eval-e2e` stays the proof | 146 cases: 8 min on the dev box's vLLM (measured 2026-09-26) |
+| 2 | `release.yml` DAILY channel: the whole release pipeline (unit suite, live STT integration, packaging, launch smoke) on the newest `main` commit whose UI Smoke run scored the e2e dictation (`scripts/ci/daily-release-plan.sh`), published as a stable minor release (`v0.9.x` → `v0.10.0` → `v0.11.0`). The on-demand NIGHTLY channel runs the same pipeline on `main`'s head without the e2e gate, as a `vX.Y.Z-nightly.YYYYMMDD` prerelease that never touches `/releases/latest`; nightlies beyond the newest 7 are pruned | dispatched at 03:15 UTC by the dev box's scheduler (`./scripts/release.sh daily`), with the 03:15 UTC cron as fallback, + `./scripts/release.sh daily` or `nightly` by hand; a scheduled run skips green outside the night window, after a covering run or on battery (`scheduled-run-guard.sh`, see "Scheduled Mac inference stays in the night window"), and a daily run skips green when no commit since the newest stable tag passed the e2e dictation. To exercise the pipeline without releasing anything: `./scripts/release.sh rehearse [target] [ref]` (every gate, artifacts on the run, no tag, any ref). That rehearsal is the proof a change to release.yml carries | ~10-20 min |
 
 Tier 1 details: the suite is env-gated (`VLLM_REALTIME_TEST_ENABLE=1`) and
 expects an STT server at `ws://127.0.0.1:8000/v1/realtime` — on the build host it
@@ -25,9 +33,19 @@ owner runbook `scripts/mac/README.md`), so their weights are not resident 24/7.
 This is hands-free: CI warms speechd in a step before the integration suite, and
 `remote-build.sh integration|eval-llm|eval-e2e` warm the right server through the gate's
 `ensure` verb first (names `speechd`/`polishd`, with `voxmlx`/`mlxlm` accepted as
-deprecated aliases), blocking until the port is healthy. A burst of runs reuses
+deprecated aliases), blocking until the port is healthy. Every live verb and
+the unfiltered `test` refuse without `LV_ALLOW_HEAVY_MAC_RUN=1` (#617), so a hand
+run is a decision: the commands below leave it out. A burst of runs reuses
 one warm process (each `ensure` resets a ~20 min idle window); the reaper frees
 the RAM once the machine goes quiet.
+
+TTS voices in `eval-e2e` and term-recall: each language takes the first voice
+`say -v ?` lists from `EvalSpeechStage`'s preference list (en: Samantha, Alex,
+Daniel; fr: Thomas, Jacques, Amélie), logs a line when it skipped one, and
+fails setup when it finds none. The chosen voices print in the scoreboard
+header, and scores compare only between runs with the same voices. Since
+macOS 27 the Mac's Actions runner lists neither Samantha nor Alex, so CI runs
+get Daniel (#960).
 
 LLM polish prompt eval: `LLMPolishPromptEvalTests` scores the bundled default
 polishing prompt (punctuation-spacing cases, French vs English) against a live
@@ -37,14 +55,35 @@ on-demand `com.localvoxtral.testpolishd` launchd service on port 8080 (the
 bundled `localvoxtral-polishd`, running the production default model), which the
 lane warms first via the gate's `ensure` verb (owner runbook: `scripts/mac/README.md`);
 a custom endpoint is left untouched. Don't point it at the app-managed instance
-on 8472, which dies whenever the app quits. Enablement is env
-(`LLM_POLISH_EVAL_ENABLE=1`) or the marker file the script writes into the
-synced tree (the SSH gate can't pass env vars). Prompt changes MUST re-run
+on 8472, which dies whenever the app quits. The optional second argument is the
+model alias, and its prefix selects the request shape: `llamacpp/<model>` sends
+the llama.cpp-via-Bifrost extras, `mistral/<model>` sends Mistral's closed
+request schema (prefix stripped from the model name, `reasoning_effort: none`,
+none of the `top_k`/`min_p`/`chat_template_kwargs`/`thinking_budget_tokens`
+extras) and copies this box's `MISTRAL_API_KEY` into the marker — e.g.
+`MISTRAL_API_KEY=… ./scripts/remote-build.sh eval-llm https://api.mistral.ai mistral/mistral-medium-3-5`.
+Enablement is env (`LLM_POLISH_EVAL_ENABLE=1`, with
+`LLM_POLISH_EVAL_REQUEST_SHAPE=mistral` for the shape) or the marker file the
+script writes into the synced tree (the SSH gate can't pass env vars). A change
+to the request shape MUST re-run this lane against the provider it changes.
+Prompt changes MUST re-run
 this eval and paste the scoreboard in the PR's Proof section. The corpus +
 scorer live in `LLMPolishEvalSupport`, shared with
 `PolishHelperIntegrationTests` (`remote-build.sh integration-polishd`), which
 holds the bundled MLX Swift polishing helper to the same baseline — engine or
 model-pin changes MUST run that one too.
+
+Mistral lane: `MistralRealtimeIntegrationTests` is the only lane that leaves the
+owner's machines — it talks to `wss://api.mistral.ai/v1/audio/transcriptions/realtime`
+with a real key and is billed per minute of audio, so it is deliberately absent
+from every workflow. Enablement is `MISTRAL_API_KEY` in the environment (a direct
+run on a Mac) or the gitignored `.mistral-integration-enable.json` marker that
+`remote-build.sh integration-mistral` writes 0600 into the synced tree and removes
+on exit; without either, the suite self-skips and the unit lane stays clean. Run it
+for any change to the Mistral wire path — frame shapes, the `model` query item, the
+`Authorization` header, the finalization gate, or the HTTP-status enrichment the
+`.unauthorized`/`.rateLimited` classifier kinds depend on — and paste the accuracy
+line in the PR's Proof section.
 
 ## When must the LLM lanes run?
 
@@ -58,41 +97,515 @@ reuses its original event payload — after adding the marker, push (an empty
 commit works, or put the marker in the commit message). The exact path list
 lives in
 `scripts/ci/llm-lane-filter.sh` — PolishHelper/**, the bundled
-`llm_*.toml` prompts, model catalog/pins, the polish client, token guard,
+`llm_*.toml` prompts and `AppConfigStore.swift`, which loads and renders
+them, model catalog/pins, the polish client, token guard,
 prompt warmup, clipboard context/macro, repo vocabulary, the polish-commit
-path (`DictationViewModel+Session.swift`), and the eval support/corpus. The
+path (`StopCommitCoordinator.swift`, the steps it calls, and
+`DictationSessionController+StopCommit.swift`, which hands it the
+transcript, the latched dictionary and the commit target), and the eval
+support/corpus. The
 decide step writes "LLM eval lane: RUNNING (…)" or "SKIPPED (…)" to the
 run's step summary so a skipped run is self-explanatory. The PolishHelper
-UNIT suite (Metal-free) and the tier-1 speechd realtime integration stay
-per-push.
+UNIT suite (Metal-free) is path-gated per helper, and the tier-1 speechd
+realtime integration is path-gated on PRs (`scripts/ci/stt-lane-filter.sh`)
+and unconditional on dispatches and in every release.
 
 The rule behind the list — the LLM lanes are REQUIRED for changes to:
 prompts, model pins/catalog, sampling/template kwargs, the polish request
-shape or anything that alters what reaches the model (context attachment,
-dictionary/vocabulary hints, macro placeholders, token guard repair
-semantics), the helper engine, or the eval corpus/scorer. NOT required for
-UI, insertion, audio, backend-supervision, or test-only changes elsewhere.
+shape or anything that alters what reaches the model (what context text is
+harvested, selected and framed, dictionary/vocabulary hints, macro
+placeholders, token guard repair semantics), the helper engine, or the eval
+corpus/scorer. NOT required for UI, insertion, audio, backend-supervision, or
+test-only changes elsewhere, nor for which session the Claude context comes
+from (the join, the hook publishers and parsers, the broker and registry, the
+agent integrations; owner call, #643). The lane replays a fixed corpus
+through `LLMPolishingService` and executes none of those. Their proof is
+`PolishRequestGoldenTests` (see "Proving a change to the polish path with the
+request goldens"): its local-join, remote-join and terminal-screen cases seed
+the real registry with hook records and pin the request a join produces, so a
+change there that alters the Claude blocks changes a fixture. The goldens do
+not run the resolver's surface matching, the publishers, the parsers of raw
+hook JSON or the plugins; their unit suites and the herdr lane cover those,
+and the live lane never ran them either.
 Either way, the PR's Proof section states one of the two: the lane's
 scoreboard, or a one-line justification for skipping. If the path filter
 misses a change that belongs above, add `[run-llm-eval]` AND extend the
-filter list in the same PR. `./scripts/remote-build.sh integration-polishd`
-remains the local equivalent. The nightly `eval-e2e.yml` lane is the only
-scheduled eval; the per-PR polishd lane skipped by the filter runs again only
-when a matching change (or the marker) triggers it.
+filter list in the same PR.
+
+The filter matches sources by name, so it also catches changes that cannot
+alter what reaches the model: a Foundation-only type moved between targets
+(the #545 series), a rename with no content change. A file under a `Tests/`
+directory runs the lane only when it is the lane's own suite or the eval
+harness (`LANE_TEST_PATTERNS` in the filter), so a unit test named after a
+polish type, or a test target named after a hook type, no longer does. For
+the rest, put
+`[skip-llm-eval: <reason>]` in the PR body or head commit message, under the
+same run-creation rule as the opt-in marker, and the lane skips even though the
+path matched. Use it only when the change cannot affect the prompt, model pins
+or catalog, sampling, the polish request shape, the helper engines, or the eval
+corpus, scorer or harness; when in doubt, let the lane run. The reason is the
+Proof section's one-line justification, and the decide step echoes it as a
+"LLM eval lane WAIVED" warning on the run page. A bare `[skip-llm-eval]` or an
+empty reason waives nothing (the run page says why), and `[run-llm-eval]`
+beside it wins. The filter stays the default rather than an opt-in because it
+has caught files whose role in the prompt was not obvious from their names:
+`AppConfigStore` renders the polish prompt and joined the list late (#564). The other direction has a list too: `EXEMPT` in
+the same script names the `ClaudeContext/` files that install, configure,
+keep a tunnel open or resolve the join, so an enrollment, settings or join
+diff does not buy live 4B inference on the owner's Mac. A new file in either
+`ClaudeContext/` directory runs the lane until it is added there, and only a
+file that cannot change the bytes of a Claude block belongs. `./scripts/remote-build.sh integration-polishd`
+remains the local equivalent. No eval is scheduled: `eval-e2e.yml` runs
+when dispatched, and the per-PR polishd lane skipped by the filter runs again
+only when a matching change (or the marker) triggers it.
+
+## Which runner a lane lands on
+
+`ci.yml` is four parallel jobs, and which one a lane is in is a statement about
+what it needs, not about cost:
+
+- **`build-test`, GitHub-hosted `macos-latest`, every event and every
+  contributor** — a required status check on main, like `mac-lanes`.
+  Anything that needs only a macOS toolchain: the pure-shell gate suites, the installer test, format
+  lint, the unit suite, coverage. A fork PR gets ONLY this job, so it also
+  packages/uploads/smokes an ad-hoc-signed bundle there.
+- **`linux`, GitHub-hosted Ubuntu, every event and every contributor** —
+  a required check. Every `scripts/ci/test-*.sh` suite, by glob, and
+  the Linux-buildable Swift targets through `scripts/core-tests-linux.sh`,
+  `localvoxtralTestSupport` (the doubles both test targets share) included.
+  `build-test` runs the shell suites too, for the Mac's bash 3.2.
+- **`mac-lanes`, the self-hosted Mac, same-repo PRs that are NOT drafts +
+  pushes + dispatches** — a draft gets `build-test` only, and marking it ready
+  (`gh pr ready <n>`) starts the run. The literal `[mac-lanes]` in a draft's PR
+  body opts it back in, for a draft that needs the signed `try-pr.sh` artifact
+  or a live lane. What the job holds is
+  anything that needs THAT machine: the `localvoxtral-dev` signing identity
+  (an ad-hoc signature invalidates the owner's Accessibility grant on every
+  `try-pr.sh` install), the launch-on-demand speechd STT service and the
+  multi-GB weights, a real Metal toolchain for the two MLX helpers, the
+  herdr/sshd fixture, the GUI session the UI-gate artifact root lives in, and
+  the warm `clean: false` `.build` the helper suites depend on.
+
+**Adding a lane: put it in `build-test` unless you can name the thing on the
+owner's Mac that it needs.** The Mac is a single runner and a personal machine;
+`build-test` is free and starts in seconds.
+
+## Why the helper unit suites are path-gated
+
+Owner decision 2026-09-05. The two helper UNIT suites ran on every self-hosted
+run, including on diffs that could not possibly change what they test. Each
+step compiles its helper package first, so its cost depends on whether that
+package's `.build` is warm: cold, the polish and speech suites took 144 s and
+206 s (run 36232595558); warm, the speech suite took 25 s (run 36235128139).
+They are gated per helper by `scripts/ci/helper-lane-filter.sh`, which is sound
+because **both helpers are hermetic SwiftPM packages**:
+`PolishHelper/Package.swift` and `SpeechHelper/Package.swift` declare only
+REMOTE dependencies — no `path:` dependency, no `..` reference, no symlink out
+of the directory, no source shared with the root package. A helper suite's only
+inputs are therefore its own directory (`Package.swift` and `Package.resolved`
+included — that is the dependency-pin surface), the Xcode toolchain (not a
+diff), and the CI plumbing that invokes it and prepares its workspace.
+
+So: `PolishHelper/**` → the polish suite; `SpeechHelper/**` → the speech suite;
+`.github/workflows/ci.yml`, `scripts/package_app.sh`, or one of the
+`scripts/ci/` files the job runs to decide the suites or to prepare the
+workspace before them (the filter lists them) → BOTH, except a `ci.yml` edit
+outside the `mac-lanes` job and the file's head (`scripts/ci/lane-diff-facts.sh`),
+which cannot change how the suites run. Another lane's filter or a shell test
+runs neither;
+`workflow_dispatch` → BOTH; a push to main → BOTH (main is the parity
+reference and is never gated; `mac-lanes` itself skips main pushes, so this
+rule applies only if that changes); an uncomputable diff or an unrecognized event →
+BOTH, failing open exactly like `docs-only-filter.sh`.
+
+**This is not the live-model lanes' "expensive, so opt in" pattern and there is
+no marker.** Nothing here is a judgment call: a diff that can affect a suite
+runs it, and a dispatch is the escape hatch if you ever want both anyway. If
+you make a helper depend on something outside its directory — a local `path:`
+dependency, a shared source directory — the premise breaks and the shared list
+in the filter has to grow in the same PR.
+
+## Why a PR waits: the waits labels
+
+An open PR that cannot merge yet carries one `waits:` label per reason, so the
+owner and the scheduler can read the queue from the PR list. Mac inference
+runs only in the night window the scheduler books, so the three Mac labels
+say what that night has to run.
+
+| Label | Waits for | Added by | Removed by |
+|---|---|---|---|
+| `waits:mac-voxtral` | Voxtral inference on the Mac: the speechd or live STT lane, an ASR eval, a speech helper replay | CI from the lane filters, or the worker | the scheduler, once the night run passed |
+| `waits:mac-llm` | LLM inference on the Mac: the LLM lane, the eval-e2e scoreboard, a polish helper replay or bench | CI from the lane filters, or the worker | the scheduler, once the night run passed |
+| `waits:mac-e2e` | a scored UI Smoke e2e dictation on the final diff, which the owner starts | the worker | the scheduler, once a run scored |
+| `waits:stack` | its base PR to merge | CI when the base is not `main` | the scheduler, after the retarget |
+| `waits:ci-red` | a known flake or a semantic conflict with main that someone is fixing | the worker or the scheduler | whoever gets it green |
+| `waits:external` | a key, account or decision from outside the repo | the worker | the worker |
+
+A hand check never holds a merge: the owner tries its steps in the next
+daily release. The owner's OK to merge comes in chat or through the merge
+classes.
+
+`pr-waits-labels.yml` adds the lane and stack labels on every push, body or
+base edit (`scripts/ci/waits-labels.sh`, the same filters `ci.yml` runs). It
+never removes one. A push after the night run adds the Mac label back, which
+is right: the lanes must pass on the final diff. CI cannot see an eval-e2e
+scoreboard, a replay, or a lane waived in an earlier commit's message, so the
+worker adds or removes those labels by hand.
+
+## Scheduled Mac inference stays in the night window
+
+Scheduled inference on the Mac runs 00:00–07:00 UTC; after that the owner
+works on the machine. GitHub fires `schedule:` events hours late (#822: the
+04:45 UTC Sunday `eval-e2e`, scheduled until 2026-10-08, was created at 09:33
+and 09:48 UTC), so a cron inside the window does not keep the run there. So
+the daily release (`release.yml`) runs two ways:
+
+- The dev box's scheduler dispatches it on main daily at 03:15 UTC with
+  `release.sh daily`. A dispatch always runs.
+- The cron stays as the fallback, for a night the scheduler's timer misses. A
+  scheduled run skips green, with the reason in the step summary ("Release
+  skipped"), when it cannot finish by 07:00
+  UTC (`scripts/ci/night-window-guard.sh`, 30 minutes) or when
+  another run of the same workflow on main succeeded, or is queued or
+  running, in the last 20 hours (`scripts/ci/recent-run-guard.sh`), which is
+  what keeps the dispatch and the cron from both running. The release chains
+  both with the AC power guard in `scripts/ci/scheduled-run-guard.sh`.
+- The release's 30 minutes cover a typical notarization, but Apple can hold
+  one for hours. So a daily release that starts inside the window, dispatched
+  or scheduled, cuts each notarization wait at 07:00 UTC
+  (`scripts/ci/night-deadline.sh`) and fails untagged when Apple has not
+  answered by then (#1554).
+
+A new scheduled workflow that runs inference on the Mac takes both guards.
+
+## Dispatching a run without deepening the queue
+
+Two self-hosted runners, one job at a time each. The Mac Mini (label `mini`)
+runs `mac-lanes`, UI Smoke's e2e dictation, `capture-assets`, `dmg-test`,
+`record-demo` and `release`; the owner's MacBook (`self-hosted, macOS, ARM64`,
+which the Mini does not carry) runs `eval-e2e` and `mac-crashlog`. PR CI
+therefore still has a concurrency of 1, and every extra run is paid by
+everything behind it. Measured 2026-09-05: in a
+3.6 h burst with four agents pushing, the runner was **89 % busy** — 26 jobs,
+19 minutes of total idle — and 3.4 h of work produced **8.95 h of accumulated
+queue**. At that utilization a queue is quadratically sensitive to load, so one
+avoidable run costs far more than its own duration.
+
+- **Never dispatch a build for a ref whose push/PR run is still queued.** The
+  dispatch lands in a DIFFERENT concurrency group — `ci-refs/heads/<branch>`
+  vs `ci-refs/pull/<n>/merge` — so `cancel-in-progress` does not deduplicate
+  them and both run to completion. Check first:
+  `gh run list --branch <ref>` (or `--workflow ci.yml`), and wait for the
+  existing run instead. Observed the same day: runs `33973422149` (dispatch)
+  and `33973420824` (PR) on one branch 20 s apart, and `33974946864`
+  (dispatch on main) alongside `33974943655` (that push's own run).
+- **The one exception** is a dispatch that produces something the queued run
+  cannot — an artifact-only input the queued run never carries. A dispatch
+  that would merely re-run the same lanes is never worth its slot.
+- **Drafts, and how a push is priced.** `mac-lanes` skips a draft, so the
+  cheap loop is: open as a draft, push as often as the hosted `build-test`
+  needs, `gh pr ready <n>` once. After that every push costs a Mac slot and
+  cancels the run in progress (11 % of the Mac's busy time went to runs that
+  were later cancelled, #418), so pull a PR back with `gh pr ready <n> --undo`
+  before a series of pushes; that also replaces its queued Mac job with a
+  skipped one. A draft and its ready run share one head SHA, which is why
+  `watch-checks.sh` reads the newest check run of each name.
+- Do not "just rerun" a red run to see if it is flaky before reading its log
+  either — the flake signatures are enumerated in
+  `docs/agent/field-debugging.md`, and a rerun is a full second run.
+
+## Proving a change with the e2e dictation check
+
+`scripts/e2e-dictation.sh` is the one check where the packaged app hears audio
+and puts text into another app's window. Each run holds the owner's Mac for
+several minutes, takes the keyboard and queues every other agent's
+`mac-lanes` behind it, so it runs at release time, when the owner is at the
+Mac, and a PR proves the session path in process (#574).
+
+`DictationPipelineTests` runs one dictation per e2e scenario, from
+`startDictation` to the stop's commit, through the real session code and the
+real `RealtimeAPIWebSocketClient` over a loopback socket
+(`TestSupport/FakeRealtimeServer`). Only the microphone, the speech model and
+the target app are fakes. A session-path change extends it or the suites
+beside it. The link-by-link map, and the broken link each test catches, are
+in #583.
+
+At release, `scripts/release.sh` refuses a stable release (not a daily, a
+nightly or a rehearsal) unless a UI Smoke run on the release commit has its
+`E2E dictation scored` step green. That step runs only when every scenario
+was scored and passed; the dictation step itself also goes green on a locked
+Mac. The daily release applies the same rule in the workflow: it ships the
+newest main commit with such a run, which can be behind main's head, and
+skips the day when there is none since the last stable tag. UI Smoke has no
+schedule; the owner starts the run on main when he is at the Mac:
+
+```bash
+gh workflow run ui-smoke.yml --ref main   # the Mac unlocked, the owner at it
+./scripts/release.sh --dry-run patch      # the gate's answer, no dispatch
+```
+
+The harness the check dictates with is `com.localvoxtral.e2e-harness`,
+signed `localvoxtral-dev`, so it holds an Accessibility row of its own. A
+harness under `com.localvoxtral.app` shared the owner's row, and since macOS
+ties a row to one signature, the ad-hoc release and the harness took the
+grant from each other (#1198). The run writes only the harness's defaults
+domain and launches it from
+`~/Library/Application Support/localvoxtral-e2e/localvoxtral.app`. The owner
+grants it once: System Settings > Privacy & Security > Accessibility
+(Device Control and Data Access on macOS 27), +, Cmd-Shift-G, that path,
+Open, then make sure its switch is on. The row
+survives rebuilds, since TCC keys it on the bundle id and the signing
+identity.
+
+On a PR the run is optional, for what only it reaches: text insertion into
+another app's window, focus handling and TCC. No agent account can run it
+directly, since the build gate has no GUI session and the UI gate reaches
+only the app under test. It goes through the wrapper, which refuses when the
+run is not justified. A dispatch also runs the AX drill on a GitHub-hosted
+runner, which costs the Mac nothing:
+
+```bash
+./scripts/ui-smoke-dispatch.sh --dry-run <branch>   # does this diff need it?
+./scripts/ui-smoke-dispatch.sh <branch>
+gh workflow run ui-smoke.yml --ref <branch> -f drill_only=true   # a drill-only change: no Mac, no wrapper
+gh run list --workflow ui-smoke.yml --branch <branch> -L 1
+./scripts/watch-checks.sh --run <run-id>
+gh run view <run-id> --log | grep -E "spoken:|inserted:|PASS:|FAIL:|NOT RUN:"
+```
+
+It refuses when:
+
+- the diff against main touches no insertion, focus or commit file. The list is
+  `scripts/ci/e2e-dictation-filter.sh`; the polish path, the overlay's look,
+  settings and docs are off it. The PR body quotes the `path:` line either
+  way, as it does for the live lanes.
+- `build-test` is not green on the pushed head. Dispatch after the review
+  fixes, on the final diff, never per commit.
+- a UI Smoke run on the branch is queued or running, or started less than an
+  hour ago.
+- a run already ran on this head commit, whatever it concluded. `NOT RUN:`
+  (exit 3: the Mac was locked or the STT test service was down or lagging;
+  exit 4: the app had no Accessibility grant) and a lost keyboard focus measure the
+  Mac, not the change. Put the line in the Proof section and ask the owner; don't
+  redispatch. A later commit may run again after the hour; take that run only
+  when the commit changed one of those files since the last one.
+
+The last two count only runs whose job ran a step. Adding any other label to
+a PR creates a UI Smoke run that is skipped or cancelled before it reaches the
+Mac; the wrapper lists those as ignored.
+
+`--override "<why>"` skips all but the queued-run refusal, for a rerun the
+owner asked for; quote the reason in the PR. The `needs-ui-smoke` label
+dispatches without these checks, so it is the owner's, not an agent's.
+
+A stack of PRs takes at most one run, from its top branch, before its lowest
+layer merges: the top's diff against main holds every layer. The owner's
+runs on main, which every release needs, cover what no PR claimed.
+
+Paste the `spoken:` / `inserted:` / `PASS:` lines in the Proof section.
+
+The speech service on the Mac is shared, and other agents' model work can put
+it seconds behind the audio, which fails a correct app (#548).
+`scripts/e2e/speech-service-probe.py` plays the scenario's WAV to the service
+without the app and times the final transcript from the end of the speech. It
+runs before the app starts, once the owner's app has quit (its own speech
+helper slowed the service past the limit, #1832), and after any failed
+scenario. A failure becomes
+`NOT RUN:` with the measured lag only when the probe finds the service past
+3.5 s: the check's 2 s of silence plus the app's 1.5 s minimum finalization
+wait. An idle service measures about 2.6 s. A probe within the limit, or one
+that measured nothing, leaves the failure a `FAIL:`, so a broken session still
+fails. The `speech service probe:` lines are in the log either way.
+
+A new scenario is a file in `scripts/e2e/scenarios/` (`mode`, `phrase`,
+`min_word_accuracy`), not a new script. Polishing is off in every scenario so
+the score measures the app; model quality belongs to `eval-e2e`.
+
+## Proving a change to the polish path with the request goldens
+
+Polishing is off in the e2e check, so a change between the stop-commit and
+the polish model is proved by `PolishRequestGoldenTests` instead. Each case
+drives `finishStoppedSession` through the shared fakes and pins, as JSON under
+`Tests/localvoxtralTests/Fixtures/PolishRequestGoldens/`, what one commit
+sent (request, configuration) and wrote (session record, committed text,
+error line, pasteboard read counts). The cases cover both prompt profiles,
+the speaker profile, every context source alone and in conflict, the
+clipboard payload macro, a template without the dictionary slot, the three
+backend configurations and every polish failure.
+
+A refactor of that path (#432 steps 5 to 7) leaves every fixture untouched;
+`git diff --stat` of the directory goes in the Proof section. A PR that
+changes what reaches the model deletes the affected fixture, re-runs the
+suite to record it, and explains the new bytes in the PR. From a non-Mac box
+the recorded file lands only on the build host, which cannot send files
+back, so the test also prints it between `POLISH GOLDEN BEGIN/END` lines in
+`.build/last-remote.log`; lift it from there. A mismatch never rewrites a
+fixture.
+
+## The live herdr lane
+
+`HerdrIntegrationTests` (`remote-build.sh integration-herdr`) is the only
+place anything checks that **herdr still behaves the way the remote-herdr
+join assumes it does**. `docs/agent/remote-herdr-panel-binding.md` records
+those assumptions; before this lane they were documented hopes. Each one that
+a live server can answer has its own named test, so a herdr upgrade that
+changes it fails with a message naming the assumption rather than silently
+un-authorizing field joins.
+
+What is real in the lane: `HerdrSocketClient` on a forwarded unix socket,
+`ClaudeRemoteHerdrForwardService` spawning a real supervised `ssh -N -L`,
+`SSHDestinationCanonicalizer.live()` running real `ssh -G`,
+`ClaudeRemoteEnrollmentService.setupRemoteHerdr` (the setup run's herdr step)
+patching the fixture server's own herdr `config.toml` over a real ssh session, and
+`HerdrPanelBindingProbe` / `HerdrPanelMicIndicator` on top of all of it. The
+ONE fixture is the focused surface: a real herdr client on a pty, read from
+its typescript instead of through accessibility.
+
+Assumptions currently pinned against the live server: only a whole-view App
+client renders the agents sidebar (`terminal attach` renders the raw pane and
+cannot echo the token — the load-bearing one); both a JSON `null` and an
+empty string clear a `pane.report_metadata` token; the `ttl_ms` window is
+1…86_400_000 inclusive; `pane.process_info` still reports named foreground
+processes; `pane.read` answers only about the pane asked for; and `ssh -G`
+identity matching accepts an alias that differs only in `User` while
+rejecting one that differs in port. On herdr 0.9+ the lane additionally pins
+federation: `machine list --json` reports `selected` for the viewed machine
+and none for Local, and the production catalog reader resolves the same
+answer; the local server still answers `pane.current` with its own focused
+pane while a machine is selected; the agents panel composes rows from every
+connected machine at once (a remote token renders while Local is displayed
+and vice versa, retiring the whole-view discriminator for federated
+clients); those rows render from the LOCAL client config alone; and
+`terminal session observe` renders no panel token, like `terminal attach`.
+
+Fixture and host requirements (`scripts/herdr-integration-fixture.sh`):
+
+- `herdr` must be installed on the machine running the lane. Its absence is a
+  LOUD failure naming the install step, never a skip — a lane that quietly
+  does nothing about herdr is indistinguishable from one that passed.
+- With no destination the fixture provisions its OWN loopback sshd (its own
+  host key, user key and `authorized_keys` file — the account's are never
+  touched), so the lane is hermetic and needs no second machine. Pass an ssh
+  destination to run the identical lane against a real second host.
+- It runs BESIDE a herdr the account is already running (the owner's runner
+  account runs one all day). Every fixture herdr process — server, CLI calls,
+  surfaces, and the remote half behind the loopback sshd's forced
+  `authorized_keys` environment — gets its own socket and
+  `XDG_CONFIG_HOME` / `XDG_STATE_HOME` under the run's workdir, which is where
+  herdr resolves `config.toml`, `session.json`, plugins and client state from.
+  The account's herdr files and server are never read, written or addressed,
+  and the enrollment config patch over the fixture alias edits the fixture
+  server's config. Over a caller-supplied destination that patch would edit
+  the second host's real config, so that one test fails up front in
+  destination mode.
+- The fixture's three host-alias blocks (the connection block, the
+  canonicalization-test block, and the federation block, the federated
+  target's loopback alias) live in the run's own `<workdir>/ssh_config`, never
+  the account's `~/.ssh/config` (#1029). The lane sets
+  `LOCALVOXTRAL_SSH_CONFIG` to that file, so every ssh the app runs carries
+  `-F <file>`, and herdr reaches it through `<workdir>/bin/ssh`, first on the
+  PATH of every herdr the fixture starts, whose config sets `[remote]
+  manage_ssh_config = false` so herdr adds no `-F` of its own. In destination mode the file ends with an `Include` of the
+  account's config, read only. `environment.txt` and teardown log the
+  account config's hash as `ssh.account.before` / `ssh.account.after`;
+  federated clients
+  run with `XDG_STATE_HOME` pointed at the run's scratch `client-state-home`
+  and the hermetic remote server listens on the run's short `remote.sock`,
+  never on the account's catalog or sockets.
+- Because nothing runs on SIGKILL, a run's teardown state lives at a stable
+  path (`~/.localvoxtral-herdr-fixture-hold/`) with a manifest naming the run
+  — never in the run's own temp dir, which a killed run would strand. `up`
+  releases a dead run's hold before starting anything and refuses while a
+  live run owns it. A hold from before #1029 also carries the pristine ssh
+  config, and releasing it strips that run's blocks from `~/.ssh/config`; a
+  current hold never opens that file. `status` and `recover` do it by hand
+  (`scripts/mac/README.md`), and `scripts/ci/test-herdr-fixture-recovery.sh`
+  holds that behavior per-push without needing herdr at all (including
+  restoring the herdr copies a pre-#323 fixture's hold still carries).
+- The suite has no `XCTSkip`. Every other lane skips it by name
+  (`--skip HerdrIntegrationTests` in `remote-build.sh test` and in CI's unit
+  step), and running it without its marker fails with the enablement
+  instructions.
+
+When must it run? For `scripts/ci/herdr-lane-filter.sh` path matches or the
+literal `[run-herdr-integration]` marker, on the same event-payload terms as
+the LLM lanes. A manual `ci.yml` dispatch also runs it by default, which is the
+supported way to repeat this live external contract without manufacturing
+commits; `-f herdr=false` opts one dispatch out. That is what
+`scripts/try-pr.sh` passes: that dispatch exists to produce an
+artifact, not to repeat the herdr contract. The
+rule behind the list: anything that changes what the app
+SAYS to herdr, what it BELIEVES herdr answered, how the forward reaching
+herdr is opened or leased, which host that forward reaches, or the recorded
+assumptions themselves. Editing
+`docs/agent/remote-herdr-panel-binding.md` matches too — a changed assumption
+that was never re-measured is exactly the failure this lane exists to
+prevent. Not required for UI, insertion, audio, or model work. Either way the
+PR's Proof section carries the scoreboard or a one-line justification for
+skipping.
+
+The fixture records the runner account, herdr binary/version, inherited and
+isolated socket settings, terminal variables, requested and actual pty size,
+rendered sidebar width, sshd port, forward sockets, and pane lifecycle. CI
+uploads those files as `herdr-lane-diagnostics` even when the lane passes. The
+artifact deliberately excludes the fixture's ephemeral host and user keys.
+On 2026-09-07 this evidence exposed an account-sensitive startup race: the
+`tom` launchd runner kept provisional `w1:p1` alive across two one-second
+reads, then replaced it with `w2:p1` 50–200 ms after readiness; the `builder`
+SSH account reached `w2:p1` before the same check. Both used herdr 0.8.2,
+45×130 ptys, and a rendered 26-cell sidebar. Pane readiness therefore needs
+three consecutive resolving samples. Do not trade that condition for a longer
+token TTL or surface timeout; neither participates in this race.
+
+Worker builds on the Mac must not overlap the lane. Measured 2026-09-07 on
+the build host (per-request latency tap in `HerdrSocketClient`, 10 lane runs
+idle + 10 with one concurrent `swift build`): idle 10/10 green with
+p50/p99/max 110/121/126 ms; loaded 9/10 with p50/p99/max 108/123/137 ms and
+zero unexpected refusals or timeouts across 379 successful requests — but one
+loaded run failed `testMicIndicatorRefreshesTheTokenAndClearsItOnStop`
+because a `pane get` read immediately after the stop still showed the token
+while every socket request in that run had succeeded in ~100 ms. The socket
+path is NOT slow under load (36× inside the 5 s timeout); the read lags the
+server's ack under CPU contention. The lane therefore polls for the clear
+(bounded below the 8 s token TTL, so a truly lost clear still fails) — and a
+red lane with worker builds running beside it means re-run the lane alone
+before debugging the diff. The mic-indicator lifecycle test holds its injected
+first refresh until that deliberate clear is observed; accelerating the
+refresh onto a 50 ms wall-clock sleep makes clear-versus-refresh ordering a
+runner scheduler race instead of testing the four-second production cadence.
 
 The speechd live-model lane follows the same owner constraint: it runs only for
 `scripts/ci/speechd-lane-filter.sh` matches or `[run-speechd-integration]`.
 SpeechHelper engine/pin, packaging, or integration-contract changes must run it;
 the Metal-free SpeechHelper unit suite remains per-push on self-hosted CI.
 
-Agent-dictation E2E eval (`AgentDictationE2EEvalTests`, nightly `eval-e2e.yml`
-+ `remote-build.sh eval-e2e`): model/prompt/feature-pipeline changes — anything
+Agent-dictation E2E eval (`AgentDictationE2EEvalTests`, dispatched
+`eval-e2e.yml` or `remote-build.sh eval-e2e`): model/prompt/feature-pipeline changes — anything
 the rule above marks LLM-relevant, plus the TTS→ASR→polish harness itself —
 MUST paste the eval-e2e scoreboard in the PR's Proof section, or explicitly
 justify skipping it in one line. Only the 7 migrated punctuation cases are
 `required` today; Phase 3 calibration will promote cases that prove stable
 across server states (restarts / prompt-cache configurations) to `required` —
 promotion PRs must carry that cross-state evidence.
+
+Its ASR stage talks to a speech test service on the Mac, which runs the helper
+installed there, never the PR's build. Each dictation model in
+`SpeechModelCatalog` has its own service, one row of
+`scripts/mac/test-speech-models.tsv`, and `eval-e2e --asr <name>` scores that
+one (default `voxtral`). To score a helper change, install the PR's packaged
+.app for that row first (`scripts/mac/README.md`, "Speech test services").
+
+Mistral arm of the same eval: `MISTRAL_API_KEY=… ./scripts/remote-build.sh
+eval-e2e --provider mistral [EvalRecordings/agent-dictation/<set>]` moves BOTH
+live stages to Mistral's hosted API — the hosted realtime socket for ASR, and a
+polish configuration built by `SettingsStore` itself in `.mistralAPI` mode — so
+its scoreboard is what proves `Mistral API` mode end to end. It needs no local
+speechd and no prior `package` run (nothing bundled is in the loop), and it
+turns `polishContextTrustedEndpointEnabled` on, because `api.mistral.ai` is not
+loopback and every clipboard/repo-vocabulary case would otherwise score an
+ungrounded polish. It BILLS the owner's account (≈0.006 USD/min of audio plus
+Medium 3.5 polish tokens), so it is by-hand only: never scheduled, never in CI,
+and the key rides a 0600 marker the script removes on exit.
 
 ## Human agent-eval recordings and ablations
 
@@ -129,3 +642,48 @@ can occasionally splice a status line into the sentinel-delimited JSONL report;
 the offline tools recover known XCTest diagnostics and warn only if an unknown
 corruption still forces a record to be skipped. Note any resulting denominator
 rather than silently treating it as a model failure.
+
+## Replaying stored dictations
+
+Whether localvoxtral learns a user is measured on that user's own recordings,
+run twice on identical input. With **Keep dictation audio on this Mac** on (Settings →
+History), each saved dictation keeps its WAV. On the Mac that dictated, as
+that user, `./scripts/export-dictation-replay.sh <dir>` copies the history
+store, the recordings, the learned terms and Global terms into a set.
+Copy it to the gitignored `EvalRecordings/replay/<set>/` of a checkout. The run
+below rsyncs the checkout, set included, to the build host, so the
+dictations' text and audio land there too. Then:
+
+```bash
+./scripts/remote-build.sh package
+./scripts/remote-build.sh eval-e2e --replay EvalRecordings/replay/<set>
+```
+
+`AgentDictationE2EEvalTests.testReplayStoredDictations` transcribes each
+Overlay Buffer dictation once on the live speech service, then polishes the
+transcript through the production stop-commit path twice: **day 0** with
+Global terms only, **today** with every confirmed learned term added. It
+scores the transcript and both arms against the text the dictation inserted
+at the time: word accuracy, and recall of the terms that text spells. That
+text is what polishing produced then, not a checked reference, so a gain
+shows as today moving closer to it than day 0 on the same audio.
+
+The log prints numbers only (`replay:` lines); paste those, never
+transcripts. Delete the set from the checkout and the Mac when done.
+
+## Proving a change to the term-suggestion prompt
+
+No lane sends the "Suggest terms" request (`SpeakerTermSuggestions`), and
+eval-e2e scores polishing only. A change to its instructions, request layout
+or reply parsing is proven with `scripts/eval-term-suggestions.py`. It replays
+the base ref's prompt and the working tree's against a frozen export of the
+owner's history on the hosted model the app uses, each arm twice, because GLM
+5.3 is not deterministic and the repeat is the noise floor. Its header has
+the export steps. Run `--self-check` first: it fails when the app's request
+layout moved and the script's copy did not.
+
+Per run it prints how many terms the model proposed, how many the
+recognizer already spells right (inference spent on nothing), and how many
+fall on the owner's accepted and refused lists. Paste those lines and the
+spend, never the terms: the export and the JSONL stay in `local-notes/` and
+are deleted when done.

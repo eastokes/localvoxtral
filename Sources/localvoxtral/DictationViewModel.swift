@@ -18,30 +18,9 @@ enum MenuBarIndicatorState: Equatable {
     /// with the failure icon because the menu bar is the only surface still
     /// visible while the popover is closed during dictation (#89).
     case secureInputWarning
-}
-
-/// A single raw realtime-delta log emission, captured before any
-/// merge/preprocess/insertion processing. Mirrors what `Log.deltas` records
-/// when `SettingsStore.debugLogRealtimeDeltas` is on; surfaced through the
-/// `#if DEBUG` `debugDeltaLogSink` seam for instrumentation tests.
-///
-/// `payload` is the exact, unprocessed string the backend delivered (quoted in
-/// the actual log via `.debugDescription` so whitespace is visible); it is nil
-/// for events that carry no string payload (session boundaries, finalized).
-struct DebugRealtimeDeltaLogRecord: Equatable, Sendable {
-    enum Kind: String, Sendable {
-        case sessionConnected = "session.connected"
-        case sessionDisconnected = "session.disconnected"
-        case partialDelta = "partial"
-        case finalTranscript = "final"
-        case status = "status"
-        case error = "error"
-        case transcriptionFinalized = "finalized"
-    }
-
-    let kind: Kind
-    let sequence: Int
-    let payload: String?
+    /// Idle, and an agent session waits on the user or finished while they
+    /// looked elsewhere (#717).
+    case agentNeedsYou
 }
 
 @MainActor
@@ -88,6 +67,7 @@ final class DictationViewModel {
         case hotKeyShortcutUnavailable
         case websocketReceiveFailed
         case secureKeyboardEntryActive
+        case microphoneDisconnected
         case other
 
         @MainActor
@@ -106,11 +86,17 @@ final class DictationViewModel {
             if message == HotKeyManager.unavailableErrorMessage
                 || message == HotKeyManager.livePasteUnavailableErrorMessage
                 || message == HotKeyManager.modifierOnlyUnavailableErrorMessage
+                || message == HotKeyManager.copyLastDictationUnavailableErrorMessage
+                || message == HotKeyManager.answerAgentUnavailableErrorMessage
+                || message == HotKeyManager.quickCaptureUnavailableErrorMessage
             {
                 return .hotKeyShortcutUnavailable
             }
             if message.localizedCaseInsensitiveContains("websocket receive failed") {
                 return .websocketReceiveFailed
+            }
+            if message == DictationViewModel.microphoneDisconnectedMessage {
+                return .microphoneDisconnected
             }
             return .other
         }
@@ -121,98 +107,213 @@ final class DictationViewModel {
         static let connectingRealtimeBackend = "Connecting to realtime backend..."
         static let finalizingPreviousDictation = "Finalizing previous dictation..."
         static let polishing = "Polishing..."
+        static let transcribingAgain = "Transcribing again..."
         static let awaitingMicrophonePermission = "Awaiting microphone permission..."
         static let requestingMicrophonePermission = "Requesting microphone permission..."
         static let waitingForAccessibilityPermission = "Waiting for Accessibility permission."
         static let accessibilityPermissionReset =
             "Accessibility reset — quit and reopen localvoxtral, then grant access."
         static let pasteBlockedByAccessibilityPermission = "Paste blocked by Accessibility permission."
-        static let networkLostDictationStopped = "Network lost. Dictation stopped."
-        static let liveDictationBlockedBySecureInput = "Blocked: Secure Keyboard Entry is on."
-        static let overlayCopiedToClipboard = "Copied — paste it manually."
+        static let networkLostDictationStopped = "Dictation stopped after the network disconnected."
+        static let liveDictationBlockedBySecureInput = "Secure Keyboard Entry blocks Live Auto-Paste."
+        static let overlayCopiedToClipboard = "Copied for manual paste."
+        static let agentPromptTextKeptInHistory = "Not delivered; the text is in History."
+        static let dictationEndMayBeMissing = "The end of the dictation may be missing."
         static let noNetworkConnection = "No network connection."
         static let microphoneAccessDenied = "Microphone access denied."
         static let finalizing = "Finalizing..."
+        static let reconnecting = "Reconnecting..."
+        static let lastDictationCopied = "Last dictation copied."
+        static let quickCaptureSaved = "Saved to inbox"
+        static let noDictationToCopy = "No dictation to copy yet."
     }
 
-    private static let microphoneDeniedMessage =
+    /// Where a dictation lands when the realtime socket is gone for good:
+    /// either the reconnect exhausted its attempts, or the drop was not
+    /// recoverable in the first place.
+    static let connectionLostMessage = "Connection lost. Dictation stopped."
+
+    static let microphoneDisconnectedMessage = "Mic disconnected."
+    static let microphoneDeniedMessage =
         "Grant microphone access in System Settings > Privacy & Security > Microphone."
 
     /// Surfaced at dictation start (and in the popover) when Live Auto-Paste is
     /// active but Accessibility isn't trusted — transcribed text would otherwise
     /// land nowhere. Kept as a stable constant so `ErrorToken` can recognize it.
     static let liveAutoPasteAccessibilityWarningMessage =
-        "Live Auto-Paste needs Accessibility access to type into other apps. Text won't appear until you enable it in System Settings > Privacy & Security > Accessibility."
+        "Live Auto-Paste can't type into other apps until you turn on localvoxtral in \(AccessibilitySettingsPane.current.path)."
+
+    /// The same warning in the popover, where the Enable button names the pane.
+    static let liveAutoPastePopoverAccessibilityWarningMessage = "Live Auto-Paste can't type into other apps."
 
     /// Surfaced at dictation start when macOS Secure Keyboard Entry is active
     /// (e.g. Ghostty around password prompts): it blocks synthetic keyboard
     /// events, so dictated text may silently land nowhere. Warn only — the
     /// session still runs. One short sentence (popover copy rule).
     static let secureKeyboardEntryWarningMessage =
-        "Secure Keyboard Entry is on; dictated text may not appear."
+        "Secure Keyboard Entry may hide dictated text."
 
-    var isDictating = false
-    var isFinalizingStop = false
-    var isConnectingRealtimeSession = false
-    var realtimeSessionIndicatorState: RealtimeSessionIndicatorState = .idle
-    var transcriptText = ""
-    var livePartialText = ""
-    var statusText = StatusStrings.ready
-    var lastError: String?
-    // Raw message from the most recent websocket .error event this session.
-    // Kept separate from lastError, which holds user-facing UI state (e.g. the
-    // Accessibility warning) that must never leak into connection-failure details.
-    var lastSocketErrorMessage: String?
-    #if DEBUG
-    // Test seam: technicalDetails otherwise only reaches the log and the alert.
-    var debugLastConnectFailureTechnicalDetails: String?
-    #endif
-    var lastFinalSegment = ""
+    /// The dictation itself: start, connect, the realtime events, stop,
+    /// reconnect and the commit. The members below forward the session state
+    /// the views read.
+    @ObservationIgnored
+    let session: DictationSessionController
 
-    /// Raw (pre-polish) transcript of the most recent stop-commit whose LLM
-    /// polishing visibly changed the text. Drives the "Copy raw transcript"
-    /// popover affordance (F6): terminals can't un-type, so the raw text a
-    /// polish replaced is offered for one-tap copy instead. `nil` when the last
-    /// commit wasn't polish-changed; cleared on every new session start.
-    /// Observable (not `@ObservationIgnored`) so the popover re-renders when it
-    /// appears/disappears.
-    var lastPolishChangedRawTranscript: String?
-
-    /// Whether the "Copy raw transcript" popover row should be offered.
-    var canCopyRawTranscript: Bool {
-        lastPolishChangedRawTranscript?.trimmed.isEmpty == false
+    var isDictating: Bool { get { session.isDictating } set { session.isDictating = newValue } }
+    var isFinalizingStop: Bool { get { session.isFinalizingStop } set { session.isFinalizingStop = newValue } }
+    var isConnectingRealtimeSession: Bool {
+        get { session.isConnectingRealtimeSession }
+        set { session.isConnectingRealtimeSession = newValue }
+    }
+    var realtimeSessionIndicatorState: RealtimeSessionIndicatorState {
+        get { session.realtimeSessionIndicatorState }
+        set { session.realtimeSessionIndicatorState = newValue }
+    }
+    var transcript: TranscriptAccumulator { get { session.transcript } set { session.transcript = newValue } }
+    var statusText: String { get { session.statusText } set { session.statusText = newValue } }
+    var lastError: String? { get { session.lastError } set { session.lastError = newValue } }
+    var lastPolishChangedRawTranscript: String? {
+        get { session.lastPolishChangedRawTranscript }
+        set { session.lastPolishChangedRawTranscript = newValue }
+    }
+    var canCopyRawTranscript: Bool { session.canCopyRawTranscript }
+    var sessionSecureInputActive: Bool {
+        get { session.sessionSecureInputActive }
+        set { session.sessionSecureInputActive = newValue }
+    }
+    var isAwaitingMicrophonePermission: Bool {
+        get { session.isAwaitingMicrophonePermission }
+        set { session.isAwaitingMicrophonePermission = newValue }
+    }
+    var isAccessibilityTrusted: Bool { session.isAccessibilityTrusted }
+    var isAccessibilityRestartRequired: Bool { textInsertion.isAccessibilityRestartRequired }
+    var currentStatusToken: StatusToken { session.currentStatusToken }
+    var currentErrorToken: ErrorToken? { session.currentErrorToken }
+    var liveAutoPasteAccessibilityWarning: String? { session.liveAutoPasteAccessibilityWarning }
+    var audio: SessionAudioPipeline { session.audio }
+    var availableInputDevices: [MicrophoneInputDevice] { session.availableInputDevices }
+    var selectedInputDeviceID: String { session.selectedInputDeviceID }
+    var selectedInputDeviceChannelCount: UInt32 { session.selectedInputDeviceChannelCount }
+    var selectedInputChannel: Int { session.selectedInputChannel }
+    var context: SessionContextResolver { session.context }
+    var dependencies: Dependencies { get { session.dependencies } set { session.dependencies = newValue } }
+    var llmPolishingService: any LLMPolishingServicing {
+        get { session.llmPolishingService }
+        set { session.llmPolishingService = newValue }
+    }
+    var appConfigStore: any AppConfigServing {
+        get { session.appConfigStore }
+        set { session.appConfigStore = newValue }
+    }
+    var sessionStore: DictationSessionStore? { get { session.sessionStore } set { session.sessionStore = newValue } }
+    /// Why the history store did not open at launch; nil when it did (#985).
+    private(set) var historyOpenFailure: DictationHistoryOpenFailure?
+    /// The store's last read or write error while it keeps failing.
+    private(set) var historyAccessFailure: String?
+    /// What History and Insights say in place of dictations: the store did
+    /// not open, or its last read or write failed. The log has the error.
+    var historyUnavailableText: String? {
+        switch historyOpenFailure {
+        case .missingHistoryTable:
+            return "Your history file lost its dictations to another program. Nothing was deleted. The log says why."
+        case .unknownContents:
+            return "Your history was saved by a newer localvoxtral. This version won't open it."
+        case .unreadable:
+            return "Your history couldn't be opened. The log says why."
+        case nil:
+            return historyAccessFailure == nil
+                ? nil : "Your history couldn't be read or saved. Nothing was deleted. The log says why."
+        }
     }
 
-    /// Whether the app focused at the most recent session start behaves like
-    /// a terminal emulator (bundle allowlist, AX-writability heuristic
-    /// fallback). Refreshed at each session start; live replacement strategy
-    /// and future per-app behaviors key off it. See `TerminalTargetDetector`.
-    private(set) var sessionTargetIsTerminalLike = false
+    /// Said above the History list after a launch whose copy from
+    /// `default.store` found no dictations there: the history did not come
+    /// along, and the old file is left for a restore by hand.
+    var historyImportNotice: String? {
+        guard case .legacyHoldsNoHistory = sessionStore?.legacyImport else { return nil }
+        return "Your earlier history wasn't in default.store, so nothing was copied. That file is kept."
+    }
 
-    private(set) var availableInputDevices: [MicrophoneInputDevice] = []
-    private(set) var selectedInputDeviceID = ""
+    /// The popover's one line while History is not saving.
+    var historyPopoverWarning: String? {
+        switch historyOpenFailure {
+        case .unknownContents: return "History needs a newer localvoxtral."
+        case .missingHistoryTable: return "History isn't saving; nothing was deleted."
+        case .unreadable: return "History isn't saving; nothing was deleted."
+        case nil: return historyAccessFailure == nil ? nil : "History isn't saving; nothing was deleted."
+        }
+    }
+    var learnedTermStore: LearnedTermStore? {
+        get { session.learnedTermStore }
+        set { session.learnedTermStore = newValue }
+    }
+    var termSuggestions: SpeakerTermSuggestionModel { session.termSuggestions }
+    /// Holds the "Learned … Undo" panel; the learner only keeps it weakly.
+    @ObservationIgnored
+    private var correctionLearnedPanel: CorrectionLearnedPanel?
+    /// The joined session submitted a prompt: correction learning compares it
+    /// with the dictation inserted into that session.
+    func promptSubmitted(sessionID: String, prompt: String) {
+        session.correctionLearning?.promptSubmitted(sessionID: sessionID, prompt: prompt)
+    }
 
-    /// Observable mirror of the live microphone authorization status, refreshed
-    /// on demand via `refreshMicrophonePermissionState()`. Stored (rather than
-    /// read live) so permission UI re-renders when the grant changes while the
-    /// app is foregrounded. Seeded lazily — reading the real status touches the
-    /// microphone service, so it stays `.notDetermined` until the first refresh.
-    private(set) var microphoneAuthorizationStatus: MicrophoneAuthorizationStatus = .notDetermined
+    func toggleDictation(outputMode: DictationOutputMode? = nil) { session.toggleDictation(outputMode: outputMode) }
+    func startDictation(outputMode: DictationOutputMode? = nil) { session.startDictation(outputMode: outputMode) }
+    func stopDictation(
+        reason: String = "unspecified",
+        finalizeRemainingAudio: Bool = true,
+        finalizationTimeout: TimeInterval = TimingConstants.stopFinalizationTimeout
+    ) {
+        session.stopDictation(
+            reason: reason,
+            finalizeRemainingAudio: finalizeRemainingAudio,
+            finalizationTimeout: finalizationTimeout
+        )
+    }
+    func cancelDictation() { session.cancelDictation() }
+    func refreshMicrophoneInputs() { session.refreshMicrophoneInputs() }
+    func selectMicrophoneInput(id: String) { session.selectMicrophoneInput(id: id) }
+    func selectMicrophoneInputChannel(_ channel: Int) { session.selectMicrophoneInputChannel(channel) }
+    func clearTranscript() { session.clearTranscript() }
+    func copyTranscript() { session.copyTranscript() }
+    func copyRawTranscript() { session.copyRawTranscript() }
+    var canCopyLastDictation: Bool { session.canCopyLastDictation }
+    func copyLastDictation() { session.copyLastDictation() }
+    func applyDictationHistoryRetention(now: Date = Date(), removingBackups: Bool = false) {
+        session.applyDictationHistoryRetention(now: now, removingBackups: removingBackups)
+    }
+    func prepareLLMPolishingPromptAccessIfNeeded() { session.prepareLLMPolishingPromptAccessIfNeeded() }
+
+    /// What the Settings toggle and the Engines widget's "Turn off polish"
+    /// both do. Turning polishing off stops the managed polishd process
+    /// (Managed local mode only); External URL mode owns no local process,
+    /// and re-enabling starts managed polishd eagerly.
+    func setLLMPolishingEnabled(_ enabled: Bool) {
+        let wasEnabled = settings.llmPolishingEnabled
+        settings.llmPolishingEnabled = enabled
+        if enabled, !wasEnabled {
+            prepareLLMPolishingPromptAccessIfNeeded()
+        }
+        engines.llmPolishingEnabledDidChange(enabled)
+    }
+
 
     /// Set by the app delegate so the General settings pane can re-present the
     /// onboarding wizard. Kept as a seam rather than a singleton reference.
     @ObservationIgnored
     var onRequestReRunOnboarding: (() -> Void)?
 
-    var isAccessibilityTrusted: Bool { textInsertion.isAccessibilityTrusted }
-    var isAccessibilityRestartRequired: Bool {
-        textInsertion.isAccessibilityRestartRequired
-    }
-    var currentStatusToken: StatusToken { StatusToken.from(statusText) }
-    var currentErrorToken: ErrorToken? {
-        guard let lastError else { return nil }
-        return ErrorToken.from(lastError)
-    }
+    /// The quick capture Inbox (#725). Built with the runtime services, so
+    /// nil in a view model that runs none.
+    private(set) var quickCapture: QuickCaptureInboxViewModel?
+    /// Voice memos from iCloud Drive (#925); nil in a view model that runs no services.
+    private(set) var voiceMemos: VoiceMemoController?
+    /// The backend the memo in flight went to.
+    @ObservationIgnored
+    private var voiceMemoBackendMode: BackendMode?
+    /// Set while the voice memo ledger is refused (#989).
+    fileprivate(set) var voiceMemoLedgerProblem: StoredFileProblem?
+
     var requiredManagedBackendsReady: Bool {
         guard settings.onboardingCompleted else { return true }
         if settings.dictationBackendMode == .managedLocal,
@@ -220,7 +321,7 @@ final class DictationViewModel {
         {
             return false
         }
-        if isManagedPolishingWarmupWanted,
+        if engines.isManagedPolishingWarmupWanted,
            !isReady(backendManager.polishdStatus)
         {
             return false
@@ -247,87 +348,150 @@ final class DictationViewModel {
         case .recentFailure:
             return .failure
         case .idle:
-            return requiredManagedBackendsReady ? .idle : .failure
+            guard requiredManagedBackendsReady else { return .failure }
+            return agentAttentionLine == nil ? .idle : .agentNeedsYou
         }
+    }
+
+    /// The needs-you queue (#717), installed by `AppDelegate`.
+    var agentAttention: AgentAttentionModel? {
+        get { session.agentAttention }
+        set { session.agentAttention = newValue }
+    }
+
+    /// The popover's needs-you sentence, nil when nobody waits or the cue is
+    /// off (turning it off hides the line at once).
+    var agentAttentionLine: String? {
+        guard settings.agentAttentionEnabled else { return nil }
+        return agentAttention?.popoverLine
     }
 
     let settings: SettingsStore
     let textInsertion = TextInsertionService()
 
-    /// Secure Keyboard Entry state sampled for the CURRENT session — drives
-    /// the menu bar warning icon independently of `lastError` (whose popover
-    /// line a higher-priority warning may own). Set when the session verdict
-    /// is applied; cleared at session end alongside the token-scoped
-    /// popover clear. Internal (not private(set)) because the session-end
-    /// clear lives in DictationViewModel+Session.swift.
-    var sessionSecureInputActive = false
+    /// The Engines pane: backend modes, the Mistral key check and model
+    /// catalog, managed warmup and shutdown, the download controls. Views
+    /// bind to `viewModel.engines`; nothing on the session path goes
+    /// through it.
+    @ObservationIgnored
+    let engines: EnginesModel
+    /// Bumped after every history write that landed, so the History pane
+    /// reads the store again.
+    private(set) var dictationHistoryRevision = 0
 
-    /// Ends the refused-start warning when no session is running: the icon
-    /// (and the "Blocked" status line) return to normal, while `lastError`
-    /// keeps the one-line explanation in the popover. A stopped session that
-    /// is still finalizing/polishing is NOT an ended attempt — its text is
-    /// still headed for the clipboard fallback, and clearing here dropped
-    /// the icon to the yellow session state mid-polish (owner field feedback
-    /// on #90); session teardown owns that clear.
-    func clearSecureInputRefusalSignalsIfAttemptEnded() {
-        guard !isDictating, !isConnectingRealtimeSession, !isFinalizingStop,
-              sessionSecureInputActive
-        else { return }
-        sessionSecureInputActive = false
-        if statusText == StatusStrings.liveDictationBlockedBySecureInput {
-            statusText = StatusStrings.ready
+    /// The collaborators a view model is built from. Production defaults;
+    /// a test replaces the ones it has to observe or hold still. Each field
+    /// retires a `debug…` seam (#432 step 2).
+    struct Dependencies {
+        /// Built on first use, so a mere permission read never registers
+        /// CoreAudio device listeners. Nil is the CoreAudio service.
+        var microphone: (() -> any MicrophoneCapturing)?
+        /// The pasteboard the polish context and the payload macro read. Both
+        /// read the one clipboard; a counting stub proves the no-read paths.
+        var pasteboardReader: @MainActor () -> any PasteboardReading
+        /// Where the copy actions write.
+        var pasteboardWriter: @MainActor (String) -> Void
+        /// The bundle identifier of a running process, for the app the
+        /// overlay commits into.
+        var bundleIdentifier: (pid_t) -> String?
+        /// The app's name, for the overlay's focused app entry (#840).
+        var applicationName: (pid_t) -> String?
+        /// Brings an app back to the front: ⇧Tab to the focused app after a
+        /// session pane came forward. False when it is gone.
+        var activateApp: @MainActor (pid_t) -> Bool
+        /// The center the terminate observer registers on. Nil is the
+        /// default center, registered only when runtime services run; a
+        /// private center is registered on regardless, so a test posts
+        /// through the real wiring without reaching every retained view
+        /// model in the process.
+        var lifecycleNotificationCenter: NotificationCenter?
+        /// The center the sleep observer registers on, under the same rule.
+        /// Nil is `NSWorkspace.shared.notificationCenter`: AppKit posts
+        /// `willSleepNotification` there and nowhere else.
+        var workspaceNotificationCenter: NotificationCenter?
+        /// The clock a mid-dictation reconnect run (#380) sleeps on.
+        var reconnectSleep: @MainActor (TimeInterval) async -> Void
+        /// Where a connection failure the popover cannot carry is shown.
+        var connectionFailurePresenter: any ConnectionFailurePresenting
+        /// Every record a session writes, before retention decides whether
+        /// the store keeps it. Nothing in the app observes; tests do.
+        var onSessionRecord: ((DictationSessionRecord) -> Void)?
+        /// The repository vocabulary a commit grounds against. Nil is the
+        /// production pipeline over the commit target's working directory.
+        var repoVocabularyGrounding: (any RepoVocabularyGrounding)?
+        /// Every raw-delta log record, called on the same gated path as
+        /// `Log.deltas` (the hidden `debug.log_realtime_deltas` toggle), so
+        /// "never called with the toggle off" proves the path was not
+        /// entered. Nothing in the app observes; tests do.
+        var onRealtimeDeltaLogRecord: ((DebugRealtimeDeltaLogRecord) -> Void)?
+        /// The time every session timer runs on. A test passes a clock it
+        /// advances by hand.
+        var clock: SessionClock
+        /// Mistral's batch endpoint, for the second pass an Overlay Buffer
+        /// dictation gets on stop in Mistral API mode (#317).
+        var batchTranscriber: any MistralBatchTranscribing
+        /// The folder every store the runtime services open lives in: history
+        /// and its audio, diagnostic records, the usage ledger, learned terms,
+        /// skills, the Inbox and voice memos. Nil is the app's folder in
+        /// Application Support; a test that starts runtime services passes a
+        /// temporary one, or it writes the owner's data (#1524).
+        var dataDirectory: URL?
+        /// The home folder whose Claude Code transcripts and agent skill
+        /// folders the runtime services read. Nil is the user's.
+        var home: URL?
+        /// How much audio one External URL server session may take before
+        /// the client rolls it over (#1139). Nil is `GET /v1/models` on the
+        /// server when runtime services run, and no rollover in a unit test,
+        /// so no suite dials the endpoint in its settings.
+        var realtimeContextLimit: (@Sendable (RealtimeSessionConfiguration) async -> RealtimeContextBudget?)?
+
+        init(
+            microphone: (() -> any MicrophoneCapturing)? = nil,
+            pasteboardReader: @escaping @MainActor () -> any PasteboardReading = { SystemPasteboardReader() },
+            pasteboardWriter: @escaping @MainActor (String) -> Void = DictationViewModel.writeToSystemPasteboard,
+            bundleIdentifier: @escaping (pid_t) -> String? = {
+                NSRunningApplication(processIdentifier: $0)?.bundleIdentifier
+            },
+            applicationName: @escaping (pid_t) -> String? = {
+                NSRunningApplication(processIdentifier: $0)?.localizedName
+            },
+            activateApp: @escaping @MainActor (pid_t) -> Bool = {
+                NSRunningApplication(processIdentifier: $0)?.activate(options: []) ?? false
+            },
+            lifecycleNotificationCenter: NotificationCenter? = nil,
+            workspaceNotificationCenter: NotificationCenter? = nil,
+            reconnectSleep: @escaping @MainActor (TimeInterval) async -> Void =
+                DictationSessionController.sleepForReconnect,
+            connectionFailurePresenter: any ConnectionFailurePresenting = ModalConnectionFailurePresenter(),
+            onSessionRecord: ((DictationSessionRecord) -> Void)? = nil,
+            repoVocabularyGrounding: (any RepoVocabularyGrounding)? = nil,
+            onRealtimeDeltaLogRecord: ((DebugRealtimeDeltaLogRecord) -> Void)? = nil,
+            clock: SessionClock = .live,
+            batchTranscriber: any MistralBatchTranscribing = MistralBatchTranscriptionClient(),
+            dataDirectory: URL? = nil,
+            home: URL? = nil,
+            realtimeContextLimit: (@Sendable (RealtimeSessionConfiguration) async -> RealtimeContextBudget?)? = nil
+        ) {
+            self.microphone = microphone
+            self.pasteboardReader = pasteboardReader
+            self.pasteboardWriter = pasteboardWriter
+            self.bundleIdentifier = bundleIdentifier
+            self.applicationName = applicationName
+            self.activateApp = activateApp
+            self.lifecycleNotificationCenter = lifecycleNotificationCenter
+            self.workspaceNotificationCenter = workspaceNotificationCenter
+            self.reconnectSleep = reconnectSleep
+            self.connectionFailurePresenter = connectionFailurePresenter
+            self.onSessionRecord = onSessionRecord
+            self.repoVocabularyGrounding = repoVocabularyGrounding
+            self.onRealtimeDeltaLogRecord = onRealtimeDeltaLogRecord
+            self.clock = clock
+            self.batchTranscriber = batchTranscriber
+            self.dataDirectory = dataDirectory
+            self.home = home
+            self.realtimeContextLimit = realtimeContextLimit
         }
     }
-
-    /// Played once at session start when Secure Keyboard Entry is detected.
-    /// The popover is closed while dictating, so an audible cue is the only
-    /// immediate signal that keystrokes will be swallowed (#89). Test seam.
-    @ObservationIgnored
-    var secureInputWarningSound: () -> Void = { NSSound(named: "Basso")?.play() }
-
-    // Services — internal so extension files can access them.
-    @ObservationIgnored
-    private var hasInitializedMicrophone = false
-    @ObservationIgnored
-    lazy var microphone: MicrophoneCaptureService = {
-        hasInitializedMicrophone = true
-        return MicrophoneCaptureService()
-    }()
-
-    /// A failed/cancelled connection can end before audio capture ever starts.
-    /// Do not instantiate the lazy CoreAudio service merely to stop it: doing
-    /// so registers device listeners that an app-lifetime view model then owns.
-    func stopMicrophoneIfInitialized() {
-        guard hasInitializedMicrophone else { return }
-        microphone.stop()
-    }
-
-    #if DEBUG
-    var debugHasInitializedMicrophoneForTesting: Bool { hasInitializedMicrophone }
-    #endif
-    @ObservationIgnored
-    let networkMonitor = NetworkMonitor()
-    @ObservationIgnored
-    let realtimeAPIClient = RealtimeAPIWebSocketClient()
-    @ObservationIgnored
-    let audioChunkBuffer = AudioChunkBuffer()
-    @ObservationIgnored
-    let healthMonitor = AudioCaptureHealthMonitor()
-    @ObservationIgnored
-    var llmPolishingService: any LLMPolishingServicing = LLMPolishingService()
-    @ObservationIgnored
-    var appConfigStore: any AppConfigServing = AppConfigStore()
-    #if LOCALVOXTRAL_DOGFOOD
-    /// `var` for the same reason `llmPolishingService` is: tests point it at a
-    /// temp directory. Production uses the Application Support default.
-    @ObservationIgnored
-    var dogfoodCaptureStore = DogfoodCaptureStore()
-    /// Watches the seconds after a commit for an immediate erase, and patches
-    /// that dictation's record with what it saw. `var` for the same reason as
-    /// the store: tests inject the clock and the event source.
-    @ObservationIgnored
-    var dogfoodEditSignalWatcher = DogfoodEditSignalWatcher()
-    #endif
     /// Warms the managed polishing helper's prompt-prefix cache on every
     /// helper launch (see `PolishPromptWarmupCoordinator`). Created only when
     /// runtime services run — trigger logic is unit-tested on the coordinator
@@ -336,40 +500,10 @@ final class DictationViewModel {
     private(set) var polishPromptWarmupCoordinator: PolishPromptWarmupCoordinator?
     @ObservationIgnored
     let backendManager: any ManagedBackendManaging
-    @ObservationIgnored
-    var sessionStore: DictationSessionStore?
-    @ObservationIgnored
-    let overlayBufferCoordinator: OverlayBufferSessionCoordinating
-    @ObservationIgnored
-    var preResolvedOverlayAnchor: OverlayAnchor?
+    /// Bumped on every learned-terms write so the Settings row re-reads it.
+    private(set) var learnedTermRevision = 0
 
-    /// Terminal-like verdict + Secure Keyboard Entry state sampled in
-    /// `beginDictationSession` BEFORE the socket opens — same reason as
-    /// `preResolvedOverlayAnchor` above: the user may focus another app while
-    /// the backend connects, and the session must record the app dictation
-    /// was started in. Consumed (and cleared) once audio capture starts.
-    @ObservationIgnored
-    var preCapturedSessionTargetVerdict: SessionTargetVerdict?
 
-    struct SessionTargetVerdict: Equatable, Sendable {
-        let decision: TerminalTargetDetector.Decision
-        let secureKeyboardEntryEnabled: Bool
-    }
-
-    /// The Ghostty screen as it looked when the user started speaking, sampled
-    /// in `beginDictationSession` before the overlay can take focus. Nil
-    /// whenever the opt-in gate rejected (setting off, remote endpoint,
-    /// non-Ghostty app, no Accessibility trust) — in which case no AX call was
-    /// made at all. Consumed at commit by `terminalScreenContextDecision()`.
-    @ObservationIgnored
-    var terminalScreenStartCapture: TerminalScreenCapture?
-
-    /// Resolves the focused pane to a live Claude Code session. Installed by
-    /// `AppDelegate` once the broker is actually listening, and nil otherwise —
-    /// so a build where broker startup failed simply never joins, rather than
-    /// joining against a registry nothing feeds.
-    @ObservationIgnored
-    var claudeSessionJoinResolver: ClaudeSessionJoinResolver?
 
     /// Settings surface for the two Claude Code integrations.
     ///
@@ -382,228 +516,15 @@ final class DictationViewModel {
     /// NOT `@ObservationIgnored`: the pane re-renders when the model swaps in.
     var claudeIntegrationSettings: ClaudeIntegrationSettingsModel?
 
-    /// THE session join for the current dictation, resolved once at start.
-    ///
-    /// Read by three consumers — raw screen attachment, the session block, and
-    /// repository collection — which is exactly why it is stored rather than
-    /// re-derived: they must all describe the same session. Nil whenever the
-    /// pane did not positively join (no marker, unknown/stale/ambiguous), which
-    /// is the abstention that keeps an unrelated terminal's repo out of the
-    /// prompt. Cleared on every session exit, like the screen capture.
-    @ObservationIgnored
-    var claudeSessionJoin: ClaudeSessionJoin?
-    /// Remote herdr `ssh -L` children this process has open. See
-    /// `retainRemoteHerdrForward(of:)` for why they are owned here and not by
-    /// the join that travels.
-    private var liveRemoteHerdrForwards: [ClaudeRemoteHerdrForwardHandle] = []
 
-    /// The JOINED pane's visible text at dictation start, read over its own
-    /// multiplexer socket (herdr `pane.read` / cmux `surface.read_text`,
-    /// sanitized + capped like an AX read). Non-nil only when the session's
-    /// join is a `.herdrPane`/`.cmuxSurface` join AND the screen-context consent
-    /// gate cleared at start. At commit it replaces the AX screen decision (see
-    /// `SocketPaneScreenContext.reconcileAtStop`); cleared on every session
-    /// exit, exactly like the screen capture and the join above.
-    @ObservationIgnored
-    var socketPaneStartCapture: SocketPaneScreenCapture?
 
-    @ObservationIgnored
-    private let hotKeyManager = HotKeyManager()
 
-    // Mutable state — internal so extension files can access.
+    /// Each lifecycle observer with the center it was registered on, so
+    /// deinit removes it from the same one.
     @ObservationIgnored
-    var commitTask: Task<Void, Never>?
+    private var lifecycleObservers: [(NotificationCenter, NSObjectProtocol)] = []
     @ObservationIgnored
-    var managedStartupTask: Task<Void, Never>?
-    @ObservationIgnored
-    var managedStartupTaskID: UUID?
-    // Stops the managed polishd (polishing) process when LLM polishing is turned
-    // off in Managed local mode. Kept awaitable so tests can await the shutdown.
-    // Shutdown tasks are tracked (never fire-and-forget) so a warmup requested
-    // right after a stop can cancel a still-queued stop and serialize behind a
-    // running one — otherwise a stale stop lands after the fresh warmup and
-    // kills the backend the settings now require.
-    @ObservationIgnored
-    var polishingShutdownTask: Task<Void, Never>?
-    @ObservationIgnored
-    var dictationShutdownTask: Task<Void, Never>?
-    // Eagerly installs/downloads/starts required managed backends so the user
-    // watches inline progress in Settings instead of waiting for dictation.
-    // One slot per backend (mirroring BackendManager's per-backend single-flight
-    // rationale): a polishing toggle/mode flip must never cancel an in-flight
-    // speechd warmup, and vice versa. Kept awaitable for tests.
-    @ObservationIgnored
-    var dictationWarmupTask: Task<Void, Never>?
-    @ObservationIgnored
-    var polishingWarmupTask: Task<Void, Never>?
-    @ObservationIgnored
-    var audioSendTask: Task<Void, Never>?
-    @ObservationIgnored
-    var stopFinalizationTask: Task<Void, Never>?
-    @ObservationIgnored
-    var connectTimeoutTask: Task<Void, Never>?
-    @ObservationIgnored
-    var isResolvingConnectTimeout = false
-    @ObservationIgnored
-    var recentFailureResetTask: Task<Void, Never>?
-    @ObservationIgnored
-    var finalizationWatchdogTask: Task<Void, Never>?
-    @ObservationIgnored
-    var isShowingConnectionFailureAlert = false
-    @ObservationIgnored
-    var realtimeFinalizationLastActivityAt: Date?
-    @ObservationIgnored
-    var isAwaitingMicrophonePermission = false
-    @ObservationIgnored
-    private var startupPermissionTask: Task<Void, Never>?
-    @ObservationIgnored
-    private var hasRequestedStartupPermissions = false
-    @ObservationIgnored
-    var pendingSegmentText = ""
-    @ObservationIgnored
-    var currentDictationEventText = ""
-    @ObservationIgnored
-    var sessionOutputMode: DictationOutputMode?
-    @ObservationIgnored
-    var polishAndCommitTask: Task<Void, Never>?
-    @ObservationIgnored
-    // Several finalization callbacks can converge here; keep stop cleanup
-    // idempotent until commit/post-processing fully finishes.
-    var isCompletingStoppedSession = false
-    @ObservationIgnored
-    var wasCancelled = false
-    @ObservationIgnored
-    let escapeCancelHandler = EscapeCancelHandler()
-    @ObservationIgnored
-    var sessionStartedAt: Date?
-    @ObservationIgnored
-    var sessionProvider: SettingsStore.RealtimeProvider?
-    @ObservationIgnored
-    var sessionModelName: String?
-    @ObservationIgnored
-    var sessionReplacementDictionary: ReplacementDictionary?
-    @ObservationIgnored
-    var sessionSendNowEnabled = false
-    @ObservationIgnored
-    var sessionSendNowTriggerPhrase = ""
-    @ObservationIgnored
-    var sessionSendNowTargetApps: Set<SendNowTargetApp> = []
-    @ObservationIgnored
-    var lastSendNowSubmittedSegment: String?
-    @ObservationIgnored
-    var sendNowReceivedPartialSinceLastFinal = false
-    @ObservationIgnored
-    var firstChunkPreprocessor = FirstChunkPreprocessor()
-
-    // Per-session sequence counter for the opt-in raw-delta log
-    // (`SettingsStore.debugLogRealtimeDeltas`). Reset to 0 when a new realtime
-    // session connects. Only mutated inside the gated logging path, so a value
-    // of 0 while events are flowing proves the toggle is off. Internal so the
-    // realtime-events extension can read/advance it.
-    @ObservationIgnored
-    var realtimeDeltaLogSequence = 0
-
-    /// `#if DEBUG` test seam mirroring the raw-delta log emissions. Only
-    /// invoked when `SettingsStore.debugLogRealtimeDeltas` is on (i.e. inside
-    /// the same gated path that calls `Log.deltas`), so "sink not called when
-    /// disabled" proves the logging call path was not entered. The record is
-    /// the exact pre-processing payload the Logger would emit.
-    @ObservationIgnored
-    var debugDeltaLogSink: ((DebugRealtimeDeltaLogRecord) -> Void)?
-    @ObservationIgnored
-    var debugSavedSessionRecordSink: ((DictationSessionRecord) -> Void)?
-    /// Test seam: overrides the commit-time target bundle ID resolution
-    /// (`resolveTargetAppBundleID`), which otherwise reads a live
-    /// `NSRunningApplication` from the overlay commit PID — unreachable in unit
-    /// tests. Lets profile-selection tests drive a terminal vs non-terminal
-    /// captured target deterministically.
-    @ObservationIgnored
-    var debugResolveTargetAppBundleIDOverride: (() -> String?)?
-    /// Test seam: injects the pasteboard the polish-context reader consults,
-    /// replacing `SystemPasteboardReader` over `NSPasteboard.general` (global /
-    /// unavailable in unit tests). Only resolved when the clipboard-context
-    /// setting is on AND the polishing endpoint is permitted, so a stub whose
-    /// read methods were never called proves the no-read privacy guarantee for
-    /// both the disabled toggle and a remote endpoint.
-    @ObservationIgnored
-    var debugPolishContextPasteboardReaderOverride: (() -> any PasteboardReading)?
-    /// Test seam: injects the pasteboard the spoken clipboard-paste macro reads,
-    /// replacing `SystemPasteboardReader`. Only resolved when the macro setting
-    /// is on AND a marker phrase is present, so a stub whose read methods were
-    /// never called proves the no-read guarantee when the setting is off or no
-    /// marker was spoken.
-    @ObservationIgnored
-    var debugClipboardPayloadPasteboardReaderOverride: (() -> any PasteboardReading)?
-    /// Test seam: replaces the whole AX-title/process-cwd -> git-index -> match
-    /// pipeline of
-    /// `repoVocabularyGroundingIfEnabled` with a closure returning the grounding for
-    /// a given transcript, so VM tests exercise the setting + endpoint gates
-    /// without touching live AX or a git subprocess. Consulted only AFTER those
-    /// two gates pass, so "off"/"remote" tests still prove the no-op paths.
-    /// Bypasses the deadline race entirely — to exercise that, use the
-    /// pipeline/deadline-sleep seams below instead. `@MainActor` so ordering
-    /// tests can read main-actor stub state inside it.
-    @ObservationIgnored
-    var debugRepoVocabularyEntriesOverride:
-        (@MainActor (String) -> RepoVocabularyMatcher.GroundingOutcome?)?
-    /// Test seam: replaces only the DETACHED vocabulary pipeline (AX title /
-    /// process cwd + git index + match) while keeping the deadline race in
-    /// play, so tests can inject a never-completing pipeline and prove the
-    /// commit still proceeds (without vocabulary) when the deadline expires.
-    @ObservationIgnored
-    var debugRepoVocabularyPipelineOverride:
-        (@Sendable (String) async -> RepoVocabularyMatcher.GroundingOutcome?)?
-    /// Test seam: replaces the deadline sleep of the vocabulary race (repo
-    /// reference pattern: injected clock/sleep seams, no wall-clock in tests).
-    /// An immediately-returning closure makes the deadline expire instantly.
-    @ObservationIgnored
-    var debugRepoVocabularyDeadlineSleepOverride: (@Sendable () async -> Void)?
-    /// TTL cache for harvested repo vocabularies, keyed by git root. Held for the
-    /// view model's lifetime so a burst of commits reuses one index.
-    @ObservationIgnored
-    let repoVocabularyCache = RepoVocabularyCache()
-    /// Single-flight gate for the detached vocabulary pipeline (see
-    /// `RepoVocabularyFlightGate`): while a prior pipeline is still in flight,
-    /// commits fast-skip vocabulary instead of stacking more blocked threads.
-    @ObservationIgnored
-    let repoVocabularyPipelineInFlight = RepoVocabularyFlightGate()
-    /// Collects the joined Claude session's repository. A stored property (not
-    /// a static call) so tests drive the whole commit path against an in-memory
-    /// tree and a stub git runner — the repo conventions' DI seam, not a
-    /// singleton.
-    @ObservationIgnored
-    var claudeRepoCollector: any ClaudeRepoCollecting = ClaudeRepoCollector()
-    /// Test seam: invoked after the managed-startup status mirror finishes
-    /// handling each status update (including updates its guard skips), so
-    /// tests can await mirror processing deterministically instead of
-    /// guessing with `Task.yield()`.
-    @ObservationIgnored
-    var debugManagedStatusMirrorEventSink: (() -> Void)?
-    /// Test seam: replaces the `NSPasteboard.general` write used by the copy
-    /// actions (`copyLatestSegment`, `copyRawTranscript`) so tests assert what
-    /// gets copied without a pasteboard server or clobbering the host clipboard.
-    #if DEBUG
-    @ObservationIgnored
-    var debugPasteboardWriteOverride: ((String) -> Void)?
-    #endif
-    @ObservationIgnored
-    var debugMicrophoneAuthorizationStatusOverride: MicrophoneAuthorizationStatus?
-    /// Test seam: replaces `microphone.requestAccess` in the session-start
-    /// permission gate so tests can hold and fire the grant continuation
-    /// deterministically (the real call shows a TCC prompt and touches the
-    /// microphone service).
-    @ObservationIgnored
-    var debugMicrophoneRequestAccessOverride: ((@escaping @Sendable (Bool) -> Void) -> Void)?
-    @ObservationIgnored
-    var debugHasRequestedStartupPermissions: Bool { hasRequestedStartupPermissions }
-
-    @ObservationIgnored
-    let debugLoggingEnabled = ProcessInfo.processInfo.environment["LOCALVOXTRAL_DEBUG"] == "1"
-
-    @ObservationIgnored
-    private var lifecycleObservers: [NSObjectProtocol] = []
-    @ObservationIgnored
-    private let managesRuntimeServices: Bool
+    let managesRuntimeServices: Bool
     /// When true, the startup permission-prompt pass (microphone +
     /// Accessibility) is skipped entirely. Driven by
     /// `LOCALVOXTRAL_SUPPRESS_STARTUP_PERMISSION_PROMPTS=1` in production;
@@ -615,27 +536,16 @@ final class DictationViewModel {
     /// (2026-07-24). The env override silences only the prompts; the launch
     /// path stays production-shaped.
     @ObservationIgnored
-    private let suppressStartupPermissionPrompts: Bool
+    /// Microphone and Accessibility permissions: the startup prompt pass and
+    /// the rows' requests and refreshes. Views bind to `viewModel.permissions`.
     @ObservationIgnored
-    private let localNetworkPermissionPreflight: any LocalNetworkPermissionPreflighting
-    // Tracks physical key state so repeat key-down events do not retrigger actions.
+    let permissions: PermissionsCoordinator
+    /// The keyboard triggers: gestures, hotkey registration, the shortcut
+    /// slots. Views bind to `viewModel.shortcuts`; the session reads its
+    /// gesture flags through it.
     @ObservationIgnored
-    private var isPushToTalkShortcutHeld = false
-
-    /// True while the user is still physically holding the dictation
-    /// shortcut/modifier — a release event is still coming, and it owns
-    /// ending the attempt's refusal signals. The managed-startup path in
-    /// DictationViewModel+Session.swift consults this: a secure-input
-    /// refusal that fires after backend boot may land with no gesture-end
-    /// event left to clear it.
-    var isDictationAttemptGestureActive: Bool { isPushToTalkShortcutHeld }
-    // True only when a start attempt was initiated by push-to-talk and may still need
-    // to be cancelled if the user releases before dictation actually begins.
-    @ObservationIgnored
-    private var hasActivePushToTalkShortcutSession = false
-    // True when a modifier-only hold gesture started dictation (push-to-talk semantics).
-    @ObservationIgnored
-    private var isModifierOnlyHoldActive = false
+    let shortcuts: ShortcutController
+    typealias ShortcutAssignment = ShortcutController.ShortcutAssignment
 
     init(
         settings: SettingsStore,
@@ -644,58 +554,142 @@ final class DictationViewModel {
         localNetworkPermissionPreflight: (any LocalNetworkPermissionPreflighting)? = nil,
         startRuntimeServices: Bool = true,
         suppressStartupPermissionPrompts: Bool =
-            DictationViewModel.startupPermissionPromptsSuppressed()
+            DictationViewModel.startupPermissionPromptsSuppressed(),
+        dependencies: Dependencies = Dependencies()
     ) {
+        var dependencies = dependencies
+        if dependencies.realtimeContextLimit == nil, startRuntimeServices {
+            dependencies.realtimeContextLimit = { await RealtimeContextLimitProbe.budget(for: $0) }
+        }
         self.settings = settings
+        self.shortcuts = ShortcutController(settings: settings)
         self.backendManager =
             backendManager
             ?? BackendManager(
                 polishingModelProvider: { settings.resolvedManagedLLMPolishingModel },
-                speechdCacheLimitProvider: { settings.speechdCacheLimit.megabytes },
-                speechdStepCadenceProvider: { settings.speechdStepCadence.milliseconds }
+                speechModelProvider: { settings.resolvedManagedSpeechModel }
             )
         self.managesRuntimeServices = startRuntimeServices
-        self.suppressStartupPermissionPrompts = suppressStartupPermissionPrompts
-        self.localNetworkPermissionPreflight =
-            localNetworkPermissionPreflight ?? LocalNetworkPermissionPreflight()
+        let context = SessionContextResolver(settings: settings, textInsertion: textInsertion)
+        self.permissions = PermissionsCoordinator(
+            settings: settings,
+            textInsertion: textInsertion,
+            managesRuntimeServices: startRuntimeServices,
+            suppressStartupPermissionPrompts: suppressStartupPermissionPrompts
+        )
+        self.engines = EnginesModel(
+            settings: settings,
+            backendManager: self.backendManager,
+            localNetworkPermissionPreflight:
+                localNetworkPermissionPreflight ?? LocalNetworkPermissionPreflight()
+        )
+        // The real control only in the running app: a unit suite that reached
+        // it would move the volume of the Mac running the tests, and the build
+        // host is the owner's own machine. `startRuntimeServices` is the gate
+        // that ships; the XCTest check is a second one for the two suites that
+        // do pass true, and is DEBUG-only because the symbol is.
+        var ducksRealOutput = startRuntimeServices
+        #if DEBUG
+        ducksRealOutput = ducksRealOutput && !TerminalTargetDetector.isRunningUnderXCTest
+        #endif
+        let audio = SessionAudioPipeline(
+            settings: settings,
+            microphone: dependencies.microphone,
+            ducksRealOutput: ducksRealOutput
+        )
+        let overlay: OverlayBufferSessionCoordinating
+        var overlayPanel: DictationOverlayController?
         if let overlayBufferCoordinator {
-            self.overlayBufferCoordinator = overlayBufferCoordinator
+            overlay = overlayBufferCoordinator
         } else {
             let anchorResolver = OverlayAnchorResolver()
-            self.overlayBufferCoordinator = OverlayBufferSessionCoordinator(
+            let panel = DictationOverlayController(
+                metricsProvider: {
+                    OverlayLayoutMetrics(
+                        bodyFontSize: settings.overlayBufferFontSize,
+                        visibleLines: settings.overlayBufferVisibleLines,
+                        wordHold: settings.overlayBufferWordHold)
+                },
+                polishColorProvider: { settings.overlayBufferPolishColor },
+                storedPlacementProvider: { settings.overlayBufferPlacement },
+                placementWriter: { settings.overlayBufferPlacement = $0 }
+            )
+            overlayPanel = panel
+            overlay = OverlayBufferSessionCoordinator(
                 stateMachine: OverlayBufferStateMachine(),
-                renderer: DictationOverlayController(
-                    fontSizeProvider: { settings.overlayBufferFontSize }
-                ),
-                anchorResolver: anchorResolver
+                renderer: panel,
+                anchorResolver: anchorResolver,
+                now: dependencies.clock.now,
+                sleepFor: dependencies.clock.sleep
             )
         }
+        let session = DictationSessionController(
+            settings: settings,
+            textInsertion: textInsertion,
+            engines: engines,
+            backendManager: self.backendManager,
+            shortcuts: shortcuts,
+            context: context,
+            audio: audio,
+            overlayBufferCoordinator: overlay,
+            dependencies: dependencies
+        )
+        self.session = session
 
-        realtimeAPIClient.setEventHandler { [weak self] event in
-            // Preserve callback order for back-to-back events (e.g. final transcript
-            // followed by transcription finalized) by routing through main-queue FIFO.
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                MainActor.assumeIsolated {
-                    self.handle(event: event)
-                }
+        engines.isDictationIdle = { [weak session] in session?.isDictationIdle ?? true }
+        engines.waitUntilDictationIsIdle = { [weak session] in
+            await session?.waitUntilDictationIsIdle()
+        }
+        engines.interruptConnectingSession = { [weak session] in
+            guard let session else { return }
+            // Cancelling the startup task mid-connect without aborting would
+            // leave the connecting flag latched and block every later start.
+            session.cancelManagedStartupTask()
+            if session.isConnectingRealtimeSession {
+                session.abortConnectingSession()
+                session.statusText = StatusStrings.ready
             }
         }
 
+        // BOTH realtime clients report into the same handler. Only the latched
+        // one is ever connected, so which client an event came from carries no
+        // information the session path needs — and wiring both here means a
+        // mode switch can never leave a client emitting into nothing.
+        let realtimeEventHandler: @Sendable (RealtimeEvent, RealtimeConnectionGeneration) -> Void = {
+            [weak session] event, generation in
+            // Preserve callback order for back-to-back events (e.g. final transcript
+            // followed by transcription finalized) by routing through main-queue FIFO.
+            // The generation rides in the same call as the event, so the FIFO orders
+            // the pair exactly as it orders the event alone.
+            DispatchQueue.main.async { [weak session] in
+                guard let session else { return }
+                MainActor.assumeIsolated {
+                    session.handle(event: event, from: generation)
+                }
+            }
+        }
+        session.realtimeAPIClient.setEventHandler(realtimeEventHandler)
+        session.mistralRealtimeClient.setEventHandler(realtimeEventHandler)
+
         if startRuntimeServices {
-            microphone.onConfigurationChange = { [weak self] in
+            // A launch that died mid-session (crash, force quit) left the
+            // volume down with nothing running. Put it back before anything
+            // else starts.
+            audio.audioDucking.restoreInterruptedDuckFromPreviousLaunch()
+
+            audio.microphone.onConfigurationChange = { [weak self] in
                 Task { @MainActor [weak self] in
-                    self?.healthMonitor.handleConfigurationChange()
+                    self?.audio.healthMonitor.handleConfigurationChange()
                 }
             }
 
-            microphone.onInputDevicesChanged = { [weak self] in
+            audio.microphone.onInputDevicesChanged = { [weak self] in
                 Task { @MainActor [weak self] in
-                    self?.healthMonitor.handleInputDevicesChanged()
+                    self?.audio.handleMicrophoneInputDevicesChanged()
                 }
             }
 
-            microphone.onError = { [weak self] message in
+            audio.microphone.onError = { [weak self] message in
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     self.lastError = message
@@ -705,7 +699,8 @@ final class DictationViewModel {
 
         textInsertion.onAccessibilityTrustChanged = { [weak self] in
             guard let self else { return }
-            self.retryModifierOnlyHotKeyRegistrationIfNeeded()
+            self.shortcuts.retryModifierOnlyHotKeyRegistrationIfNeeded()
+            self.shortcuts.retryChordShortcutRegistrationIfNeeded()
             if self.currentErrorToken == .accessibilityPermissionRequired {
                 self.lastError = nil
             }
@@ -723,32 +718,138 @@ final class DictationViewModel {
             }
         }
 
-        networkMonitor.onChange = { [weak self] connected in
-            Task { @MainActor [weak self] in
-                self?.handleNetworkChange(connected: connected)
+        session.networkMonitor.onChange = { [weak session] connected in
+            Task { @MainActor [weak session] in
+                session?.handleNetworkChange(connected: connected)
             }
         }
         if startRuntimeServices {
-            networkMonitor.start()
+            session.networkMonitor.start()
         }
 
-        hotKeyManager.onPressWithMode = { [weak self] mode in self?.handleDictationShortcutPress(mode: mode) }
-        hotKeyManager.onPress = { [weak self] in self?.handleDictationShortcutPress() }
-        hotKeyManager.onRelease = { [weak self] in self?.handleDictationShortcutRelease() }
-        hotKeyManager.onHoldStart = { [weak self] in self?.handleModifierOnlyHoldStart() }
-        hotKeyManager.onModifierOnlyTap = { [weak self] mode in self?.handleModifierOnlyTap(mode: mode) }
+        shortcuts.install(session: session)
+        permissions.install(session: session)
         if startRuntimeServices {
-            registerCurrentHotKeys()
+            shortcuts.registerAtLaunch()
         }
 
-        escapeCancelHandler.onCancel = { [weak self] in self?.cancelDictation() }
+        session.escapeCancelHandler.onCancel = { [weak session] in session?.cancelDictation() }
+        session.destinationKeyHandler.onMove = { [weak session] forward in
+            session?.moveDestination(forward: forward)
+        }
+        overlayPanel?.onDestinationClick = { [weak session] destination in
+            session?.clickDestination(destination)
+        }
 
         textInsertion.refreshAccessibilityTrustState()
         if startRuntimeServices {
-            sessionStore = DictationSessionStore()
+            let dataDirectory = dependencies.dataDirectory ?? LocalvoxtralDataDirectory.url()
+            let home = dependencies.home ?? FileManager.default.homeDirectoryForCurrentUser
+            switch DictationSessionStore.open(directory: dependencies.dataDirectory) {
+            case let .success(store):
+                sessionStore = store
+            case let .failure(failure):
+                historyOpenFailure = failure
+                session.historyOpenFailed = true
+                session.quarantineWithoutHistory = DictationHistoryQuarantine(
+                    directoryURL: DictationHistoryQuarantine.directory(
+                        inHistoryFolder: dependencies.dataDirectory ?? DictationHistoryStoreFile.defaultDirectoryURL()))
+            }
+            sessionStore?.onAccessFailureChange = { [weak self] failure in
+                self?.historyAccessFailure = failure
+                self?.dictationHistoryRevision += 1
+            }
+            sessionStore?.onChange = { [weak self] in
+                self?.dictationHistoryRevision += 1
+                Task { await self?.session.refreshLastDictationFromStore() }
+            }
+            Task { [weak self] in await self?.session.refreshLastDictationFromStore() }
+            // Attached whatever the setting says, so Delete and retention
+            // still clear recordings kept before it was turned off.
+            sessionStore?.audioStore = DictationAudioStore(
+                directoryURL: dataDirectory.appendingPathComponent("dictation-audio", isDirectory: true))
+            // One store for writes and for deletes: a record follows its
+            // History entry the way its audio does.
+            let diagnosticRecordStore = DiagnosticRecordStore(
+                directoryURL: dataDirectory.appendingPathComponent("diagnostic-records", isDirectory: true))
+            session.diagnosticRecordStore = diagnosticRecordStore
+            sessionStore?.diagnosticRecordStore = diagnosticRecordStore
+            sessionStore?.removeOrphanedAudio()
+            applyDictationHistoryRetention()
+            // Before everything that calls a model, so each one records to it.
+            let usageLedger = UsageLedger(fileURL: UsageLedger.defaultFileURL(in: dataDirectory)) {
+                [weak self] in
+                Task { @MainActor in self?.engines.noteUsageLedgerChanged() }
+            }
+            learnedTermStore = LearnedTermStore(
+                fileURL: LearnedTermStore.defaultFileURL(in: dataDirectory),
+                onChange: { [weak self] in
+                    Task { @MainActor in
+                        self?.learnedTermRevision += 1
+                        // What keeps the sidebar badge honest between two
+                        // openings of the pane; reads memory, never the disk.
+                        self?.termSuggestions.refreshLearnedSuggestions()
+                    }
+                }
+            )
+            session.agentSkillStore = AgentSkillStore(
+                fileURL: AgentSkillStore.defaultFileURL(in: dataDirectory), home: home)
+            if let learnedTermStore {
+                let agentProjectScanner = AgentProjectActivityScanner(store: learnedTermStore, home: home)
+                agentProjectScanner.refreshIfStale()
+                session.agentProjectScanner = agentProjectScanner
+                let correctionLearning = CorrectionLearning(
+                    store: learnedTermStore,
+                    knownTerms: { [settings] in settings.polishSpeakerTerms }
+                )
+                correctionLearnedPanel = CorrectionLearnedPanel()
+                correctionLearning.presenter = correctionLearnedPanel
+                session.correctionLearning = correctionLearning
+                session.projectTermProposer = ProjectTermProposer(
+                    store: learnedTermStore,
+                    runner: ProjectTermProposalProcessRunner(
+                        vibeHome: dataDirectory.appendingPathComponent("vibe-home", isDirectory: true),
+                        userVibeDirectory: home.appendingPathComponent(".vibe", isDirectory: true)
+                    ),
+                    now: { Date() },
+                    usageRecorder: usageLedger
+                )
+            }
+            installQuickCaptureInbox(
+                QuickCaptureInboxViewModel(
+                    settings: settings,
+                    learnedTerms: { [weak self] in self?.learnedTermStore?.snapshot() ?? LearnedTerms() },
+                    learnedTermStore: learnedTermStore,
+                    fileURL: QuickCaptureInboxViewModel.defaultFileURL(in: dataDirectory),
+                    applicationSupport: dataDirectory,
+                    usageRecorder: usageLedger,
+                    polisher: QuickCaptureLLMPolisher(
+                        settings: settings,
+                        appConfigStore: { [weak self] in self?.appConfigStore ?? AppConfigStore() },
+                        service: { [weak self] in self?.llmPolishingService ?? LLMPolishingService() }
+                    )
+                )
+            )
+            session.termSuggestionCadence = TermSuggestionCadence(
+                settings: settings,
+                model: { [weak self] in self?.termSuggestions },
+                isDictationActive: { [weak self] in
+                    guard let self else { return false }
+                    return self.isDictating || self.isFinalizingStop
+                        || self.isConnectingRealtimeSession
+                },
+                launchedAt: Date()
+            )
+            installUsageLedger(usageLedger)
+            installVoiceMemos(usageLedger: usageLedger, dataDirectory: dataDirectory)
             refreshMicrophoneInputs()
-            registerLifecycleObservers()
-            requestStartupPermissionsIfNeeded()
+            registerLifecycleObservers(
+                application: dependencies.lifecycleNotificationCenter ?? .default,
+                workspace: dependencies.workspaceNotificationCenter
+                    ?? NSWorkspace.shared.notificationCenter
+            )
+            permissions.requestStartupPermissionsIfNeeded()
+            importSpeakerTermsFromReplacementDictionaryIfNeeded()
             // Subscribe BEFORE the launch warmup below so the very first
             // polishd ready edge is observed and prompt-prefix-warmed.
             let promptWarmup = PolishPromptWarmupCoordinator(
@@ -759,81 +860,121 @@ final class DictationViewModel {
                     guard let self else { return nil }
                     return PolishPromptWarmup.plan(
                         settings: self.settings,
-                        appConfigStore: self.appConfigStore
+                        appConfigStore: self.appConfigStore,
+                        projectNames: self.session.polishProjectNames(),
+                        skillNames: self.session.polishSkillNames()
                     )
-                }
+                },
+                clock: dependencies.clock
             )
             polishPromptWarmupCoordinator = promptWarmup
             promptWarmup.observe(self.backendManager.statusUpdates)
-            warmUpManagedBackendsAtLaunchIfNeeded()
+            promptWarmup.observePlanInputs()
+            session.onDictationStartRequested = { [weak promptWarmup] in
+                promptWarmup?.ensureWarm(reason: "dictation start")
+            }
+            engines.warmUpManagedBackendsAtLaunchIfNeeded()
+        } else {
+            registerLifecycleObservers(
+                application: dependencies.lifecycleNotificationCenter,
+                workspace: dependencies.workspaceNotificationCenter
+            )
         }
+    }
+
+    /// Points both realtime clients, the second pass and the polishing service
+    /// (polishes and term suggestions) at `ledger`. Replaces `llmPolishingService`, so a test that
+    /// substitutes a fake does so after this.
+    func installUsageLedger(_ ledger: UsageLedger) {
+        engines.installUsageLedger(ledger)
+        session.mistralRealtimeClient.setUsageRecorder(ledger)
+        session.realtimeAPIClient.setUsageRecorder(ledger)
+        session.secondPassUsageRecorder = ledger
+        llmPolishingService = LLMPolishingService(usageRecorder: ledger)
     }
 
     @MainActor
     deinit {
-        for observer in lifecycleObservers {
-            NotificationCenter.default.removeObserver(observer)
+        for (center, observer) in lifecycleObservers {
+            center.removeObserver(observer)
         }
         lifecycleObservers.removeAll()
-        commitTask?.cancel()
-        managedStartupTask?.cancel()
-        managedStartupTaskID = nil
-        polishingShutdownTask?.cancel()
-        dictationShutdownTask?.cancel()
-        dictationWarmupTask?.cancel()
-        polishingWarmupTask?.cancel()
-        audioSendTask?.cancel()
-        stopFinalizationTask?.cancel()
-        connectTimeoutTask?.cancel()
-        recentFailureResetTask?.cancel()
-        finalizationWatchdogTask?.cancel()
-        startupPermissionTask?.cancel()
-        polishAndCommitTask?.cancel()
+        audio.commitTask?.cancel()
+        session.managedStartupTask?.cancel()
+        session.managedStartupTaskID = nil
+        engines.cancelTasks()
+        audio.audioSendTask?.cancel()
+        session.stopFinalizationTask?.cancel()
+        session.connectTimeoutTask?.cancel()
+        session.silenceAutoStopTask?.cancel()
+        session.reconnectTask?.cancel()
+        session.recentFailureResetTask?.cancel()
+        session.finalizationWatchdogTask?.cancel()
+        session.microphonePermissionTimeoutTask?.cancel()
+        permissions.cancelTasks()
+        session.polishAndCommitTask?.cancel()
         polishPromptWarmupCoordinator?.cancelTasks()
         textInsertion.stopAllTasks()
-        overlayBufferCoordinator.reset()
-        healthMonitor.cancelTasks()
-        escapeCancelHandler.stop()
+        session.overlayBufferCoordinator.reset()
+        audio.healthMonitor.cancelTasks()
+        session.escapeCancelHandler.stop()
+        session.destinationKeyHandler.stop()
+        audio.audioDucking.restoreImmediatelyForTermination()
         if managesRuntimeServices {
-            if hasInitializedMicrophone {
-                microphone.stop()
-            }
-            networkMonitor.stop()
-            realtimeAPIClient.disconnect()
-            hotKeyManager.unregister()
+            audio.stopMicrophoneIfInitialized()
+            session.networkMonitor.stop()
+            session.activeRealtimeClient.disconnect()
+            shortcuts.unregister()
         }
+    }
+
+    /// See `DictationSessionController.finalizeDictationBeforeQuit`.
+    func finalizeDictationBeforeQuit(then reply: @escaping @MainActor () -> Void) -> Bool {
+        session.finalizeDictationBeforeQuit(then: reply)
+    }
+
+    /// A stopped dictation still owed its commit is saved to History as not
+    /// inserted. Quit calls this before it drains the History writes.
+    func saveStoppedDictationForQuit() {
+        session.saveStoppedDictationForQuit()
+    }
+
+    func resetAccessibilityPermission() {
+        guard textInsertion.resetAccessibilityPermission() else {
+            lastError = "Unable to reset Accessibility permission for this app build."
+            return
+        }
+        statusText = StatusStrings.accessibilityPermissionReset
+        lastError = nil
     }
 
     // MARK: - Lifecycle Observers
 
-    private func registerLifecycleObservers() {
-        registerLifecycleObservers(on: .default)
-    }
-
-    #if DEBUG
-    /// Test seam: registers the REAL lifecycle observers on a private center,
-    /// so a suite can post `willTerminateNotification` through the actual
-    /// wiring without broadcasting to every retained view model in the
-    /// process.
-    func debugRegisterLifecycleObservers(on center: NotificationCenter) {
-        registerLifecycleObservers(on: center)
-    }
-    #endif
-
-    private func registerLifecycleObservers(on nc: NotificationCenter) {
-
-        let sleepObserver = nc.addObserver(
-            forName: NSWorkspace.willSleepNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                guard let self, self.isDictating else { return }
-                self.stopDictation(reason: "system sleep", finalizeRemainingAudio: false)
+    private func registerLifecycleObservers(
+        application: NotificationCenter?, workspace: NotificationCenter?
+    ) {
+        if let workspace {
+            let sleepObserver = workspace.addObserver(
+                forName: NSWorkspace.willSleepNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    guard let self, self.isDictating else { return }
+                    // The final commit is what makes the bundled helper flush
+                    // its last words; a closed socket drops them (#1584).
+                    // Bounded short, since sleep may suspend the app any time.
+                    self.stopDictation(
+                        reason: "system sleep",
+                        finalizationTimeout: TimingConstants.sleepStopFinalizationTimeout
+                    )
+                }
             }
+            lifecycleObservers.append((workspace, sleepObserver))
         }
 
-        let terminateObserver = nc.addObserver(
+        guard let application else { return }
+        let terminateObserver = application.addObserver(
             forName: NSApplication.willTerminateNotification,
             object: nil,
             queue: .main
@@ -846,14 +987,15 @@ final class DictationViewModel {
             // to run).
             MainActor.assumeIsolated {
                 guard let self else { return }
-                #if LOCALVOXTRAL_DOGFOOD
                 // Last chance for a still-open post-commit watch to patch its
                 // record: after this the process is gone and the dictation
                 // would keep no behavior block at all.
-                self.dogfoodEditSignalWatcher.flushForTermination()
-                #endif
+                self.session.editSignalWatcher.flushForTermination()
+                // Inline, not in the Task below: a fade would not get to
+                // finish and the Task is not guaranteed to run at all.
+                self.audio.audioDucking.restoreImmediatelyForTermination()
                 Task {
-                    self.cancelManagedStartupTask()
+                    self.session.cancelManagedStartupTask()
                     if self.isDictating {
                         self.stopDictation(
                             reason: "app terminating", finalizeRemainingAudio: false
@@ -864,7 +1006,7 @@ final class DictationViewModel {
             }
         }
 
-        lifecycleObservers = [sleepObserver, terminateObserver]
+        lifecycleObservers.append((application, terminateObserver))
     }
 
     /// True when `LOCALVOXTRAL_SUPPRESS_STARTUP_PERMISSION_PROMPTS=1` — the
@@ -874,1519 +1016,55 @@ final class DictationViewModel {
     nonisolated static func startupPermissionPromptsSuppressed(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> Bool {
-        environment["LOCALVOXTRAL_SUPPRESS_STARTUP_PERMISSION_PROMPTS"] == "1"
+        StartupPermissionSuppression.isActive(environment: environment)
     }
 
-    private func requestStartupPermissionsIfNeeded() {
-        guard managesRuntimeServices else { return }
-        guard !suppressStartupPermissionPrompts else {
-            // .notice so the line persists in the unified log archive: it is
-            // the after-the-fact field proof that a CI smoke launch skipped
-            // the prompt pass (.info survives only in the memory buffer).
-            Log.dictation.notice(
-                "startup permission prompts suppressed (LOCALVOXTRAL_SUPPRESS_STARTUP_PERMISSION_PROMPTS=1)"
-            )
-            return
-        }
-        guard settings.onboardingCompleted else {
-            debugLog("startup permission prompts skipped until onboarding completes")
-            return
-        }
-        guard !hasRequestedStartupPermissions else { return }
-        hasRequestedStartupPermissions = true
-
-        startupPermissionTask?.cancel()
-        startupPermissionTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            self.prepareLLMPolishingPromptAccessIfNeeded()
-            guard !Task.isCancelled else { return }
-            await self.requestStartupMicrophonePermissionIfNeeded()
-            guard !Task.isCancelled else { return }
-            self.requestStartupAccessibilityPermissionIfNeeded()
-        }
-    }
-
-    func prepareLLMPolishingPromptAccessIfNeeded() {
-        guard settings.llmPolishingEnabled else { return }
-
-        debugLog("preloading LLM polishing prompt/config files")
-        _ = appConfigStore.loadLLMPromptTemplates()
-    }
-
-    private func requestStartupAccessibilityPermissionIfNeeded() {
-        refreshAccessibilityTrustState()
-        guard !textInsertion.isAccessibilityTrusted else { return }
-
-        debugLog("startup accessibility permission prompt requested")
-        textInsertion.requestAccessibilityPermissionIfNeeded()
-    }
-
-    private func requestStartupMicrophonePermissionIfNeeded() async {
-        guard !isAwaitingMicrophonePermission else { return }
-        guard microphone.authorizationStatus() == .notDetermined else { return }
-
-        isAwaitingMicrophonePermission = true
-        debugLog("startup microphone permission prompt requested")
-
-        let granted = await withCheckedContinuation { continuation in
-            microphone.requestAccess { granted in
-                continuation.resume(returning: granted)
-            }
-        }
-
-        guard !Task.isCancelled else { return }
-        isAwaitingMicrophonePermission = false
-        debugLog("startup microphone permission result granted=\(granted)")
-
-        guard granted else {
-            if !isDictating, !isFinalizingStop, !isConnectingRealtimeSession {
-                statusText = StatusStrings.microphoneAccessDenied
-            }
-            lastError = Self.microphoneDeniedMessage
-            return
-        }
-
-        if !isDictating, !isFinalizingStop, !isConnectingRealtimeSession,
-           currentStatusToken == .awaitingMicrophonePermission
-        {
-            statusText = StatusStrings.ready
-        }
-    }
-
-    // MARK: - Network
-
-    private func handleNetworkChange(connected: Bool) {
-        if connected {
-            debugLog("network restored")
-            if !isDictating, !isFinalizingStop, !isConnectingRealtimeSession,
-               (currentStatusToken == .networkLostDictationStopped
-                   || currentStatusToken == .noNetworkConnection)
-            {
-                statusText = StatusStrings.ready
-                lastError = nil
-            }
-        } else {
-            debugLog("network lost")
-            if isConnectingRealtimeSession {
-                abortConnectingSession()
-                handleConnectFailure(reason: .networkLost)
-            } else if isDictating {
-                stopDictation(reason: "network lost", finalizeRemainingAudio: false)
-                statusText = StatusStrings.networkLostDictationStopped
-                lastError = "Network connection was lost during dictation."
-            } else if isFinalizingStop {
-                realtimeAPIClient.disconnect()
-                finishStoppedSession(promotePendingSegment: true)
-                statusText = StatusStrings.networkLostDictationStopped
-                lastError = "Network connection was lost during dictation."
-            } else {
-                statusText = StatusStrings.noNetworkConnection
-            }
-        }
-    }
-
-    // MARK: - Public API
-
-    private func handleDictationShortcutPress(mode: DictationOutputMode? = nil) {
-        switch settings.dictationShortcutMode {
-        case .toggle:
-            hasActivePushToTalkShortcutSession = false
-            if isDictating {
-                stopDictation(reason: "manual toggle")
-            } else if isConnectingRealtimeSession {
-                statusText = StatusStrings.connectingRealtimeBackend
-            } else if isFinalizingStop {
-                statusText = StatusStrings.finalizingPreviousDictation
-            } else {
-                startDictation(outputMode: mode)
-            }
-        case .pushToTalk:
-            guard !isPushToTalkShortcutHeld else { return }
-            isPushToTalkShortcutHeld = true
-            guard !isDictating, !isConnectingRealtimeSession, !isFinalizingStop else { return }
-            hasActivePushToTalkShortcutSession = true
-            startDictation(outputMode: mode)
-            if !isDictating, !isConnectingRealtimeSession, !isAwaitingMicrophonePermission {
-                hasActivePushToTalkShortcutSession = false
-            }
-        }
-    }
-
-    private func handleDictationShortcutRelease() {
-        // A REFUSED live start (secure input) resets the hold flags inside
-        // handleModifierOnlyHoldStart, so no branch below fires for it —
-        // this is the moment the user's attempt gesture ends, and the
-        // warning icon must end with it (owner field feedback on #90). The
-        // popover line stays as the explanation until the next start
-        // re-samples.
-        clearSecureInputRefusalSignalsIfAttemptEnded()
-        // Modifier-only hold release
-        if isModifierOnlyHoldActive {
-            isModifierOnlyHoldActive = false
-            isPushToTalkShortcutHeld = false
-            if isDictating {
-                stopDictation(reason: "modifier hold release")
-            } else if isConnectingRealtimeSession {
-                statusText = StatusStrings.connectingRealtimeBackend
-                return
-            } else if isAwaitingMicrophonePermission {
-                statusText = StatusStrings.ready
-                return
-            }
-            clearPushToTalkShortcutSessionAttempt()
-            return
-        }
-
-        guard isPushToTalkShortcutHeld else { return }
-        isPushToTalkShortcutHeld = false
-
-        guard settings.dictationShortcutMode == .pushToTalk else {
-            hasActivePushToTalkShortcutSession = false
-            return
-        }
-        guard hasActivePushToTalkShortcutSession else { return }
-
-        if isConnectingRealtimeSession {
-            // Keep the connection attempt alive so timeout/errors surface to the user
-            // instead of silently resetting to Ready on key release.
-            statusText = StatusStrings.connectingRealtimeBackend
-            return
-        } else if isDictating {
-            stopDictation(reason: "push-to-talk release")
-        } else if isAwaitingMicrophonePermission {
-            // Keep the session marker until the permission callback resolves so we can
-            // suppress starting if the key was released before permission was granted.
-            statusText = StatusStrings.ready
-            return
-        }
-        clearPushToTalkShortcutSessionAttempt()
-    }
-
-    /// Modifier-only hold gesture started — use push-to-talk semantics with live auto-paste.
-    private func handleModifierOnlyHoldStart() {
-        guard !isDictating, !isConnectingRealtimeSession, !isFinalizingStop else { return }
-        isModifierOnlyHoldActive = true
-        isPushToTalkShortcutHeld = true
-        hasActivePushToTalkShortcutSession = true
-        startDictation(outputMode: .liveAutoPaste)
-        if !isDictating, !isConnectingRealtimeSession, !isAwaitingMicrophonePermission {
-            hasActivePushToTalkShortcutSession = false
-            isModifierOnlyHoldActive = false
-            isPushToTalkShortcutHeld = false
-        }
-    }
-
-    /// Modifier-only TAP is a toggle by contract regardless of the configured
-    /// shortcut behavior: taps have no release event, so routing them through
-    /// push-to-talk semantics latches dictation on with no way to stop it.
-    private func handleModifierOnlyTap(mode: DictationOutputMode) {
-        toggleDictation(outputMode: mode)
-    }
-
-    func shouldCancelPushToTalkStartAfterConnect() -> Bool {
-        hasActivePushToTalkShortcutSession
-            && !isPushToTalkShortcutHeld
-    }
-
-    func clearPushToTalkShortcutSessionAttempt() {
-        hasActivePushToTalkShortcutSession = false
-    }
-
-    func toggleDictation(outputMode: DictationOutputMode? = nil) {
-        hasActivePushToTalkShortcutSession = false
-        defer {
-            // Toggle starts (modifier tap, popover button) have no release
-            // event, so a refused live start would latch the warning icon
-            // forever (Codex findings on #90, rounds 5-6). The tap/click IS
-            // the whole attempt gesture: if nothing started, end the refusal
-            // signals now — the sound already fired and the popover line
-            // keeps the explanation.
-            if !isDictating, !isConnectingRealtimeSession, !isAwaitingMicrophonePermission {
-                clearSecureInputRefusalSignalsIfAttemptEnded()
-            }
-        }
-        if isDictating {
-            stopDictation(reason: "manual toggle")
-        } else if isConnectingRealtimeSession {
-            statusText = StatusStrings.connectingRealtimeBackend
-        } else if isFinalizingStop {
-            statusText = StatusStrings.finalizingPreviousDictation
-        } else {
-            startDictation(outputMode: outputMode)
-        }
-    }
-
-    func cancelDictation() {
-        guard isDictating || isFinalizingStop || isConnectingRealtimeSession else { return }
-        wasCancelled = true
-        // A cancelled session never reaches the commit path that consumes the
-        // capture, so without this the user's screen text would sit in memory
-        // until the next session start — text from a session they explicitly
-        // threw away.
-        discardTerminalScreenCapture()
-        cancelManagedStartupTask()
-        if isDictating {
-            stopDictation(reason: "cancelled", finalizeRemainingAudio: false)
-        } else if isConnectingRealtimeSession {
-            abortConnectingSession()
-            statusText = StatusStrings.ready
-        } else if isFinalizingStop {
-            realtimeAPIClient.disconnect()
-            finishStoppedSession(promotePendingSegment: false)
-        }
-    }
-
-    /// Re-register the hotkey based on current settings.
-    /// Called when modifier-only mode or modifier key selection changes.
-    func applyHotKeySettingsChange() {
-        switch registerCurrentHotKeys() {
-        case .success:
-            if !isDictating, !isFinalizingStop,
-               (currentStatusToken == .hotKeyHandlerRegistrationFailure
-                || currentStatusToken == .hotKeyShortcutUnavailable)
-            {
-                statusText = StatusStrings.ready
-            }
-            if currentErrorToken == .hotKeyShortcutUnavailable
-                || currentErrorToken == .hotKeyHandlerRegistrationFailure
-            {
-                lastError = nil
-            }
-        case .failure(let reason):
-            applyHotKeyRegistrationFailure(reason)
-        }
-    }
-
-    /// Modifier-only NSEvent monitors require Accessibility trust, and
-    /// `AXIsProcessTrusted()` can transiently report false at cold launch even
-    /// with a persisted grant (field-hit 2026-07-05: launch-time registration
-    /// died and the shortcut stayed dead until the user touched the modifier
-    /// setting). Once trust lands, re-register — but never churn a live
-    /// registration.
-    private func retryModifierOnlyHotKeyRegistrationIfNeeded() {
-        guard settings.modifierOnlyHotKeyEnabled,
-              textInsertion.isAccessibilityTrusted,
-              !hotKeyManager.isModifierOnlyRegistrationActive
-        else { return }
-        Log.modifierKeys.notice(
-            "Accessibility trust granted; retrying modifier-only hotkey registration."
-        )
-        applyHotKeySettingsChange()
-    }
-
-    func applyDictationBackendModeChange(_ mode: BackendMode) {
-        let previousMode = settings.dictationBackendMode
-        settings.dictationBackendMode = mode
-
-        if mode == .externalURL {
-            preflightDictationEndpoint(reason: "dictation backend switched to external")
-        }
-
-        if previousMode == .externalURL, mode == .managedLocal {
-            startManagedBackendWarmup(dictation: true, polishing: false)
-            return
-        }
-
-        if previousMode == .managedLocal, mode == .externalURL {
-            Log.backends.info("dictation backend mode switched to external; stopping managed speechd")
-            cancelManagedStartupTask()
-            dictationWarmupTask?.cancel()
-            if isConnectingRealtimeSession {
-                abortConnectingSession()
-                statusText = StatusStrings.ready
-            }
-            dictationShutdownTask?.cancel()
-            dictationShutdownTask = Task { @MainActor [backendManager] in
-                guard !Task.isCancelled else { return }
-                await backendManager.stopDictation()
-            }
-        }
-    }
-
-    func applyPolishingBackendModeChange(_ mode: BackendMode) {
-        let previousMode = settings.polishingBackendMode
-        settings.polishingBackendMode = mode
-
-        if mode == .externalURL {
-            preflightPolishingEndpoint(reason: "polishing backend switched to external")
-        }
-
-        if previousMode == .externalURL, mode == .managedLocal {
-            if isManagedPolishingWarmupWanted {
-                startPolishingWarmup()
-            }
-            return
-        }
-
-        if previousMode == .managedLocal, mode == .externalURL {
-            Log.backends.info("polishing backend mode switched to external; stopping managed polishd")
-            cancelManagedStartupTask()
-            // Mirror the dictation sibling above: cancelling the startup task
-            // mid-connect without aborting would leave the connecting flag
-            // latched and block every later start.
-            if isConnectingRealtimeSession {
-                abortConnectingSession()
-                statusText = StatusStrings.ready
-            }
-            polishingWarmupTask?.cancel()
-            polishingShutdownTask?.cancel()
-            polishingShutdownTask = Task { @MainActor [backendManager] in
-                guard !Task.isCancelled else { return }
-                await backendManager.stopPolishing()
-            }
-        }
-    }
-
-    func applyRealtimeEndpointChange(_ endpoint: String) {
-        settings.realtimeAPIEndpointURL = endpoint
-        guard settings.dictationBackendMode == .externalURL else { return }
-        preflightDictationEndpoint(reason: "dictation endpoint updated")
-    }
-
-    func applyLLMPolishingEndpointChange(_ endpoint: String) {
-        settings.llmPolishingEndpointURL = endpoint
-        guard settings.polishingBackendMode == .externalURL else { return }
-        preflightPolishingEndpoint(reason: "polishing endpoint updated")
-    }
-
-    func preflightConfiguredLocalNetworkEndpoints() {
-        if settings.dictationBackendMode == .externalURL {
-            preflightDictationEndpoint(reason: "configured external dictation endpoint")
-        }
-        if settings.polishingBackendMode == .externalURL {
-            preflightPolishingEndpoint(reason: "configured external polishing endpoint")
-        }
-    }
-
-    private func preflightDictationEndpoint(reason: String) {
-        guard let endpoint = settings.resolvedWebSocketURL(for: settings.realtimeProvider),
-              LocalNetworkEndpointPolicy.preflightTarget(for: endpoint) != nil
-        else { return }
-        localNetworkPermissionPreflight.preflight(endpoint: endpoint, reason: reason)
-    }
-
-    private func preflightPolishingEndpoint(reason: String) {
-        let configuredEndpoint = settings.llmPolishingEndpointURL.trimmed
-        guard settings.polishingBackendMode == .externalURL,
-              let endpoint = URL(string: configuredEndpoint),
-              LocalNetworkEndpointPolicy.preflightTarget(for: endpoint) != nil
-        else { return }
-        localNetworkPermissionPreflight.preflight(endpoint: endpoint, reason: reason)
-    }
-
-    /// Managed speechd's launch arguments carry this setting; a running engine
-    /// keeps its argv, so apply a change by restarting it (same eager UX as
-    /// `applyLLMPolishingModelChange`: stop, then warm back up with progress
-    /// in the status row). Outside Managed local mode only the stored value
-    /// changes — the next managed start reads current settings.
-    func applySpeechdCacheLimitChange(_ limit: SpeechdCacheLimit) {
-        guard settings.speechdCacheLimit != limit else { return }
-        settings.speechdCacheLimit = limit
-        restartManagedDictationEngineForSettingChange(reason: "memory limit changed")
-    }
-
-    /// See `applySpeechdCacheLimitChange` — same restart contract.
-    func applySpeechdStepCadenceChange(_ cadence: SpeechdStepCadence) {
-        guard settings.speechdStepCadence != cadence else { return }
-        settings.speechdStepCadence = cadence
-        restartManagedDictationEngineForSettingChange(reason: "step interval changed")
-    }
-
-    private func restartManagedDictationEngineForSettingChange(reason: String) {
-        guard settings.dictationBackendMode == .managedLocal else { return }
-        Log.backends.info(
-            "managed dictation setting changed (\(reason, privacy: .public)); restarting dictation engine"
-        )
-        dictationWarmupTask?.cancel()
-        dictationShutdownTask?.cancel()
-        dictationShutdownTask = Task { @MainActor [weak self, backendManager] in
-            guard !Task.isCancelled else { return }
-            await backendManager.stopDictation()
-            guard !Task.isCancelled, let self else { return }
-            self.startManagedBackendWarmup(dictation: true, polishing: false)
-        }
-    }
-
-    func applyLLMPolishingModelChange(_ model: String) {
-        guard settings.managedLLMPolishingModel != model else { return }
-        settings.managedLLMPolishingModel = model
-        guard settings.polishingBackendMode == .managedLocal else { return }
-
-        Log.backends.info("managed polishing model changed; restarting polishing engine")
-        polishingWarmupTask?.cancel()
-        polishingShutdownTask?.cancel()
-        polishingShutdownTask = Task { @MainActor [weak self, backendManager] in
-            guard !Task.isCancelled else { return }
-            await backendManager.stopPolishing()
-            // Same eager UX as the enable/mode toggles: download + relaunch
-            // now, with progress in the status row — not on the next
-            // dictation (field finding, PR #99 hand-test).
-            guard !Task.isCancelled, let self, self.isManagedPolishingWarmupWanted else { return }
-            self.startPolishingWarmup()
-        }
-    }
-
-    func applyDictationOutputModeChange(_ mode: DictationOutputMode) {
-        // The menu-bar output mode is not a reachability input (see
-        // `isOverlayBufferSessionReachable`), so managed polishd is unaffected.
-        settings.dictationOutputMode = mode
-    }
-
-    /// The trigger picker in Settings > Dictation. Switching between the
-    /// single-modifier gesture and per-mode shortcuts changes whether an
-    /// Overlay Buffer session is reachable, so managed polishd follows.
-    func applyDictationTriggerModeChange(modifierOnlyEnabled: Bool) {
-        guard settings.modifierOnlyHotKeyEnabled != modifierOnlyEnabled else { return }
-        let wasReachable = settings.isOverlayBufferSessionReachable
-        settings.modifierOnlyHotKeyEnabled = modifierOnlyEnabled
-        applyHotKeySettingsChange()
-        handleOverlayReachabilityTransition(wasReachable: wasReachable)
-    }
-
-    /// Managed polishd follows Overlay Buffer reachability: polishing runs only
-    /// on Overlay Buffer commits, so when no trigger can start one the process
-    /// is stopped instead of idling in memory.
-    func handleOverlayReachabilityTransition(wasReachable: Bool) {
-        let isReachable = settings.isOverlayBufferSessionReachable
-        guard wasReachable != isReachable,
-              settings.llmPolishingEnabled,
-              settings.polishingBackendMode == .managedLocal
-        else { return }
-
-        if isReachable {
-            startPolishingWarmup()
-        } else {
-            Log.backends.info("no Overlay Buffer trigger configured; stopping managed polishd")
-            polishingWarmupTask?.cancel()
-            polishingShutdownTask?.cancel()
-            polishingShutdownTask = Task { @MainActor [backendManager] in
-                guard !Task.isCancelled else { return }
-                await backendManager.stopPolishing()
-            }
-        }
-    }
-
-    /// React to the LLM polishing enable toggle. Disabling polishing in Managed
-    /// local polishing mode stops the managed polishd process so it stops holding memory.
-    /// Enabling in Managed local mode eagerly starts the polishing warmup so
-    /// install/model progress is visible in Settings. External URL mode owns
-    /// no local process.
-    /// Any polish request in flight when the process stops fails, and the
-    /// existing polish-failure fallback commits the raw text.
-    func llmPolishingEnabledDidChange(_ enabled: Bool) {
-        guard settings.polishingBackendMode == .managedLocal else { return }
-        polishingShutdownTask?.cancel()
-        if enabled, settings.isOverlayBufferSessionReachable {
-            startPolishingWarmup()
-        } else {
-            Log.backends.info("polishing disabled; stopping managed polishd")
-            polishingWarmupTask?.cancel()
-            polishingShutdownTask = Task { @MainActor [backendManager] in
-                guard !Task.isCancelled else { return }
-                await backendManager.stopPolishing()
-            }
-        }
-    }
-
-    func warmUpManagedBackendsAtLaunchIfNeeded() {
-        guard settings.onboardingCompleted else {
-            Log.backends.info("launch managed backend warmup skipped until onboarding completes")
-            return
-        }
-
-        let needsDictation = settings.dictationBackendMode == .managedLocal
-        let needsPolishing = isManagedPolishingWarmupWanted
-        startManagedBackendWarmup(dictation: needsDictation, polishing: needsPolishing)
-    }
-
-    func startPolishingWarmup() {
-        startManagedBackendWarmup(dictation: false, polishing: true)
-    }
-
-    func startManagedBackendWarmup(dictation: Bool, polishing: Bool) {
-        guard dictation || polishing else { return }
-        guard settings.onboardingCompleted else {
-            Log.backends.info("managed backend warmup skipped until onboarding completes")
-            return
-        }
-
-        // Owner-specified UX: required managed backends install/download/start
-        // eagerly, with progress rendered inline in Endpoints.
-        // Failures land in the manager statuses; dictation-time ensureReady remains the
-        // backstop and retry path.
-        Log.backends.info(
-            "managed backend warmup requested dictation=\(dictation, privacy: .public) polishing=\(polishing, privacy: .public)"
-        )
-        // A stop decided just before this warmup must not land on the fresh
-        // process: cancel the shutdown if it hasn't run yet, and serialize the
-        // warmup behind it if it has (rapid managed→external→managed or
-        // polishing off→on flips race the async stop otherwise).
-        if dictation {
-            dictationWarmupTask?.cancel()
-            let pendingShutdown = dictationShutdownTask
-            dictationShutdownTask = nil
-            pendingShutdown?.cancel()
-            dictationWarmupTask = Task { @MainActor [backendManager] in
-                await pendingShutdown?.value
-                try? await backendManager.ensureReady(dictation: true, polishing: false)
-            }
-        }
-        if polishing {
-            polishingWarmupTask?.cancel()
-            let pendingShutdown = polishingShutdownTask
-            polishingShutdownTask = nil
-            pendingShutdown?.cancel()
-            polishingWarmupTask = Task { @MainActor [backendManager] in
-                await pendingShutdown?.value
-                try? await backendManager.ensureReady(dictation: false, polishing: true)
-            }
-        }
-    }
-
-    /// Writes a local-first diagnostics report to the Desktop. The report
-    /// contains only non-secret configuration/status (no API keys, no dictated
-    /// content). See `DiagnosticsExporter` for the redaction boundary.
-    func exportDiagnostics() {
-        let snapshot = DiagnosticsExporter.makeSnapshot(
-            settings: settings,
-            speechdStatus: backendManager.speechdStatus,
-            polishdStatus: backendManager.polishdStatus,
-            speechdRecentOutput: backendManager.recentOutput(for: BackendCatalog.speechd),
-            polishdRecentOutput: backendManager.recentOutput(for: BackendCatalog.polishd)
-        )
-
-        guard let desktop = FileManager.default.urls(
-            for: .desktopDirectory,
-            in: .userDomainMask
-        ).first else {
-            Log.diagnostics.error("diagnostics export failed: Desktop directory unavailable")
-            return
-        }
-
-        let exportedAt = Date()
-        Task.detached(priority: .utility) {
-            do {
-                let writtenURL = try DiagnosticsExporter.writeReport(
-                    snapshot: snapshot,
-                    to: desktop,
-                    now: exportedAt
-                )
-                Log.diagnostics.info("diagnostics exported: \(writtenURL.path, privacy: .public)")
-                await MainActor.run {
-                    NSWorkspace.shared.activateFileViewerSelecting([writtenURL])
-                }
-            } catch {
-                Log.diagnostics.error("diagnostics export failed: \(error.localizedDescription, privacy: .public)")
-            }
-        }
-    }
-
-    /// Register hotkeys based on current settings.
-    /// Uses modifier-only, dual shortcuts, or legacy single shortcut depending on config.
-    @discardableResult
-    private func registerCurrentHotKeys() -> HotKeyManager.RegistrationResult {
-        if settings.modifierOnlyHotKeyEnabled {
-            return hotKeyManager.registerModifierOnly(
-                settings.modifierOnlyHotKeyModifier,
-                holdThreshold: settings.modifierOnlyHoldDelay
-            )
-        }
-
-        // Use dual shortcut registration
-        let overlayShortcut = settings.overlayBufferShortcut
-        let livePasteShortcut = settings.livePasteShortcut
-
-        return hotKeyManager.registerDual(
-            overlay: overlayShortcut,
-            livePaste: livePasteShortcut
-        )
-    }
-
-    func updateDictationShortcut(_ shortcut: DictationShortcut?) {
-        let previousShortcut = settings.dictationShortcut
-        let previousWasEnabled = settings.dictationShortcutEnabled
-
-        settings.setDictationShortcut(shortcut)
-
-        switch registerCurrentHotKeys() {
-        case .success:
-            if !isDictating, !isFinalizingStop,
-               (currentStatusToken == .hotKeyHandlerRegistrationFailure
-                || currentStatusToken == .hotKeyShortcutUnavailable)
-            {
-                statusText = StatusStrings.ready
-            }
-
-            if currentErrorToken == .hotKeyShortcutUnavailable
-                || currentErrorToken == .hotKeyHandlerRegistrationFailure
-            {
-                lastError = nil
-            }
-            return
-        case .failure(let reason):
-            if previousWasEnabled {
-                settings.setDictationShortcut(previousShortcut ?? SettingsStore.defaultDictationShortcut)
-            } else {
-                settings.setDictationShortcut(nil)
-            }
-            _ = registerCurrentHotKeys()
-            applyHotKeyRegistrationFailure(reason)
-        }
-    }
-
-    func updateOverlayBufferShortcut(_ shortcut: DictationShortcut?) {
-        let previousShortcut = settings.overlayBufferShortcut
-        let previousWasEnabled = settings.overlayBufferShortcutEnabled
-        let wasReachable = settings.isOverlayBufferSessionReachable
-
-        settings.setOverlayBufferShortcut(shortcut)
-
-        switch registerCurrentHotKeys() {
-        case .success:
-            clearHotKeyErrors()
-        case .failure(let reason):
-            if previousWasEnabled {
-                settings.setOverlayBufferShortcut(previousShortcut ?? SettingsStore.defaultDictationShortcut)
-            } else {
-                settings.setOverlayBufferShortcut(nil)
-            }
-            _ = registerCurrentHotKeys()
-            applyHotKeyRegistrationFailure(reason)
-        }
-        handleOverlayReachabilityTransition(wasReachable: wasReachable)
-    }
-
-    func updateLivePasteShortcut(_ shortcut: DictationShortcut?) {
-        let previousShortcut = settings.livePasteShortcut
-        let previousWasEnabled = settings.livePasteShortcutEnabled
-
-        settings.setLivePasteShortcut(shortcut)
-
-        switch registerCurrentHotKeys() {
-        case .success:
-            clearHotKeyErrors()
-        case .failure(let reason):
-            if previousWasEnabled, let previousShortcut {
-                settings.setLivePasteShortcut(previousShortcut)
-            } else {
-                settings.setLivePasteShortcut(nil)
-            }
-            _ = registerCurrentHotKeys()
-            applyHotKeyRegistrationFailure(reason)
-        }
-    }
-
-    private func clearHotKeyErrors() {
-        if !isDictating, !isFinalizingStop,
-           (currentStatusToken == .hotKeyHandlerRegistrationFailure
-            || currentStatusToken == .hotKeyShortcutUnavailable)
-        {
-            statusText = StatusStrings.ready
-        }
-        if currentErrorToken == .hotKeyShortcutUnavailable
-            || currentErrorToken == .hotKeyHandlerRegistrationFailure
-        {
-            lastError = nil
-        }
-    }
-
-    func refreshMicrophoneInputs() {
-        let devices = microphone.availableInputDevices()
-        if availableInputDevices != devices {
-            availableInputDevices = devices
-        }
-
-        let savedSelection = settings.selectedInputDeviceUID.trimmed
-        let currentSelection = selectedInputDeviceID.trimmed
-        let explicitSelection = !savedSelection.isEmpty ? savedSelection : currentSelection
-
-        guard !devices.isEmpty else { return }
-
-        if !explicitSelection.isEmpty,
-           devices.contains(where: { $0.id == explicitSelection })
-        {
-            if selectedInputDeviceID != explicitSelection {
-                selectedInputDeviceID = explicitSelection
-            }
-            if settings.selectedInputDeviceUID != explicitSelection {
-                settings.selectedInputDeviceUID = explicitSelection
-            }
-            return
-        }
-
-        let resolvedSelection: String
-        if let defaultID = microphone.defaultInputDeviceID(),
-           devices.contains(where: { $0.id == defaultID })
-        {
-            resolvedSelection = defaultID
-        } else if let firstDevice = devices.first {
-            resolvedSelection = firstDevice.id
-        } else {
-            return
-        }
-
-        if selectedInputDeviceID != resolvedSelection {
-            selectedInputDeviceID = resolvedSelection
-        }
-        if settings.selectedInputDeviceUID != resolvedSelection {
-            settings.selectedInputDeviceUID = resolvedSelection
-        }
-    }
-
-    func selectMicrophoneInput(id: String) {
-        guard !id.isEmpty else { return }
-        guard selectedInputDeviceID != id else { return }
-
-        selectedInputDeviceID = id
-        settings.selectedInputDeviceUID = id
-
-        guard isDictating else { return }
-        stopDictation(reason: "input device changed by user", finalizeRemainingAudio: false)
-        startDictation()
-    }
-
-    func startDictation(outputMode: DictationOutputMode? = nil) {
-        guard !isDictating else { return }
-        guard !isConnectingRealtimeSession else {
-            statusText = StatusStrings.connectingRealtimeBackend
-            return
-        }
-        if isFinalizingStop {
-            guard cancelPolishingForNewSessionIfNeeded() else {
-                statusText = StatusStrings.finalizingPreviousDictation
-                return
-            }
-        }
-        guard !isAwaitingMicrophonePermission else {
-            statusText = StatusStrings.awaitingMicrophonePermission
-            return
-        }
-        guard networkMonitor.isConnected else {
-            statusText = StatusStrings.noNetworkConnection
-            lastError = "Connect to a network before starting dictation."
-            return
-        }
-        // Refused BEFORE the microphone-authorization gate: a doomed live
-        // session must not trigger a mic permission prompt — and the mic
-        // gate's per-user TCC state must not decide whether the refusal
-        // fires at all (it did: the refusal lived only past this gate, and
-        // CI vs build-host permission differences flipped the behavior).
-        if refuseLiveStartForSecureInputIfNeeded(
-            outputMode: outputMode ?? settings.dictationOutputMode
-        ) {
-            return
-        }
-        debugLog("startDictation requested")
-        refreshMicrophoneInputs()
-        if debugLoggingEnabled {
-            let inputs = availableInputDevices.map { "\($0.name)=\($0.id)" }.joined(separator: ", ")
-            debugLog("available inputs: \(inputs)")
-            debugLog("selected input id=\(selectedInputDeviceID)")
-        }
-        lastError = nil
-
-        switch currentMicrophoneAuthorizationStatus() {
-        case .authorized:
-            beginDictationAfterManagedBackendIfNeeded(outputMode: outputMode)
-        case .notDetermined:
-            isAwaitingMicrophonePermission = true
-            statusText = StatusStrings.requestingMicrophonePermission
-            debugLog("microphone permission prompt requested")
-            requestMicrophoneAccessForSessionStart { [weak self] granted in
-                Task { @MainActor [weak self] in
-                    guard let self else { return }
-                    self.isAwaitingMicrophonePermission = false
-                    self.debugLog("microphone permission result granted=\(granted)")
-                    guard granted else {
-                        self.statusText = StatusStrings.microphoneAccessDenied
-                        self.lastError = Self.microphoneDeniedMessage
-                        self.hasActivePushToTalkShortcutSession = false
-                        return
-                    }
-                    if self.hasActivePushToTalkShortcutSession,
-                        !self.isPushToTalkShortcutHeld
-                    {
-                        self.statusText = StatusStrings.ready
-                        self.hasActivePushToTalkShortcutSession = false
-                        return
-                    }
-                    self.beginDictationAfterManagedBackendIfNeeded(outputMode: outputMode)
-                    // The grant may land long after the initiating tap ended
-                    // (toggle taps have no release event). If secure input
-                    // turned on while the dialog was up, the entry point
-                    // above just refused — with no gesture-end event left,
-                    // the signals would wedge (Codex finding, round 9; same
-                    // shape as the managed-startup wedge in round 8).
-                    if !self.isDictationAttemptGestureActive {
-                        self.clearSecureInputRefusalSignalsIfAttemptEnded()
-                    }
-                }
-            }
-            Task { [weak self] in
-                try? await Task.sleep(for: .seconds(120))
-                guard let self, self.isAwaitingMicrophonePermission else { return }
-                self.isAwaitingMicrophonePermission = false
-                self.statusText = StatusStrings.ready
-                if self.hasActivePushToTalkShortcutSession && !self.isPushToTalkShortcutHeld {
-                    self.hasActivePushToTalkShortcutSession = false
-                }
-                self.debugLog("microphone permission prompt timed out")
-            }
-        case .denied, .restricted:
-            statusText = StatusStrings.microphoneAccessDenied
-            lastError = Self.microphoneDeniedMessage
-            debugLog("microphone access denied or restricted")
-        }
-    }
-
-    private func requestMicrophoneAccessForSessionStart(
-        completion: @escaping @Sendable (Bool) -> Void
-    ) {
-        if let debugMicrophoneRequestAccessOverride {
-            debugMicrophoneRequestAccessOverride(completion)
-            return
-        }
-        microphone.requestAccess(completion: completion)
-    }
-
-    func currentMicrophoneAuthorizationStatus() -> MicrophoneAuthorizationStatus {
+    /// Once per install: the spellings the user already maintains in
+    /// `replacement_dictionary.toml` become their first terms. Writing the
+    /// (possibly empty) result is what marks the import done, so an unreadable
+    /// file leaves it for the next launch. Never at init under XCTest: the
+    /// store there is still the real one, and a test must not read or seed
+    /// the machine's config directory.
+    private func importSpeakerTermsFromReplacementDictionaryIfNeeded() {
         #if DEBUG
-        if let debugMicrophoneAuthorizationStatusOverride {
-            return debugMicrophoneAuthorizationStatusOverride
-        }
+        if TerminalTargetDetector.isRunningUnderXCTest { return }
         #endif
-        // A mere status read (the onboarding/General permission rows) must
-        // not force the lazy capture service into existence; but once the
-        // service exists, ask it, so any injected replacement stays
-        // authoritative.
-        guard hasInitializedMicrophone else {
-            switch AVCaptureDevice.authorizationStatus(for: .audio) {
-            case .authorized:
-                return .authorized
-            case .denied:
-                return .denied
-            case .restricted:
-                return .restricted
-            case .notDetermined:
-                return .notDetermined
-            @unknown default:
-                return .notDetermined
-            }
-        }
-        return microphone.authorizationStatus()
+        importSpeakerTermsFromReplacementDictionary()
     }
 
-    func stopDictation(reason: String = "unspecified", finalizeRemainingAudio: Bool = true) {
-        guard isDictating else { return }
-        debugLog("stopDictation reason=\(reason)")
-        hasActivePushToTalkShortcutSession = false
-
-        polishAndCommitTask?.cancel()
-        polishAndCommitTask = nil
-        commitTask?.cancel()
-        commitTask = nil
-        audioSendTask?.cancel()
-        audioSendTask = nil
-        healthMonitor.stop()
-        isAwaitingMicrophonePermission = false
-
-        microphone.stop()
-        flushBufferedAudio()
-        isDictating = false
-        escapeCancelHandler.stop()
-
-        guard finalizeRemainingAudio else {
-            realtimeAPIClient.disconnect()
-            finishStoppedSession(promotePendingSegment: true)
+    func importSpeakerTermsFromReplacementDictionary() {
+        guard !settings.hasStoredPolishSpeakerTerms else { return }
+        guard let dictionary = appConfigStore.loadReplacementDictionaryIfReadable() else {
+            Log.config.error("Speaker terms import postponed: replacement dictionary unreadable")
             return
         }
-
-        isFinalizingStop = true
-        statusText = StatusStrings.finalizing
-        setRealtimeIndicatorConnected()
-        if isOverlayBufferModeEnabled {
-            beginOverlayFinalization()
-        }
-        scheduleStopFinalization()
-        startStopFinalizationWatchdog()
+        let imported = SpeakerTerms.migrated(from: dictionary)
+        settings.polishSpeakerTerms = imported
+        Log.config.info("Speaker terms imported from replacement dictionary: \(imported.count, privacy: .public)")
     }
 
-    func clearTranscript() {
-        transcriptText = ""
-        livePartialText = ""
-        lastFinalSegment = ""
-        pendingSegmentText = ""
-        currentDictationEventText = ""
-        if !isDictating, !isFinalizingStop, !isConnectingRealtimeSession {
-            clearLatchedSessionMetadata()
-        }
-        firstChunkPreprocessor.reset()
-        overlayBufferCoordinator.reset()
-        lastError = nil
-    }
-
-    func copyTranscript() {
-        let fullText = fullTranscript.trimmed
-        guard !fullText.isEmpty else { return }
-
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        pasteboard.setString(fullText, forType: .string)
-
-        statusText = "Transcript copied."
-    }
-
-    func copyLatestSegment(updateStatus: Bool = true) {
-        let segment = lastFinalSegment.trimmed
-        guard !segment.isEmpty else { return }
-
-        writeToPasteboard(segment)
-
-        if updateStatus {
-            statusText = "Latest segment copied."
-        }
-    }
-
-    /// Copies the RAW (pre-polish) transcript of the last polish-changed commit
-    /// to the clipboard (F6). No-op when there is nothing to offer.
-    func copyRawTranscript() {
-        guard let raw = lastPolishChangedRawTranscript?.trimmed, !raw.isEmpty else { return }
-        writeToPasteboard(raw)
-        statusText = "Raw transcript copied."
-    }
-
-    /// Single pasteboard-write seam. In DEBUG a test can substitute the write to
-    /// avoid touching (and clobbering) `NSPasteboard.general` — headless CI has
-    /// no pasteboard server, and clobbering the host clipboard is antisocial.
-    private func writeToPasteboard(_ text: String) {
+    /// The production `Dependencies.pasteboardWriter`: the general pasteboard,
+    /// which a test never reaches (headless CI has no pasteboard server, and
+    /// clobbering the host clipboard is antisocial).
+    static func writeToSystemPasteboard(_ text: String) {
         #if DEBUG
-        if let override = debugPasteboardWriteOverride {
-            override(text)
-            return
-        }
+        if TerminalTargetDetector.isRunningUnderXCTest { return }
         #endif
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
     }
 
-    func requestAccessibilityPermission() {
-        guard !textInsertion.isAccessibilityRestartRequired else {
-            statusText = StatusStrings.accessibilityPermissionReset
-            return
-        }
-
-        textInsertion.requestAccessibilityPermission()
-
-        if textInsertion.isAccessibilityTrusted {
-            statusText = StatusStrings.ready
-        } else {
-            statusText = StatusStrings.waitingForAccessibilityPermission
-        }
-    }
-
-    func resetAccessibilityPermission() {
-        guard textInsertion.resetAccessibilityPermission() else {
-            lastError = "Unable to reset Accessibility permission for this app build."
-            return
-        }
-
-        statusText = StatusStrings.accessibilityPermissionReset
-        lastError = nil
-    }
-
-    /// Re-read the live microphone authorization status into the observable
-    /// mirror. Reading only — never prompts. Call on appear / app activation so
-    /// permission rows reflect grants made in System Settings.
-    func refreshMicrophonePermissionState() {
-        let status = currentMicrophoneAuthorizationStatus()
-        if microphoneAuthorizationStatus != status {
-            microphoneAuthorizationStatus = status
-        }
-    }
-
-    /// Samples the terminal-like verdict and Secure Keyboard Entry state for
-    /// the app focused right now. Called from `beginDictationSession` before
-    /// the socket opens (see `preCapturedSessionTargetVerdict`).
-    /// Opt-in field diagnostic: scalar tracing of posted keyboard chunks is
-    /// enabled per session by the presence of the `insertion_scalar_trace`
-    /// marker file in the shared config folder (same gate pattern as the
-    /// eval-llm marker). Called at each dictation session start.
-    func refreshInsertionScalarTracingForSession() {
-        let markerURL = appConfigStore.configDirectoryURL()
-            .appendingPathComponent("insertion_scalar_trace", isDirectory: false)
-        let enabled = FileManager.default.fileExists(atPath: markerURL.path)
-        if enabled, !textInsertion.isScalarTracingEnabled {
-            Log.insertion.notice("scalar-trace enabled for this session (marker file present)")
-        }
-        textInsertion.isScalarTracingEnabled = enabled
-    }
-
-    func captureSessionTargetVerdict() {
-        let userBundleIDs = Set(appConfigStore.loadTerminalAppBundleIDs())
-        preCapturedSessionTargetVerdict = SessionTargetVerdict(
-            decision: TerminalTargetDetector.detectCurrentTarget(userBundleIDs: userBundleIDs),
-            secureKeyboardEntryEnabled: TerminalTargetDetector.isSecureKeyboardEntryEnabled()
-        )
-    }
-
-    /// Samples the focused terminal's screen for polish grounding (Ghostty
-    /// over AX, iTerm2/Terminal.app over AppleScript contents), at the same
-    /// moment and
-    /// for the same reason as the verdict above: this is the last point where
-    /// the app the user is dictating INTO is reliably frontmost. The target is
-    /// resolved independently of the overlay (see
-    /// `TerminalScreenContextSource.frontmostTarget`).
-    ///
-    /// Every privacy gate is evaluated inside the source before any AX or
-    /// AppleScript call, so
-    /// an opted-out user, a remote polishing endpoint, or an unlisted app
-    /// means the screen is never read. A nil polishing configuration also means
-    /// no read: with no endpoint there is nothing to ground for.
-    func captureTerminalScreenContextForSession() async {
-        #if LOCALVOXTRAL_DOGFOOD
-        // A fresh dictation gets fresh tap slots: an abandoned pipeline's late
-        // note from the PREVIOUS session must not describe this one.
-        DogfoodCaptureTap.shared.beginSession()
-        // Same rule for the post-commit edit watch: the previous dictation's
-        // window closes here rather than reading this session's keys. It still
-        // flushes its own record, as `superseded`.
-        dogfoodEditSignalWatcher.supersede()
-        #endif
-        guard let endpointURL = settings.llmPolishingConfiguration?.endpointURL else {
-            terminalScreenStartCapture = nil
-            claudeSessionJoin = nil
-            socketPaneStartCapture = nil
-            return
-        }
-        terminalScreenStartCapture = TerminalScreenContextSource.captureAtStart(
-            settingEnabled: settings.terminalScreenContextEnabled,
-            endpointURL: endpointURL,
-            isAccessibilityTrusted: textInsertion.isAccessibilityTrusted,
-            trustedEndpointEnabled: settings.polishContextTrustedEndpointEnabled
-        )
-        claudeSessionJoin = await resolveClaudeSessionJoin(endpointURL: endpointURL)
-        // Ownership of the join's `ssh -L` is taken HERE, at the one place a
-        // join is ever assigned, and never given back to whoever happens to
-        // hold the join later. The commit path CONSUMES the join, so an owner
-        // that reached the child only through `claudeSessionJoin` was nil at
-        // exactly the moments it mattered — quit during polish, an aborted
-        // connect — and the ssh outlived the app (review finding 4).
-        retainRemoteHerdrForward(of: claudeSessionJoin)
-        // Only a socket-routed pane join — herdr, remote herdr, or cmux —
-        // produces a sample here (the function refuses everything else before
-        // any socket request), and it reads exactly the joined pane. Fetched at
-        // start for the same reason the AX screen is:
-        // this text is evidence of what the user could see while choosing
-        // their words, and only a start sample can be that.
-        socketPaneStartCapture = await SocketPaneScreenContext.captureAtStart(
-            join: claudeSessionJoin,
-            resolver: claudeSessionJoinResolver,
-            settingEnabled: settings.terminalScreenContextEnabled,
-            endpointURL: endpointURL,
-            isAccessibilityTrusted: textInsertion.isAccessibilityTrusted,
-            trustedEndpointEnabled: settings.polishContextTrustedEndpointEnabled
-        )
-    }
-
-    /// Resolves this dictation's Claude session join, ONCE, here at start.
-    ///
-    /// Start, not commit, for the same reason the screen is sampled here: this
-    /// is the last moment the app the user is dictating INTO is reliably
-    /// frontmost, and by commit time the frontmost app may be our own overlay.
-    /// It also means the join describes the pane the user was looking at while
-    /// choosing their words, which is the only pane whose context is evidence of
-    /// what they meant.
-    ///
-    /// Every gate is checked BEFORE the resolver is asked, because asking is not
-    /// passive — it makes a live AX round trip for the window title. An opted-out
-    /// user, a remote endpoint, or a revoked Accessibility grant means no read.
-    private func resolveClaudeSessionJoin(endpointURL: URL) async -> ClaudeSessionJoin? {
-        guard let resolver = claudeSessionJoinResolver else {
-            return dogfoodUnresolvedJoin(cause: "gate: no resolver installed")
-        }
-        // Either context feature can want a join: the screen needs it to
-        // authorize a raw excerpt, the repo/session blocks ARE the join's
-        // content. Neither being enabled means there is nothing to resolve for.
-        guard settings.terminalScreenContextEnabled || settings.claudeRepoContextEnabled else {
-            return dogfoodUnresolvedJoin(cause: "gate: both context settings off")
-        }
-        // Permitted endpoints only (loopback, or any endpoint under the
-        // explicit trusted-endpoint opt-in). Repository contents and a prior
-        // prompt must never ride to an endpoint the user has not consented to,
-        // and this is the gate that guarantees no filesystem read even STARTS
-        // for one — the collector is downstream of the join, so an unresolved
-        // join means no git subprocess, no file read.
-        guard PolishContextClipboardReader.isPermittedContextEndpoint(
-            endpointURL,
-            trustedEndpointEnabled: settings.polishContextTrustedEndpointEnabled
-        ) else {
-            return dogfoodUnresolvedJoin(cause: "gate: endpoint not permitted")
-        }
-        guard textInsertion.isAccessibilityTrusted else {
-            return dogfoodUnresolvedJoin(cause: "gate: accessibility not trusted")
-        }
-        guard let target = TerminalScreenContextSource.frontmostTarget() else {
-            return dogfoodUnresolvedJoin(cause: "gate: no frontmost supported terminal")
-        }
-        // The browser entry path. `frontmostTarget()` answers for ANY app and
-        // the resolver owns the allowlists, so a browser reaches the resolver
-        // through the same one call a terminal does — except for this gate: a
-        // browser join can only ever produce the session/repo blocks (the
-        // authorizer refuses `.browserTab` raw attachment outright), so the
-        // screen-context setting alone must not send an Apple event to the
-        // user's browser, nor raise its Automation consent sheet.
-        if BrowserTabAllowlist.isSupported(target.bundleID),
-           !settings.claudeRepoContextEnabled {
-            return dogfoodUnresolvedJoin(cause: "gate: browser target without session context")
-        }
-        return await resolver.resolve(target: target)
-    }
-
-    /// Notes WHY the join never reached the resolver, so a dogfood record can
-    /// distinguish "gate refused" from "resolver abstained" — and always
-    /// returns nil, keeping the guard sites one-liners. Compiled to a bare nil
-    /// in a shipping build.
-    private func dogfoodUnresolvedJoin(cause: String) -> ClaudeSessionJoin? {
-        #if LOCALVOXTRAL_DOGFOOD
-        DogfoodCaptureTap.shared.noteJoinAbstention(cause)
-        #endif
-        return nil
-    }
-
-    /// Drops any retained screen capture. Idempotent, and safe to call on a
-    /// path that already consumed it. Screen text must not outlive the session
-    /// that captured it: every exit — cancel, connect abort, an early return in
-    /// the commit path — funnels here or through
-    /// `terminalScreenContextDecision(endpointURL:)`, and session start
-    /// reassigns the property unconditionally as a backstop.
-    func discardTerminalScreenCapture() {
-        terminalScreenStartCapture = nil
-        // The join goes with it. It names a session and a pane that belong to
-        // the session being abandoned, and a stale join surviving into the next
-        // dictation is precisely how the wrong repo's context would get
-        // attached to an unrelated sentence.
-        //
-        claudeSessionJoin = nil
-        // And the pane text with the join: it is that session's screen.
-        socketPaneStartCapture = nil
-        // Every open `ssh -L`, not just this join's — the view model owns them
-        // all, so abandoning a dictation cannot leave one behind for a holder
-        // that no longer exists.
-        closeRemoteHerdrForwards()
-    }
-
-    /// Takes ownership of a join's remote herdr tunnel, if it has one.
-    ///
-    /// One owner, deliberately: the join object travels (it is consumed by the
-    /// commit path and captured into a Task), and a resource whose owner is
-    /// "whoever currently holds the value" has no owner at all.
-    func retainRemoteHerdrForward(of join: ClaudeSessionJoin?) {
-        guard let forward = join?.remoteHerdrForward else { return }
-        liveRemoteHerdrForwards.append(forward)
-    }
-
-    /// Closes every open remote herdr tunnel. Idempotent, and safe from any
-    /// path — including ones that never knew a tunnel existed.
-    ///
-    /// Called from every dictation exit (`discardTerminalScreenCapture`, the
-    /// commit path once the stop-side pane read is done, `abortConnectingSession`)
-    /// and from `applicationWillTerminate`. Closing ALL of them rather than one
-    /// is what makes a leaked handle from some path nobody thought of
-    /// self-healing at the next exit.
-    func closeRemoteHerdrForwards() {
-        guard !liveRemoteHerdrForwards.isEmpty else { return }
-        let forwards = liveRemoteHerdrForwards
-        liveRemoteHerdrForwards = []
-        for forward in forwards { forward.close() }
-    }
-
-    /// Test seam: how many tunnels this view model is holding open.
-    var openRemoteHerdrForwardCount: Int { liveRemoteHerdrForwards.count }
-
-    /// Reconciles the start capture against a stop-time re-read of the SAME
-    /// PID/bundle and clears it. See `TerminalScreenContext.reconcile` for the
-    /// truth table. Returns `.drop(.noStartCapture)` when nothing was captured,
-    /// which is also what makes stop-only context unrepresentable.
-    func terminalScreenContextDecision(endpointURL: URL) -> TerminalScreenContextDecision {
-        let start = terminalScreenStartCapture
-        terminalScreenStartCapture = nil
-        return TerminalScreenContextSource.reconcileAtStop(
-            start: start,
-            settingEnabled: settings.terminalScreenContextEnabled,
-            endpointURL: endpointURL,
-            isAccessibilityTrusted: textInsertion.isAccessibilityTrusted,
-            trustedEndpointEnabled: settings.polishContextTrustedEndpointEnabled
-        )
-    }
-
-    /// Takes this dictation's join and clears it.
-    ///
-    /// MUST be called after `terminalScreenContextDecision`, which is what asks
-    /// the authorizer about the join. Consuming first would clear it out from
-    /// under that call and silently withdraw every raw screen attachment.
-    func consumeClaudeSessionJoin() -> ClaudeSessionJoin? {
-        let join = claudeSessionJoin
-        claudeSessionJoin = nil
-        return join
-    }
-
-    /// Takes this dictation's socket pane start sample and clears it. Consumed
-    /// alongside the join at commit; a sample must never survive into another
-    /// session's reconciliation.
-    func consumeSocketPaneStartCapture() -> SocketPaneScreenCapture? {
-        let capture = socketPaneStartCapture
-        socketPaneStartCapture = nil
-        return capture
-    }
-
-    /// The repository snapshot for `join`, or nil when any gate rejects.
-    ///
-    /// Re-checks the FULL gate rather than trusting the start-time resolution,
-    /// because consent can be withdrawn mid-session: the user can toggle the
-    /// setting off or repoint the endpoint while they are speaking, and either
-    /// is a withdrawal that must land before a single file is read. The order
-    /// here is the point — every cheap, local check runs before the collector is
-    /// reached, so "no marker ⇒ no filesystem call" and "setting off ⇒ no
-    /// filesystem call" are properties of the control flow, not of the
-    /// collector's manners.
-    func claudeRepoSnapshotIfEnabled(
-        join: ClaudeSessionJoin?,
-        endpointURL: URL,
-        transcript: String
-    ) async -> ClaudeRepoSnapshot? {
-        guard settings.claudeRepoContextEnabled else { return nil }
-        guard PolishContextClipboardReader.isPermittedContextEndpoint(
-            endpointURL,
-            trustedEndpointEnabled: settings.polishContextTrustedEndpointEnabled
-        ) else {
-            Log.claudeContext.info(
-                "Claude repo context skipped: polishing endpoint is not permitted (loopback-only without the trusted-endpoint opt-in)"
-            )
-            return nil
-        }
-        guard let join else { return nil }
-        guard let resolver = claudeSessionJoinResolver, resolver.isStillLive(join) else {
-            Log.claudeContext.info("Claude repo context skipped: session no longer live")
-            return nil
-        }
-        // The type is the gate. A remote session has no `localWorkspacePath` to
-        // hand the collector — not because this checks the origin, but because
-        // `ClaudeWorkspaceReference.make` never built a `LocalWorkspacePath` for
-        // one. There is nothing here to get wrong.
-        guard let workspace = join.localWorkspacePath else {
-            Log.claudeContext.info("Claude repo context skipped: session workspace is not local")
-            return nil
-        }
-        return await claudeRepoCollector.collect(
-            workspace: workspace,
-            // `localRecentFiles`, not `recentFiles`: the collector opens these
-            // paths. The workspace gate above already proves this session is
-            // local, so today the two are the same array — but the accessor is
-            // the documented gate for per-file paths (which are plain strings on
-            // the wire, unlike the cwd, which the type system covers), and a
-            // consumer that touches the filesystem must read it from there. Not
-            // a behavior change; a change to which invariant is load-bearing.
-            recentFiles: join.snapshot.localRecentFiles,
-            transcript: transcript
-        )
-    }
-
-    /// The Claude session block's text, re-gated at commit exactly like
-    /// `claudeRepoSnapshotIfEnabled` — current setting, currently permitted
-    /// endpoint, this exact join still live.
-    ///
-    /// The same three gates because it carries the same kind of thing: the
-    /// session's workspace name, the PRIOR PROMPT the user typed to the agent,
-    /// the paths it touched, and (remote only) bounded tool excerpts. That is
-    /// the session's content, which is what the setting consents to and what a
-    /// unpermitted endpoint must never receive. The block previously checked
-    /// only the setting, so a session that died mid-sentence still had its
-    /// prompt attached, and a Settings change to a remote endpoint sent it
-    /// there.
-    ///
-    /// There is deliberately no LOCAL-workspace gate, which is the one place
-    /// this diverges from the repo collector: that gate exists because the
-    /// collector opens files, and this opens nothing. A remote session's
-    /// off-screen facts are exactly what this block is for.
-    ///
-    /// Returns "" rather than a snapshot on purpose. "" produces no
-    /// preparation, which withholds the GROUNDING as well as the rendered
-    /// block — a gate that suppressed only the excerpt would still let the
-    /// prior prompt's words reach the model as replacement entries.
-    func claudeSessionTextIfEnabled(join: ClaudeSessionJoin?, endpointURL: URL) -> String {
-        guard settings.claudeRepoContextEnabled else { return "" }
-        guard PolishContextClipboardReader.isPermittedContextEndpoint(
-            endpointURL,
-            trustedEndpointEnabled: settings.polishContextTrustedEndpointEnabled
-        ) else {
-            Log.claudeContext.info(
-                "Claude session context skipped: polishing endpoint is not permitted (loopback-only without the trusted-endpoint opt-in)"
-            )
-            return ""
-        }
-        guard let join else { return "" }
-        guard let resolver = claudeSessionJoinResolver, resolver.isStillLive(join) else {
-            Log.claudeContext.info("Claude session context skipped: session no longer live")
-            return ""
-        }
-        return ClaudeSessionContextText.text(for: join.snapshot)
-    }
-
-    /// Consumes the verdict captured at `beginDictationSession` time once
-    /// audio capture starts, and warns (without blocking) when Secure
-    /// Keyboard Entry would swallow synthetic keystrokes. Lives in this file
-    /// (not +Session) so `sessionTargetIsTerminalLike` stays private(set).
-    func applyPreCapturedSessionTargetVerdict() {
-        // Fallback probe covers paths that reach audio start without a
-        // capture (should not happen; keeps the verdict defined regardless).
-        let verdict = preCapturedSessionTargetVerdict ?? SessionTargetVerdict(
-            decision: TerminalTargetDetector.detectCurrentTarget(),
-            secureKeyboardEntryEnabled: TerminalTargetDetector.isSecureKeyboardEntryEnabled()
-        )
-        preCapturedSessionTargetVerdict = nil
-        sessionTargetIsTerminalLike = verdict.decision.isTerminalLike
-        sessionSecureInputActive = verdict.secureKeyboardEntryEnabled
-
-        if verdict.secureKeyboardEntryEnabled {
-            // Never mask the Accessibility-trust warning — it explains a
-            // total insertion failure, which outranks a secure-input maybe.
-            if currentErrorToken != .accessibilityPermissionRequired {
-                lastError = Self.secureKeyboardEntryWarningMessage
-            }
-            // Audible regardless of which warning owns the popover line: the
-            // session that just started will type nothing either way.
-            secureInputWarningSound()
-            Log.target.warning(
-                "Secure Keyboard Entry is enabled at session start; synthetic keyboard events may be blocked."
-            )
-        } else if currentErrorToken == .secureKeyboardEntryActive {
-            // Stale warning from an earlier session; secure input is off now.
-            lastError = nil
-        }
-    }
-
-    /// Prompt for microphone access if it has not been decided yet. When access
-    /// was already denied/restricted the system dialog no longer appears, so the
-    /// permission UI routes the user to System Settings instead. Refreshes the
-    /// observable status once the request resolves.
-    func requestMicrophonePermission() {
-        microphone.requestAccess { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.refreshMicrophonePermissionState()
-            }
-        }
-    }
-
     /// Reset the first-launch flag and ask the app delegate to re-present the
-    /// onboarding wizard. Invoked by the General settings pane's "Re-run Setup…".
+    /// onboarding wizard. Invoked by the General settings pane's "Re-run setup…".
     func reRunOnboarding() {
         settings.onboardingCompleted = false
         onRequestReRunOnboarding?()
     }
 
-    func refreshAccessibilityTrustState() {
-        let wasTrusted = textInsertion.isAccessibilityTrusted
-        textInsertion.refreshAccessibilityTrustState()
-
-        if textInsertion.isAccessibilityTrusted, !wasTrusted, !isDictating,
-           (currentStatusToken == .waitingForAccessibilityPermission
-               || currentStatusToken == .pasteBlockedByAccessibilityPermission)
-        {
-            statusText = StatusStrings.ready
-        }
-
-        if let axError = textInsertion.lastAccessibilityError {
-            if lastError == nil || currentErrorToken == .accessibilityPermissionRequired {
-                lastError = axError
-            }
-        } else if currentErrorToken == .accessibilityPermissionRequired {
-            lastError = nil
-        }
-    }
-
     func openConfigFolder() {
         let url = appConfigStore.configDirectoryURL()
         NSWorkspace.shared.open(url)
-    }
-
-    func pasteLatestSegment() {
-        let segment = lastFinalSegment.trimmed
-        guard !segment.isEmpty else { return }
-
-        textInsertion.refreshAccessibilityTrustState()
-
-        let directInsertResult = textInsertion.insertText(segment)
-        if directInsertResult.isSuccess {
-            statusText = "Pasted latest segment."
-            return
-        }
-
-        if textInsertion.pasteUsingCommandV(segment) {
-            statusText = "Pasted latest segment."
-            return
-        }
-
-        if !textInsertion.isAccessibilityTrusted {
-            statusText = StatusStrings.pasteBlockedByAccessibilityPermission
-        } else {
-            statusText = "Unable to paste latest segment."
-        }
-    }
-
-    var fullTranscript: String {
-        let finalPart = transcriptText.trimmed
-        let livePart = livePartialText.trimmed
-
-        if finalPart.isEmpty { return livePart }
-        if livePart.isEmpty { return finalPart }
-        return finalPart + "\n" + livePart
-    }
-
-    var acceptsRealtimeEvents: Bool {
-        isDictating || isFinalizingStop
-    }
-
-    var isOverlayBufferModeEnabled: Bool {
-        activeOutputMode == .overlayBuffer
-    }
-
-    var isLiveAutoPasteModeEnabled: Bool {
-        activeOutputMode == .liveAutoPaste
-    }
-
-    /// Non-nil when Live Auto-Paste is the active output mode but Accessibility
-    /// isn't trusted — the condition under which transcribed text lands nowhere.
-    /// Used to surface a warning in the popover and at dictation start. Derived
-    /// from existing state; no new stored state.
-    var liveAutoPasteAccessibilityWarning: String? {
-        guard isLiveAutoPasteModeEnabled, !textInsertion.isAccessibilityTrusted else {
-            return nil
-        }
-        return Self.liveAutoPasteAccessibilityWarningMessage
-    }
-
-    func isManagedPolishingRequired(outputMode: DictationOutputMode) -> Bool {
-        outputMode == .overlayBuffer
-            && settings.llmPolishingEnabled
-            && settings.polishingBackendMode == .managedLocal
-    }
-
-    /// Warmup-time variant of `isManagedPolishingRequired`: instead of a
-    /// session's output mode, gates on whether a keyboard trigger can start
-    /// an Overlay Buffer session at all. When false, managed polishd stays
-    /// stopped — an overlay session started from the menu-bar button still
-    /// polishes via the dictation-time `ensureReady` backstop, paying the
-    /// polishd cold start (deliberate: see
-    /// `SettingsStore.isOverlayBufferSessionReachable`).
-    var isManagedPolishingWarmupWanted: Bool {
-        settings.llmPolishingEnabled
-            && settings.polishingBackendMode == .managedLocal
-            && settings.isOverlayBufferSessionReachable
-    }
-
-    private var activeOutputMode: DictationOutputMode {
-        sessionOutputMode ?? settings.dictationOutputMode
     }
 
     private func isReady(_ status: ManagedBackendStatus) -> Bool {
@@ -2396,74 +1074,169 @@ final class DictationViewModel {
         return false
     }
 
-    func debugLog(_ message: String) {
-        guard debugLoggingEnabled else { return }
-        Log.dictation.debug("\(message)")
+}
+
+#if DEBUG || LOCALVOXTRAL_E2E_HARNESS
+extension DictationViewModel {
+    /// The dogfood control socket's entry into the dictation trigger.
+    ///
+    /// Deliberately the app's OWN modifier-only tap handler, not a shortcut
+    /// past it: the socket must be subject to everything a real gesture is
+    /// subject to — the Secure Keyboard Entry refusal, the Accessibility state,
+    /// the microphone gate, managed-backend readiness — and must report a
+    /// refusal rather than override one. It mirrors
+    /// the same handler the tests drive through `shortcuts`.
+    func dogfoodHandleModifierOnlyTap(mode: DictationOutputMode) {
+        shortcuts.handleModifierOnlyTap(mode: mode)
     }
 
-    private func applyHotKeyRegistrationFailure(_ reason: HotKeyManager.RegistrationFailure) {
-        switch reason {
-        case .handlerInstallFailed:
-            statusText = HotKeyManager.handlerRegistrationErrorMessage
-            lastError = HotKeyManager.handlerRegistrationErrorMessage
-        case .shortcutUnavailable:
-            statusText = HotKeyManager.registrationErrorStatus
-            lastError = HotKeyManager.unavailableErrorMessage
-        case .livePasteShortcutUnavailable:
-            statusText = HotKeyManager.registrationErrorStatus
-            lastError = HotKeyManager.livePasteUnavailableErrorMessage
-        case .modifierOnlyHotKeyUnavailable:
-            statusText = HotKeyManager.registrationErrorStatus
-            lastError = HotKeyManager.modifierOnlyUnavailableErrorMessage
+}
+#endif
+
+
+extension DictationViewModel {
+    /// Points stopped quick captures at the Inbox, its routing sentence at
+    /// the popover, and each capture's polish and destination at its History
+    /// record.
+    func installQuickCaptureInbox(_ inbox: QuickCaptureInboxViewModel) {
+        quickCapture = inbox
+        session.onQuickCapture = { [weak inbox] text, historyRecordID, group in
+            inbox?.capture(text: text, historyRecordID: historyRecordID, group: group)
+        }
+        inbox.model.onStatus = { [weak self] sentence in
+            // Mid-session the status line belongs to the session.
+            guard let self, !self.isDictating, !self.isFinalizingStop, !self.isConnectingRealtimeSession else { return }
+            self.statusText = sentence
+        }
+        inbox.model.onPolished = { [weak self] recordID, polishedText, seconds in
+            self?.sessionStore?.setQuickCapturePolish(polishedText, seconds: seconds, id: recordID)
+        }
+        inbox.model.onRouted = { [weak self] recordID, destination in
+            self?.sessionStore?.setQuickCaptureDestination(destination, id: recordID)
+        }
+        installDraftCue(for: inbox.model)
+    }
+
+    /// Ready drafts join the needs-you cue (#927), leave it when the Inbox no
+    /// longer holds them as ready drafts, and the answer shortcut reviews
+    /// them against this Inbox.
+    func installDraftCue(for model: QuickCaptureInboxModel) {
+        session.quickCaptureInbox = model
+        model.onDraftReady = { [weak self] item in
+            guard let self, self.settings.agentAttentionEnabled, let projectName = item.projectName else { return }
+            self.agentAttention?.draftReady(id: item.id, projectName: projectName, at: Date())
+        }
+        let observeItems = model.onChange
+        model.onChange = { [weak self, weak model] in
+            observeItems?()
+            guard let self, let model else { return }
+            self.agentAttention?.retainDrafts(in: model.items)
         }
     }
 }
 
-#if DEBUG
 extension DictationViewModel {
-    func debugHandleDictationShortcutPressForTesting(mode: DictationOutputMode? = nil) {
-        handleDictationShortcutPress(mode: mode)
+    /// Turns each voice memo in the iCloud Drive folder into a quick capture
+    /// through the dictation engine, while the setting is on (#925).
+    func installVoiceMemos(usageLedger: UsageLedger, dataDirectory: URL) {
+        guard let inbox = quickCapture else { return }
+        let controller = VoiceMemoController(
+            settings: settings,
+            inbox: inbox,
+            audioStore: DictationAudioStore(
+                directoryURL: VoiceMemoController.defaultAudioDirectoryURL(in: dataDirectory)),
+            ledgerURL: VoiceMemoController.defaultLedgerURL(in: dataDirectory),
+            transcriber: VoiceMemoEngineTranscriber(prepare: { [weak self] in
+                guard let self else { throw CancellationError() }
+                return try await self.voiceMemoEngine(usageLedger: usageLedger)
+            }),
+            isDictationActive: { [weak self] in
+                guard let self else { return false }
+                return self.isDictating || self.isFinalizingStop || self.isConnectingRealtimeSession
+            },
+            saveHistory: { [weak self] text, recordedAt in
+                self?.saveVoiceMemoRecord(text: text, recordedAt: recordedAt)
+            }
+        )
+        controller.onStatus = { [weak self] sentence in
+            // Mid-session the status line belongs to the session.
+            guard let self, !self.isDictating, !self.isFinalizingStop, !self.isConnectingRealtimeSession else { return }
+            self.statusText = sentence
+        }
+        controller.onLedgerProblem = { [weak self] in self?.voiceMemoLedgerProblem = $0 }
+        session.yieldVoiceMemoEngine = { [weak self, weak controller] in
+            guard let self, let controller, controller.isTranscribing,
+                  Self.voiceMemoSharesTheEngine(
+                      memo: self.voiceMemoBackendMode, dictation: self.settings.dictationBackendMode)
+            else { return }
+            controller.yieldToDictation()
+        }
+        voiceMemos = controller
+        controller.apply()
     }
 
-    func debugHandleDictationShortcutReleaseForTesting() {
-        handleDictationShortcutRelease()
+    /// Only the bundled helper decodes one connection at a time. A server of
+    /// the user's own or Mistral serves a memo beside a dictation.
+    static func voiceMemoSharesTheEngine(memo: BackendMode?, dictation: BackendMode) -> Bool {
+        memo == .managedLocal && dictation == .managedLocal
     }
 
-    func debugHandleModifierOnlyTapForTesting(mode: DictationOutputMode) {
-        handleModifierOnlyTap(mode: mode)
+    /// What a dictation would dial now, on a socket of its own so a memo never
+    /// touches the session's client. The bundled helper is started first. An
+    /// External URL server's context budget comes along, as a dictation's
+    /// does (#1148).
+    private func voiceMemoEngine(
+        usageLedger: UsageLedger
+    ) async throws -> (RealtimeSessionConfiguration, RealtimeContextBudget?, @Sendable () -> any RealtimeClient) {
+        let mode = settings.dictationBackendMode
+        voiceMemoBackendMode = mode
+        if mode == .managedLocal {
+            try await backendManager.ensureReady(dictation: true, polishing: false)
+        }
+        let provider = settings.realtimeProvider
+        guard let endpoint = settings.resolvedWebSocketURL(for: provider) else {
+            throw RealtimeFileTranscriber.Failure.connectFailed("no dictation endpoint is set")
+        }
+        let configuration = RealtimeSessionConfiguration(
+            endpoint: endpoint,
+            apiKey: settings.trimmedAPIKey,
+            model: settings.effectiveModelName(for: provider),
+            usageBackend: DictationSessionController.usageBackend(for: mode)
+        )
+        if mode == .mistralAPI {
+            return (configuration, nil, {
+                let client = MistralRealtimeWebSocketClient()
+                client.setUsageRecorder(usageLedger)
+                return client
+            })
+        }
+        var contextBudget: RealtimeContextBudget?
+        if configuration.usageBackend == .userServer, let lookup = dependencies.realtimeContextLimit {
+            contextBudget = await lookup(configuration)
+        }
+        return (configuration, contextBudget, {
+            let client = RealtimeAPIWebSocketClient()
+            client.setUsageRecorder(usageLedger)
+            return client
+        })
     }
 
-    func debugHandleModifierOnlyHoldStartForTesting() {
-        handleModifierOnlyHoldStart()
-    }
-
-    var debugIsPushToTalkShortcutHeldForTesting: Bool {
-        isPushToTalkShortcutHeld
-    }
-
-    func debugSetPushToTalkShortcutStateForTesting(
-        isHeld: Bool,
-        hasActiveSession: Bool
-    ) {
-        isPushToTalkShortcutHeld = isHeld
-        hasActivePushToTalkShortcutSession = hasActiveSession
-    }
-
-    /// Install a sink that receives every raw-delta log emission captured by
-    /// `logRawRealtimeEventIfEnabled`. Only fires when
-    /// `SettingsStore.debugLogRealtimeDeltas` is on (same gated path as
-    /// `Log.deltas`), so it doubles as an observation point for "logging path
-    /// not entered when disabled". Pass `nil` to clear.
-    func debugConfigureDeltaLogSink(_ sink: ((DebugRealtimeDeltaLogRecord) -> Void)?) {
-        debugDeltaLogSink = sink
-    }
-
-    func debugSetModifierOnlyHoldStateForTesting(isActive: Bool) {
-        isModifierOnlyHoldActive = isActive
-    }
-
-    var debugCurrentHotKeyRegistrationKindForTesting: HotKeyManager.DebugRegistrationKind {
-        hotKeyManager.debugCurrentRegistrationKind
+    /// A memo's History record, as a quick capture's: saved when History
+    /// keeps dictations. Its audio lives with the Inbox item, not here.
+    private func saveVoiceMemoRecord(text: String, recordedAt: Date) -> UUID? {
+        guard let sessionStore, settings.dictationHistoryRetention.savesDictations else { return nil }
+        let record = DictationSessionRecord(
+            startedAt: recordedAt,
+            finishedAt: Date(),
+            rawText: text,
+            provider: settings.realtimeProvider.rawValue,
+            model: settings.effectiveModelName,
+            outputMode: DictationSessionRecord.quickCaptureOutputMode,
+            status: .sttCompleted,
+            commitSucceeded: true,
+            quickCaptureDestination: "Inbox"
+        )
+        sessionStore.save(record)
+        return record.id
     }
 }
-#endif

@@ -1,3 +1,4 @@
+import ClaudeContextWire
 import Foundation
 import Synchronization
 import XCTest
@@ -7,73 +8,30 @@ import XCTest
 import Darwin
 #endif
 
-/// Records what the pane asked for, and fails on demand. No `claude` process is
-/// ever spawned — which is the point: the build host HAS Claude Code installed,
-/// so "reports when the CLI is missing" is untestable against the real thing.
-private final class StubPluginService: ClaudePluginInstalling {
-    private let calls = Mutex<[String]>([])
-    // Typed, not `any Error`: an existential is not Sendable, and this stub has
-    // to cross into the model's @Sendable action closure.
-    private let failure = Mutex<ClaudePluginInstallService.ServiceError?>(nil)
+/// A config the test can write into, so the read-only forward-state scan has
+/// something to read. Writes are accepted and ignored — no test here asserts
+/// them, and `RecordingSSHConfigFileSystem` is the one that counts.
+private final class StubSSHConfigFileSystem: ClaudeRemoteSSHConfigFileSystem, @unchecked Sendable {
+    private let storage = Mutex<String?>(nil)
 
-    init(failWith error: ClaudePluginInstallService.ServiceError? = nil) {
-        failure.withLock { $0 = error }
+    var configText: String? {
+        get { storage.withLock { $0 } }
+        set { storage.withLock { $0 = newValue } }
     }
 
-    var recordedCalls: [String] { calls.withLock { $0 } }
-
-    private func record(_ name: String) throws {
-        calls.withLock { $0.append(name) }
-        if let error = failure.withLock({ $0 }) { throw error }
+    func readState() throws -> ClaudeRemoteSSHConfigState {
+        ClaudeRemoteSSHConfigState(
+            directoryExists: true,
+            configData: configText.map { Data($0.utf8) },
+            configPermissions: 0o600,
+            directoryPermissions: 0o700
+        )
     }
 
-    func installPlugin() throws { try record("install") }
-    func updatePlugin() throws { try record("update") }
-    func uninstallPlugin() throws { try record("uninstall") }
-}
-
-/// A listener that binds nothing.
-///
-/// Unit tests must not open 8473: it would conflict with the developer's own
-/// running app and with any other test in the same process. This stub is what
-/// makes "the port follows enrollment" assertable at all.
-@MainActor
-private final class StubListener: ClaudeRemoteListenerControlling {
-    private let hosts: ClaudeRemoteHostRegistry
-    var isListening = false
-    var boundPort: UInt16 = 8473
-    var reconcileCount = 0
-    /// Thrown on the next reconcile that would bind.
-    var bindError: (any Error)?
-    /// What the real listener would have counted. Set by a test to stand in for
-    /// a night of rejected connections.
-    var rejectionSnapshot = ClaudeRemoteRejectionTally.Snapshot()
-
-    /// Shared with the forward stubs so a test can assert the ORDER of the two
-    /// shutdowns, not just that both happened.
-    var journal: ShutdownJournal?
-
-    init(hosts: ClaudeRemoteHostRegistry) {
-        self.hosts = hosts
+    func createSSHDirectory(permissions _: UInt16) throws {}
+    func atomicWriteConfig(_ data: Data, permissions _: UInt16, replacing _: Data?) throws {
+        configText = String(decoding: data, as: UTF8.self)
     }
-
-    func reconcile() throws {
-        reconcileCount += 1
-        if isListening, !hosts.hasActiveHosts { journal?.note("listener.stop") }
-        if hosts.hasActiveHosts {
-            guard !isListening else { return }
-            if let bindError { throw bindError }
-            isListening = true
-        } else {
-            isListening = false
-        }
-    }
-}
-
-private final class MemoryStore: ClaudeRemoteHostStoreIO {
-    private let contents = Mutex<[String: Data]>([:])
-    func read(from url: URL) throws -> Data? { contents.withLock { $0[url.path] } }
-    func write(_ data: Data, to url: URL) throws { contents.withLock { $0[url.path] = data } }
 }
 
 private final class RecordingSSHConfigFileSystem: ClaudeRemoteSSHConfigFileSystem {
@@ -104,7 +62,7 @@ private final class RecordingSSHConfigFileSystem: ClaudeRemoteSSHConfigFileSyste
 
     func createSSHDirectory(permissions _: UInt16) throws {}
 
-    func atomicWriteConfig(_ data: Data, permissions: UInt16) throws {
+    func atomicWriteConfig(_ data: Data, permissions: UInt16, replacing _: Data?) throws {
         XCTAssertFalse(data.isEmpty)
         XCTAssertEqual(permissions, 0o600)
         writes.withLock { $0 += 1 }
@@ -127,6 +85,16 @@ final class ShutdownJournal: @unchecked Sendable {
     var recorded: [String] { entries.withLock { $0 } }
 }
 
+/// Holds what the model hands to the main actor, so a test runs it at a
+/// point it chooses instead of awaiting a scheduled task.
+private final class MainActorHops: Sendable {
+    private let pending = Mutex<[@MainActor @Sendable () -> Void]>([])
+    func enqueue(_ body: @escaping @MainActor @Sendable () -> Void) { pending.withLock { $0.append(body) } }
+    @MainActor func drain() {
+        for body in pending.withLock({ queued in defer { queued = [] }; return queued }) { body() }
+    }
+}
+
 private final class StubForwarding: ClaudeRemoteForwarding {
     var journal: ShutdownJournal?
     var state: ClaudeRemoteForwardSupervisor.State = .stopped
@@ -142,6 +110,7 @@ private final class StubForwarding: ClaudeRemoteForwarding {
         transition(to: .stopped)
     }
     func retry() { retried += 1 }
+    func recover() {}
 
     func transition(to newState: ClaudeRemoteForwardSupervisor.State) {
         state = newState
@@ -149,12 +118,99 @@ private final class StubForwarding: ClaudeRemoteForwarding {
     }
 }
 
+/// One scripted answer per ssh shape the six-step run can make. Dispatch is
+/// by shape — `ssh -G`, the env probe's stdin, the plugin/herdr sentinels,
+/// the two verification probes — so a step that never ran is visible as an
+/// invocation that never arrived. The env echo arrives framed with banner
+/// noise on both sides, as a real login shell's merged stdout/stderr would
+/// deliver it.
+/// A switch a test flips between two runs of one model.
+private final class TestFlag: Sendable {
+    private let value = Mutex(false)
+    var isSet: Bool { value.withLock { $0 } }
+    func set() { value.withLock { $0 = true } }
+}
+
+private struct SetupFlowScript: Sendable {
+    /// The install/update call's result. Its message is never read: the
+    /// outcome comes from the two decoded listings around it.
+    var plugin = ClaudeRemoteEnrollmentService.RunResult(exitCode: 0, message: "")
+    /// What `claude plugin list --json` reports for our plugin before and
+    /// after the install call; nil = not installed. The defaults model a
+    /// fresh host: nothing before, the shipped version after the install.
+    var pluginVersionBefore: String?
+    var pluginVersionAfter: String? = ClaudeRemoteEnrollmentService.remotePluginVersion
+    /// The host has no Claude Code: the listing dies in our own PATH resolver.
+    var claudeMissing = false
+    var envEchoesBack = true
+    var sendEnvOutput = "hostname builder\nsendenv LANG LC_*\n"
+    var herdr = ClaudeRemoteEnrollmentService.RunResult(
+        exitCode: 0, message: "LVX_HERDR_ABSENT"
+    )
+    var tunnelMessage = "LVX_HTTP:401"
+    var pluginListMessage = "localvoxtral-remote 1.10.0\n"
+    /// Whether the host has Claude Desktop's session daemon directory.
+    var claudeDesktop = false
+}
+
+/// A `claude plugin list --json` capture as a login shell delivers it: a
+/// banner before the frame, the CLI's own array (a second, unrelated plugin
+/// first, ours at user scope), and the frame end after it. `version == nil`
+/// lists only the unrelated plugin.
+private func framedPluginListing(version: String?) -> String {
+    let ours = version.map {
+        """
+          ,
+          {
+            "id": "\(ClaudeRemoteEnrollmentService.remotePluginReference)",
+            "version": "\($0)",
+            "scope": "user",
+            "enabled": true,
+            "installPath": "/home/dev/.claude/plugins/cache/localvoxtral/localvoxtral-remote/\($0)",
+            "installedAt": "2026-07-27T20:59:23.439Z",
+            "lastUpdated": "2026-09-07T13:27:31.000Z"
+          }
+        """
+    } ?? ""
+    return """
+        Welcome to builder
+        \(ClaudeRemoteEnrollmentService.pluginListFrameBegin)
+        [
+          {
+            "id": "frontend-design@claude-plugins-official",
+            "version": "unknown",
+            "scope": "project",
+            "enabled": false,
+            "installPath": "/home/dev/.claude/plugins/cache/claude-plugins-official/frontend-design/unknown",
+            "installedAt": "2026-07-01T15:07:39.195Z",
+            "lastUpdated": "2026-07-01T15:07:39.195Z",
+            "projectPath": "/home/dev/work/other"
+          }\(ours)
+        ]
+        \(ClaudeRemoteEnrollmentService.pluginListFrameEnd)
+        Last login: today
+        """
+}
+
+/// Records every ssh invocation the run makes, from the nonisolated runner
+/// closure. File scope, not nested in the @MainActor test class: nested types
+/// inherit the enclosing actor's isolation, and `Synchronization.Mutex` is
+/// noncopyable and cannot be moved across it — the same reason every other
+/// Sendable stub in this file lives out here.
+private final class SetupFlowRecorder: @unchecked Sendable {
+    private let invocations = Mutex<[ClaudeRemoteEnrollmentService.Invocation]>([])
+    func record(_ invocation: ClaudeRemoteEnrollmentService.Invocation) {
+        invocations.withLock { $0.append(invocation) }
+    }
+    var all: [ClaudeRemoteEnrollmentService.Invocation] { invocations.withLock { $0 } }
+}
+
 @MainActor
 final class ClaudeIntegrationSettingsModelTests: XCTestCase {
     private func makeRegistry() throws -> ClaudeRemoteHostRegistry {
         try ClaudeRemoteHostRegistry(
             fileURL: URL(fileURLWithPath: "/tmp/lvx-settings-test/hosts.json"),
-            io: MemoryStore(),
+            io: MemoryClaudeRemoteHostStore(),
             now: { Date(timeIntervalSince1970: 1_000_000) }
         )
     }
@@ -162,7 +218,7 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
     private func makeModel(
         registry: ClaudeRemoteHostRegistry?,
         listener: (any ClaudeRemoteListenerControlling)?,
-        plugin: StubPluginService = StubPluginService(),
+        plugin: StubClaudePluginService = StubClaudePluginService(),
         enrollmentService: ClaudeRemoteEnrollmentService = ClaudeRemoteEnrollmentService(),
         // Frozen by default (AGENTS: no wall-clock in tests). The registry's
         // own clock is pinned to the same instant, so a host that just reported
@@ -172,7 +228,16 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
         // a test that computed the allocation would only prove the derivation
         // twice.
         remoteForwardPort: UInt16 = ClaudeRemoteForwardPort.legacyPort,
-        forwards: ClaudeRemoteForwardCoordinator? = nil
+        forwards: ClaudeRemoteForwardCoordinator? = nil,
+        loginShell: @escaping @Sendable () -> ClaudeShellKind? = { nil },
+        shellRCWriter: @escaping @Sendable (ClaudeShellKind) -> ClaudeShellRCWriter? = { _ in nil },
+        liveLocalTTYReport: @escaping @Sendable () -> ClaudeShellSetupStatus.CrossingState = {
+            .noSessions
+        },
+        herdrPaneReportingHostIDs: @escaping @Sendable () -> [String] = { [] },
+        hasEnabledHerdrMachineReport: @escaping @Sendable () -> Bool = { false },
+        vibeRemoteFiles: @escaping @Sendable () -> VibeRemoteHooksFiles? = { nil },
+        hops: MainActorHops = MainActorHops()
     ) -> ClaudeIntegrationSettingsModel {
         ClaudeIntegrationSettingsModel(
             registry: registry,
@@ -200,10 +265,64 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
                     )
                 }
             },
+            performVerificationAsync: { body in
+                do {
+                    return ClaudeVerificationAttempt(checks: try body(), failure: nil)
+                } catch {
+                    return ClaudeVerificationAttempt(
+                        checks: [],
+                        failure: ClaudeEnrollmentActionFailure(error)
+                    )
+                }
+            },
             now: now,
             remoteForwardPort: remoteForwardPort,
-            forwards: forwards
+            forwards: forwards,
+            loginShell: loginShell,
+            shellRCWriter: shellRCWriter,
+            liveLocalTTYReport: liveLocalTTYReport,
+            vibeRemoteFiles: vibeRemoteFiles,
+            herdrPaneReportingHostIDs: herdrPaneReportingHostIDs,
+            hasEnabledHerdrMachineReport: hasEnabledHerdrMachineReport,
+            runOnMainActor: { hops.enqueue($0) }
         )
+    }
+
+    // MARK: - herdr pane host labels
+
+    /// The herdr pane lists the enrolled hosts whose live remote sessions
+    /// report a herdr pane, by LABEL; an id with no enrolled row is dropped,
+    /// never guessed from the id.
+    func testHerdrPaneListsReportingEnrolledHostsOnly() async throws {
+        let registry = try makeRegistry()
+        let builder = try registry.enroll(label: "builder").host
+        let linter = try registry.enroll(label: "linter").host
+
+        let oneHost = makeModel(
+            registry: registry,
+            listener: nil,
+            herdrPaneReportingHostIDs: { [builder.id] }
+        )
+        await oneHost.refreshIntegrationsStatuses()
+        XCTAssertEqual(oneHost.herdrPaneHostLabels, ["builder"])
+
+        // A host removed while its sessions were still live reports an id the
+        // enrolled list no longer knows: dropped, not rendered from the id.
+        let staleID = makeModel(
+            registry: registry,
+            listener: nil,
+            herdrPaneReportingHostIDs: { [linter.id, "hdeadbeef"] }
+        )
+        await staleID.refreshIntegrationsStatuses()
+        XCTAssertEqual(staleID.herdrPaneHostLabels, ["linter"])
+
+        let none = makeModel(
+            registry: registry,
+            listener: nil,
+            herdrPaneReportingHostIDs: { [] }
+        )
+        await none.refreshIntegrationsStatuses()
+        XCTAssertTrue(none.herdrPaneHostLabels.isEmpty)
     }
 
     // MARK: Persistent forward toggle
@@ -213,11 +332,12 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
         var byHost: [String: StubForwarding] = [:]
         var journal: ShutdownJournal?
     }
-
     private func makeForwardCoordinator(
         registry: ClaudeRemoteHostRegistry,
         stubs: ForwardStubs,
-        isListenerBound: @escaping @MainActor () -> Bool = { true }
+        isListenerBound: @escaping @MainActor () -> Bool = { true },
+        reapOrphans: (@Sendable () async -> Void)? = nil,
+        reconcileHerdrEnrollment: @escaping @MainActor (Set<String>) -> Void = { _ in }
     ) -> ClaudeRemoteForwardCoordinator {
         ClaudeRemoteForwardCoordinator(
             hosts: registry,
@@ -229,7 +349,9 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
                 stub.journal = stubs.journal
                 stubs.byHost[configuration.hostID] = stub
                 return stub
-            }
+            },
+            reapOrphans: reapOrphans,
+            reconcileHerdrEnrollment: reconcileHerdrEnrollment
         )
     }
 
@@ -239,7 +361,7 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
         let forwards = makeForwardCoordinator(registry: registry, stubs: stubs)
         let model = makeModel(
             registry: registry,
-            listener: StubListener(hosts: registry),
+            listener: StubClaudeRemoteListener(hosts: registry),
             remoteForwardPort: 28542,
             forwards: forwards
         )
@@ -271,7 +393,7 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
         let forwards = makeForwardCoordinator(registry: registry, stubs: stubs)
         let model = makeModel(
             registry: registry,
-            listener: StubListener(hosts: registry),
+            listener: StubClaudeRemoteListener(hosts: registry),
             remoteForwardPort: 28542,
             forwards: forwards
         )
@@ -292,7 +414,7 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
         try XCTUnwrap(stubs.byHost[hostID]).transition(to: .portUnavailable)
 
         let row = try XCTUnwrap(model.hosts.first)
-        XCTAssertEqual(row.forwardStatusText, "Port held — close ssh sessions to that host.")
+        XCTAssertEqual(row.forwardStatusText, "Port held on that host. Checking again every 5 min.")
         XCTAssertTrue(row.forwardIsFailure)
         // Owner rule: a Settings status line is one short sentence; the ssh
         // stderr tail belongs in the log.
@@ -314,7 +436,7 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
         let journal = ShutdownJournal()
         let stubs = ForwardStubs()
         stubs.journal = journal
-        let listener = StubListener(hosts: registry)
+        let listener = StubClaudeRemoteListener(hosts: registry)
         listener.journal = journal
         let forwards = makeForwardCoordinator(registry: registry, stubs: stubs)
         let model = makeModel(
@@ -340,6 +462,64 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
         XCTAssertFalse(listener.isListening)
     }
 
+    /// Two copies on one host file: what the installed app revokes, the
+    /// try-pr build stops forwarding on its next read of the file, and the
+    /// last revoke closes its listener after the forwards (#1125).
+    func testAHostTheOtherCopyRevokesLosesItsForwardsHere() async throws {
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("lvx-two-copies-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true,
+            attributes: [.posixPermissions: NSNumber(value: Int16(0o700))]
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent("claude-remote-hosts.json")
+        let installed = try ClaudeRemoteHostRegistry(fileURL: fileURL, io: ClaudeRemoteHostFileStoreIO())
+        let studio = try installed.enroll(label: "studio", sshHostAlias: "studio")
+        let laptop = try installed.enroll(label: "laptop", sshHostAlias: "laptop")
+        for host in [studio.host, laptop.host] {
+            try installed.setPersistentForwardEnabled(true, hostID: host.id)
+        }
+
+        let tryBuild = try ClaudeRemoteHostRegistry(fileURL: fileURL, io: ClaudeRemoteHostFileStoreIO())
+        let journal = ShutdownJournal()
+        let stubs = ForwardStubs()
+        stubs.journal = journal
+        let listener = StubClaudeRemoteListener(hosts: tryBuild)
+        listener.journal = journal
+        var herdrHostIDs: Set<String>?
+        let forwards = makeForwardCoordinator(
+            registry: tryBuild, stubs: stubs,
+            isListenerBound: { listener.isListening },
+            reconcileHerdrEnrollment: { herdrHostIDs = $0 }
+        )
+        let hops = MainActorHops()
+        let model = makeModel(registry: tryBuild, listener: listener, forwards: forwards, hops: hops)
+        model.synchronizeListenerAtLaunch()
+        XCTAssertEqual(stubs.byHost[studio.host.id]?.state, .connecting)
+        XCTAssertEqual(stubs.byHost[laptop.host.id]?.state, .connecting)
+
+        try installed.revoke(hostID: studio.host.id)
+        // A hook on a listener thread is this copy's next read of the file.
+        XCTAssertNil(tryBuild.authenticate(token: studio.token))
+        hops.drain()
+
+        XCTAssertEqual(stubs.byHost[studio.host.id]?.state, .stopped)
+        XCTAssertEqual(stubs.byHost[laptop.host.id]?.state, .connecting)
+        XCTAssertEqual(herdrHostIDs, [laptop.host.id])
+        XCTAssertEqual(model.hosts.first { $0.id == studio.host.id }?.isRevoked, true)
+        XCTAssertTrue(listener.isListening)
+
+        try installed.revoke(hostID: laptop.host.id)
+        XCTAssertNil(tryBuild.authenticate(token: laptop.token))
+        hops.drain()
+
+        XCTAssertEqual(stubs.byHost[laptop.host.id]?.state, .stopped)
+        XCTAssertEqual(herdrHostIDs, [])
+        XCTAssertFalse(listener.isListening)
+        XCTAssertEqual(journal.recorded, ["forward.stop", "forward.stop", "listener.stop"])
+    }
+
     func testAHostWithNoAliasIsNotOfferedATunnel() async throws {
         let registry = try makeRegistry()
         let stubs = ForwardStubs()
@@ -347,7 +527,7 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
         let enrollment = try registry.enroll(label: "buildhost")
         let model = makeModel(
             registry: registry,
-            listener: StubListener(hosts: registry),
+            listener: StubClaudeRemoteListener(hosts: registry),
             remoteForwardPort: 28542,
             forwards: forwards
         )
@@ -361,7 +541,7 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
 
     func testNoTunnelIsOfferedWhenTheAppHasNoForwardCoordinator() async throws {
         let registry = try makeRegistry()
-        let model = makeModel(registry: registry, listener: StubListener(hosts: registry))
+        let model = makeModel(registry: registry, listener: StubClaudeRemoteListener(hosts: registry))
         _ = try registry.enroll(label: "buildhost", sshHostAlias: "builder")
         model.refreshHosts()
         XCTAssertFalse(try XCTUnwrap(model.hosts.first).canHoldForward)
@@ -370,7 +550,7 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
     // MARK: Local plugin
 
     func testInstallOrUpdateRunsTheUpdatePathAndReportsShortSuccess() async {
-        let plugin = StubPluginService()
+        let plugin = StubClaudePluginService()
         let model = makeModel(registry: nil, listener: nil, plugin: plugin)
         await model.updatePlugin()
         XCTAssertEqual(plugin.recordedCalls, ["update"])
@@ -379,7 +559,7 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
     }
 
     func testAMissingCLIIsAShortLineInThePaneAndLongDetailInTheAlert() async {
-        let plugin = StubPluginService(failWith: .claudeCLINotFound)
+        let plugin = StubClaudePluginService(failWith: .claudeCLINotFound)
         let model = makeModel(registry: nil, listener: nil, plugin: plugin)
         await model.installPlugin()
 
@@ -393,7 +573,7 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
 
     func testAFailedCommandNeverPutsTheCLIOutputInThePane() async {
         let noise = String(repeating: "stack trace line\n", count: 200)
-        let plugin = StubPluginService(failWith: .commandFailed(action: .install, exitCode: 2, message: noise))
+        let plugin = StubClaudePluginService(failWith: .commandFailed(action: .install, exitCode: 2, message: noise))
         let model = makeModel(registry: nil, listener: nil, plugin: plugin)
         await model.installPlugin()
 
@@ -406,7 +586,7 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
 
     func testTheFirstEnrollmentBindsTheListenerWithoutARelaunch() async throws {
         let registry = try makeRegistry()
-        let listener = StubListener(hosts: registry)
+        let listener = StubClaudeRemoteListener(hosts: registry)
         let model = makeModel(registry: registry, listener: listener)
         XCTAssertFalse(listener.isListening)
         XCTAssertEqual(model.listenerStatus, .idle)
@@ -426,7 +606,7 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
     func testLaunchSyncPreservesFailureStatusWithoutQueueingALateModal() throws {
         let registry = try makeRegistry()
         _ = try registry.enroll(label: "builder")
-        let listener = StubListener(hosts: registry)
+        let listener = StubClaudeRemoteListener(hosts: registry)
         #if canImport(Darwin)
         listener.bindError = ClaudeRemoteContextListener.StartFailure.bindFailed(errno: EADDRINUSE)
         #else
@@ -449,27 +629,48 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
         XCTAssertTrue(detail.contains("/tmp/claude"))
     }
 
-    func testRevokingTheLastHostStopsListening() async throws {
+    func testRevokingTheLastHostStopsListeningAndRotatingItRebindsTheListener() async throws {
         let registry = try makeRegistry()
-        let listener = StubListener(hosts: registry)
+        let listener = StubClaudeRemoteListener(hosts: registry)
         let model = makeModel(registry: registry, listener: listener)
         model.enrollLabel = "buildhost"
         model.enrollSSHAlias = "builder"
         await model.enroll()
         XCTAssertTrue(listener.isListening)
+        let hostID = try XCTUnwrap(model.hosts.first).id
 
-        await model.revoke(hostID: try XCTUnwrap(model.hosts.first).id)
+        await model.revoke(hostID: hostID)
 
         // No enrolled host ⇒ no open port. A feature nobody has set up must not
         // be listening on one.
         XCTAssertFalse(listener.isListening)
         XCTAssertEqual(model.listenerStatus, .idle)
         XCTAssertEqual(listener.reconcileCount, 2)
+
+        await model.rotate(hostID: hostID)
+
+        // Rotation reinstates a revoked host — handing out a credential is the
+        // same act as enrolling — so it is a 0→1 transition and must rebind.
+        XCTAssertTrue(listener.isListening)
+    }
+
+    func testRemovingTheLastHostStopsListening() async throws {
+        let registry = try makeRegistry()
+        let listener = StubClaudeRemoteListener(hosts: registry)
+        let model = makeModel(registry: registry, listener: listener)
+        model.enrollLabel = "buildhost"
+        model.enrollSSHAlias = "builder"
+        await model.enroll()
+
+        await model.remove(hostID: try XCTUnwrap(model.hosts.first).id)
+
+        XCTAssertTrue(model.hosts.isEmpty)
+        XCTAssertFalse(listener.isListening)
     }
 
     func testRevokingOneOfTwoHostsKeepsListening() async throws {
         let registry = try makeRegistry()
-        let listener = StubListener(hosts: registry)
+        let listener = StubClaudeRemoteListener(hosts: registry)
         let model = makeModel(registry: registry, listener: listener)
         for alias in ["builder", "otherbox"] {
             model.enrollLabel = alias
@@ -484,53 +685,24 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
         XCTAssertEqual(listener.reconcileCount, 3, "every registry mutation must reconcile")
     }
 
-    func testRemovingTheLastHostStopsListening() async throws {
-        let registry = try makeRegistry()
-        let listener = StubListener(hosts: registry)
-        let model = makeModel(registry: registry, listener: listener)
-        model.enrollLabel = "buildhost"
-        model.enrollSSHAlias = "builder"
-        await model.enroll()
-
-        await model.remove(hostID: try XCTUnwrap(model.hosts.first).id)
-
-        XCTAssertTrue(model.hosts.isEmpty)
-        XCTAssertFalse(listener.isListening)
-    }
-
-    func testRotatingARevokedHostRebindsTheListener() async throws {
-        let registry = try makeRegistry()
-        let listener = StubListener(hosts: registry)
-        let model = makeModel(registry: registry, listener: listener)
-        model.enrollLabel = "buildhost"
-        model.enrollSSHAlias = "builder"
-        await model.enroll()
-        let hostID = try XCTUnwrap(model.hosts.first).id
-        await model.revoke(hostID: hostID)
-        XCTAssertFalse(listener.isListening)
-
-        await model.rotate(hostID: hostID)
-
-        // Rotation reinstates a revoked host — handing out a credential is the
-        // same act as enrolling — so it is a 0→1 transition and must rebind.
-        XCTAssertTrue(listener.isListening)
-    }
-
     // MARK: The token
 
-    func testEnrollmentShowsTheTokenExactlyOnceAndThenForgetsIt() async throws {
+    func testEnrollmentShowsTheTokenExactlyOnceThenForgetsItAndClearsTheForm() async throws {
         let registry = try makeRegistry()
-        let model = makeModel(registry: registry, listener: StubListener(hosts: registry))
+        let model = makeModel(registry: registry, listener: StubClaudeRemoteListener(hosts: registry))
         model.enrollLabel = "buildhost"
         model.enrollSSHAlias = "builder"
         await model.enroll()
 
+        // The form is cleared, so the next host starts blank.
+        XCTAssertEqual(model.enrollLabel, "")
+        XCTAssertEqual(model.enrollSSHAlias, "")
         let plan = try XCTUnwrap(model.presentedPlan)
         XCTAssertFalse(plan.isRotation)
         XCTAssertTrue(ClaudeRemoteTokenDigest.isWellFormed(plan.token))
-        XCTAssertTrue(plan.plan.remoteCommands.joined().contains(plan.token))
-        // The install command needs it; the ssh config must not have it. That
-        // file gets copied between machines and pasted into issues.
+        // The install script needs it (`testTheSetupRunInstallsTheSheetsTokenThroughStdinOnly`);
+        // the ssh config must not have it. That file gets copied between
+        // machines and pasted into issues.
         XCTAssertFalse(plan.plan.sshConfigSnippet.contains(plan.token))
 
         model.dismissPlan()
@@ -540,19 +712,9 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
         XCTAssertNil(model.presentedPlan)
     }
 
-    func testTheFormIsClearedAfterEnrollingSoTheNextHostStartsBlank() async throws {
-        let registry = try makeRegistry()
-        let model = makeModel(registry: registry, listener: StubListener(hosts: registry))
-        model.enrollLabel = "buildhost"
-        model.enrollSSHAlias = "builder"
-        await model.enroll()
-        XCTAssertEqual(model.enrollLabel, "")
-        XCTAssertEqual(model.enrollSSHAlias, "")
-    }
-
     func testRotationPresentsTheNewTokenAndSaysItIsARotation() async throws {
         let registry = try makeRegistry()
-        let model = makeModel(registry: registry, listener: StubListener(hosts: registry))
+        let model = makeModel(registry: registry, listener: StubClaudeRemoteListener(hosts: registry))
         model.enrollLabel = "buildhost"
         model.enrollSSHAlias = "builder"
         await model.enroll()
@@ -568,63 +730,258 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
         XCTAssertNotNil(registry.authenticate(token: rotated.token))
     }
 
-    func testRemoteSetupDoesNotRunBeforeExplicitConfirmation() async throws {
-        let registry = try makeRegistry()
-        let calls = Mutex<[ClaudeRemoteEnrollmentService.Invocation]>([])
-        let service = ClaudeRemoteEnrollmentService(runner: { invocation in
-            calls.withLock { $0.append(invocation) }
-            return .init(exitCode: 0, message: "ok")
-        })
-        let model = makeModel(
-            registry: registry,
-            listener: StubListener(hosts: registry),
-            enrollmentService: service
+    // MARK: - Local federated herdr panel offer
+
+    func testLocalHerdrPanelOfferConfiguresTheRowAndReportsReload() async throws {
+        let fileSystem = StubLocalHerdrConfigFileSystem(
+            state: ClaudeLocalHerdrConfigState(
+                directoryExists: false,
+                configData: nil,
+                configPermissions: nil
+            )
         )
-        model.enrollLabel = "buildhost"
-        model.enrollSSHAlias = "builder"
-        await model.enroll()
-        let token = try XCTUnwrap(model.presentedPlan).token
+        let service = ClaudeRemoteEnrollmentService(
+            localHerdrConfigFileSystem: fileSystem
+        )
+        let model = makeModel(
+            registry: nil,
+            listener: nil,
+            enrollmentService: service,
+            hasEnabledHerdrMachineReport: { true }
+        )
+        await model.refreshIntegrationsStatuses()
+        XCTAssertTrue(model.hasEnabledHerdrMachine)
 
-        model.requestRemoteSetup()
+        model.requestLocalHerdrPanelConfiguration()
 
-        XCTAssertTrue(calls.withLock { $0 }.isEmpty)
         let confirmation = try XCTUnwrap(model.enrollmentConfirmation)
-        XCTAssertFalse(confirmation.preview.contains(token))
-        XCTAssertTrue(confirmation.preview.contains(ClaudeRemoteTokenRedaction.placeholder))
+        XCTAssertEqual(confirmation.action, .configureLocalHerdrPanel)
+        XCTAssertEqual(
+            confirmation.title,
+            ClaudeRemoteEnrollmentService.localHerdrPanelConsentTitle
+        )
 
         await model.confirmEnrollmentAction()
 
-        XCTAssertEqual(calls.withLock { $0 }.count, 2)
-        XCTAssertEqual(model.enrollmentStepStatuses.map(\.text), [
-            "Step 1 succeeded.", "Step 2 succeeded.",
-        ])
+        XCTAssertEqual(
+            model.localHerdrPanelResult,
+            ClaudeRemoteEnrollmentService.localHerdrPanelReloadStatus
+        )
+        XCTAssertNil(model.alert)
+        XCTAssertEqual(fileSystem.writes.count, 1)
+        // The row is there now: pressing Set up… again would only refuse.
+        XCTAssertEqual(model.localHerdrPanelStatus, .added)
+        XCTAssertFalse(model.offersLocalHerdrPanelSetup)
+        XCTAssertEqual(
+            model.localHerdrPanelSentence,
+            ClaudeRemoteEnrollmentService.localHerdrPanelReloadStatus
+        )
     }
 
-    func testCancellingTheConfirmationRunsNothing() async throws {
-        let registry = try makeRegistry()
-        let calls = Mutex<[ClaudeRemoteEnrollmentService.Invocation]>([])
-        let service = ClaudeRemoteEnrollmentService(runner: { invocation in
-            calls.withLock { $0.append(invocation) }
-            return .init(exitCode: 0, message: "ok")
-        })
-        let model = makeModel(
-            registry: registry,
-            listener: StubListener(hosts: registry),
-            enrollmentService: service
+    /// Cancel is the user's only exit short of confirming: after it, the
+    /// confirm entry point must be a no-op.
+    func testCancellingTheLocalHerdrPanelConfirmationWritesNothing() async throws {
+        let fileSystem = StubLocalHerdrConfigFileSystem(
+            state: ClaudeLocalHerdrConfigState(
+                directoryExists: false,
+                configData: nil,
+                configPermissions: nil
+            )
         )
-        model.enrollLabel = "buildhost"
-        model.enrollSSHAlias = "builder"
-        await model.enroll()
+        let model = makeModel(
+            registry: nil,
+            listener: nil,
+            enrollmentService: ClaudeRemoteEnrollmentService(localHerdrConfigFileSystem: fileSystem),
+            hasEnabledHerdrMachineReport: { true }
+        )
+        await model.refreshIntegrationsStatuses()
+        model.requestLocalHerdrPanelConfiguration()
+        XCTAssertNotNil(model.enrollmentConfirmation)
 
-        model.requestRemoteSetup()
         model.cancelEnrollmentActionConfirmation()
+        await model.confirmEnrollmentAction()
 
         XCTAssertNil(model.enrollmentConfirmation)
-        // Cancel is the user's only exit short of confirming: after it, the
-        // confirm entry point must be a no-op.
+        XCTAssertTrue(fileSystem.writes.isEmpty)
+        XCTAssertNil(model.localHerdrPanelResult)
+    }
+
+    func testLocalHerdrPanelRowFollowsTheConfigAtRefresh() async {
+        func refreshedModel(_ content: String?) async -> ClaudeIntegrationSettingsModel {
+            let fileSystem = StubLocalHerdrConfigFileSystem(
+                state: ClaudeLocalHerdrConfigState(
+                    directoryExists: true,
+                    configData: content.map { Data($0.utf8) },
+                    configPermissions: content == nil ? nil : 0o644
+                )
+            )
+            let model = makeModel(
+                registry: nil,
+                listener: nil,
+                enrollmentService: ClaudeRemoteEnrollmentService(localHerdrConfigFileSystem: fileSystem),
+                hasEnabledHerdrMachineReport: { true }
+            )
+            await model.refreshIntegrationsStatuses()
+            return model
+        }
+
+        let absent = await refreshedModel(nil)
+        XCTAssertTrue(absent.offersLocalHerdrPanelSetup)
+        XCTAssertNil(absent.localHerdrPanelSentence)
+
+        let added = await refreshedModel(ClaudeRemoteEnrollmentService.herdrPanelConfigSnippet + "\n")
+        XCTAssertFalse(added.offersLocalHerdrPanelSetup)
+        XCTAssertEqual(added.localHerdrPanelSentence, "Added.")
+
+        let customized = await refreshedModel("[ui.sidebar.agents]\nrows = [[\"agent\"]]\n")
+        XCTAssertFalse(customized.offersLocalHerdrPanelSetup)
+        XCTAssertEqual(customized.localHerdrPanelSentence, "Your herdr config sets its own agents rows.")
+
+        // Set up… would refuse an unreadable config, so it is not offered.
+        let symlinked = makeModel(
+            registry: nil,
+            listener: nil,
+            enrollmentService: ClaudeRemoteEnrollmentService(
+                localHerdrConfigFileSystem: StubLocalHerdrConfigFileSystem(
+                    state: ClaudeLocalHerdrConfigState(
+                        directoryExists: true, configData: nil, configPermissions: nil,
+                        configIsSymlink: true
+                    )
+                )
+            ),
+            hasEnabledHerdrMachineReport: { true }
+        )
+        await symlinked.refreshIntegrationsStatuses()
+        XCTAssertEqual(symlinked.localHerdrPanelStatus, .unknown)
+        XCTAssertFalse(symlinked.offersLocalHerdrPanelSetup)
+        XCTAssertEqual(symlinked.localHerdrPanelSentence, "Could not read your herdr config.")
+
+        let notUTF8 = makeModel(
+            registry: nil,
+            listener: nil,
+            enrollmentService: ClaudeRemoteEnrollmentService(
+                localHerdrConfigFileSystem: StubLocalHerdrConfigFileSystem(
+                    state: ClaudeLocalHerdrConfigState(
+                        directoryExists: true, configData: Data([0xFF, 0xFE, 0x00]),
+                        configPermissions: 0o644
+                    )
+                )
+            ),
+            hasEnabledHerdrMachineReport: { true }
+        )
+        await notUTF8.refreshIntegrationsStatuses()
+        XCTAssertEqual(notUTF8.localHerdrPanelStatus, .unknown)
+        XCTAssertFalse(notUTF8.offersLocalHerdrPanelSetup)
+    }
+
+    /// The success line belongs to the row it wrote. Once the config no
+    /// longer holds it, the sentence follows the config, not the old result.
+    func testLocalHerdrPanelResultGivesWayWhenTheRowIsGone() async throws {
+        let fileSystem = StubLocalHerdrConfigFileSystem(
+            state: ClaudeLocalHerdrConfigState(
+                directoryExists: true, configData: nil, configPermissions: nil
+            )
+        )
+        let model = makeModel(
+            registry: nil,
+            listener: nil,
+            enrollmentService: ClaudeRemoteEnrollmentService(localHerdrConfigFileSystem: fileSystem),
+            hasEnabledHerdrMachineReport: { true }
+        )
+        await model.refreshIntegrationsStatuses()
+        model.requestLocalHerdrPanelConfiguration()
         await model.confirmEnrollmentAction()
-        XCTAssertTrue(calls.withLock { $0 }.isEmpty)
-        XCTAssertTrue(model.enrollmentStepStatuses.isEmpty)
+        XCTAssertEqual(model.localHerdrPanelSentence, ClaudeRemoteEnrollmentService.localHerdrPanelReloadStatus)
+
+        fileSystem.state.configData = nil
+        await model.refreshIntegrationsStatuses()
+        XCTAssertTrue(model.offersLocalHerdrPanelSetup)
+        XCTAssertNil(model.localHerdrPanelSentence)
+
+        fileSystem.state.configData = Data("[ui.sidebar.agents]\nrows = [[\"agent\"]]\n".utf8)
+        await model.refreshIntegrationsStatuses()
+        XCTAssertEqual(model.localHerdrPanelSentence, "Your herdr config sets its own agents rows.")
+    }
+
+    func testLocalHerdrPanelOfferRefusesACustomizedConfig() async throws {
+        let original = "[ui.sidebar.agents]\nrows = [[\"state_icon\"]]\n"
+        let fileSystem = StubLocalHerdrConfigFileSystem(
+            state: ClaudeLocalHerdrConfigState(
+                directoryExists: true,
+                configData: Data(original.utf8),
+                configPermissions: 0o644
+            )
+        )
+        let service = ClaudeRemoteEnrollmentService(
+            localHerdrConfigFileSystem: fileSystem
+        )
+        let model = makeModel(
+            registry: nil,
+            listener: nil,
+            enrollmentService: service,
+            hasEnabledHerdrMachineReport: { true }
+        )
+
+        model.requestLocalHerdrPanelConfiguration()
+        await model.confirmEnrollmentAction()
+
+        XCTAssertEqual(
+            model.alert?.title,
+            "Local herdr panel"
+        )
+        XCTAssertTrue(model.alert?.detail.contains("Open Details for the manual remedy") == true)
+        XCTAssertNil(model.localHerdrPanelResult)
+        XCTAssertTrue(fileSystem.writes.isEmpty)
+    }
+
+    func testLocalHerdrPanelOfferIsUnavailableWithoutAnEnabledMachine() async {
+        let model = makeModel(
+            registry: nil,
+            listener: nil,
+            hasEnabledHerdrMachineReport: { false }
+        )
+        await model.refreshIntegrationsStatuses()
+
+        XCTAssertFalse(model.hasEnabledHerdrMachine)
+        model.requestLocalHerdrPanelConfiguration()
+        XCTAssertNil(model.enrollmentConfirmation)
+    }
+
+    /// The offer gate is re-checked at perform time, not just at request time.
+    private final class EnabledMachineBox: @unchecked Sendable {
+        var value = true
+    }
+
+    func testLocalHerdrPanelOfferRechecksTheEnabledMachineAtPerformTime() async throws {
+        let enabled = EnabledMachineBox()
+        let fileSystem = StubLocalHerdrConfigFileSystem(
+            state: ClaudeLocalHerdrConfigState(
+                directoryExists: false,
+                configData: nil,
+                configPermissions: nil
+            )
+        )
+        let service = ClaudeRemoteEnrollmentService(
+            localHerdrConfigFileSystem: fileSystem
+        )
+        let model = makeModel(
+            registry: nil,
+            listener: nil,
+            enrollmentService: service,
+            hasEnabledHerdrMachineReport: { enabled.value }
+        )
+        await model.refreshIntegrationsStatuses()
+        XCTAssertTrue(model.hasEnabledHerdrMachine)
+
+        model.requestLocalHerdrPanelConfiguration()
+        XCTAssertNotNil(model.enrollmentConfirmation)
+
+        // The last enabled machine is disabled between consent and confirm.
+        enabled.value = false
+        await model.confirmEnrollmentAction()
+
+        XCTAssertTrue(fileSystem.writes.isEmpty, "no write after the gate closed")
+        XCTAssertNil(model.localHerdrPanelResult)
     }
 
     func testANewEnrollmentSheetDoesNotInheritThePreviousHostsStepResults() async throws {
@@ -634,15 +991,15 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
         })
         let model = makeModel(
             registry: registry,
-            listener: StubListener(hosts: registry),
+            listener: StubClaudeRemoteListener(hosts: registry),
             enrollmentService: service
         )
         model.enrollLabel = "first"
         model.enrollSSHAlias = "builder"
         await model.enroll()
-        model.requestRemoteSetup()
+        model.requestHostSetup()
         await model.confirmEnrollmentAction()
-        XCTAssertFalse(model.enrollmentStepStatuses.isEmpty)
+        XCTAssertNotNil(model.setupRun)
 
         model.dismissPlan()
         model.enrollLabel = "second"
@@ -650,174 +1007,36 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
         await model.enroll()
 
         XCTAssertNotNil(model.presentedPlan)
-        XCTAssertTrue(model.enrollmentStepStatuses.isEmpty)
+        XCTAssertNil(model.setupRun)
         XCTAssertNil(model.enrollmentConfirmation)
-        XCTAssertNil(model.enrollmentResultsAction)
-    }
-
-    func testSSHConfigInsertionDoesNotTouchFilesystemBeforeExplicitConfirmation() async throws {
-        let registry = try makeRegistry()
-        let fileSystem = RecordingSSHConfigFileSystem()
-        let service = ClaudeRemoteEnrollmentService(sshConfigFileSystem: fileSystem)
-        let model = makeModel(
-            registry: registry,
-            listener: StubListener(hosts: registry),
-            enrollmentService: service
-        )
-        model.enrollLabel = "buildhost"
-        model.enrollSSHAlias = "builder"
-        await model.enroll()
-
-        model.requestSSHConfigInsertion()
-
-        XCTAssertEqual(fileSystem.readCount, 0)
-        XCTAssertEqual(fileSystem.writeCount, 0)
-        XCTAssertEqual(
-            model.enrollmentConfirmation?.preview,
-            model.presentedPlan?.plan.sshConfigSnippet
-        )
-
-        await model.confirmEnrollmentAction()
-
-        XCTAssertEqual(fileSystem.readCount, 1)
-        XCTAssertEqual(fileSystem.writeCount, 1)
-        XCTAssertEqual(
-            model.enrollmentStepStatuses.first?.text,
-            "Inserted this host's block into ~/.ssh/config."
-        )
-        XCTAssertEqual(model.enrollmentResultsAction, .insertSSHConfig)
-    }
-
-    /// Field report 2026-07-26: the step-1 success rendered in a pooled results
-    /// area below step 2, the owner never saw it, and confirmed the insertion
-    /// twice believing it had done nothing. The sheet now renders each outcome
-    /// inside the section that ran it, which needs the model to say WHICH
-    /// action the statuses belong to — and to clear that tag the moment a new
-    /// confirmation starts, so step 1's stale result can never render while
-    /// step 2 is the one being confirmed.
-    func testStepResultsAreTaggedWithTheActionThatProducedThem() async throws {
-        let registry = try makeRegistry()
-        let fileSystem = RecordingSSHConfigFileSystem()
-        let service = ClaudeRemoteEnrollmentService(
-            runner: { _ in .init(exitCode: 1, message: "remote said no") },
-            sshConfigFileSystem: fileSystem
-        )
-        let model = makeModel(
-            registry: registry,
-            listener: StubListener(hosts: registry),
-            enrollmentService: service
-        )
-        model.enrollLabel = "buildhost"
-        model.enrollSSHAlias = "builder"
-        await model.enroll()
-        XCTAssertNil(model.enrollmentResultsAction)
-
-        model.requestSSHConfigInsertion()
-        await model.confirmEnrollmentAction()
-        XCTAssertEqual(model.enrollmentResultsAction, .insertSSHConfig)
-
-        model.requestRemoteSetup()
-        XCTAssertNil(model.enrollmentResultsAction, "a pending confirmation must not show stale results")
-        XCTAssertTrue(model.enrollmentStepStatuses.isEmpty)
-
-        await model.confirmEnrollmentAction()
-        XCTAssertEqual(model.enrollmentResultsAction, .runRemoteSetup)
-        XCTAssertEqual(model.enrollmentStepStatuses.first?.succeeded, false)
-    }
-
-    /// Review finding (PR #194): the late-result guard compared only
-    /// `host.id`, which token rotation REUSES — a setup still in flight when
-    /// the sheet went away could publish its old-token outcome underneath the
-    /// rotation sheet that replaced it. The guard now requires the whole
-    /// presentation to match; rotation mints a new token, so equality
-    /// distinguishes the generations.
-    func testALateResultFromBeforeARotationNeverSurfacesUnderTheNewToken() async throws {
-        let registry = try makeRegistry()
-        let (gate, releaseGate) = AsyncStream.makeStream(of: Void.self)
-        let service = ClaudeRemoteEnrollmentService(runner: { _ in
-            .init(exitCode: 0, message: "ok")
-        })
-        let model = ClaudeIntegrationSettingsModel(
-            registry: registry,
-            listener: StubListener(hosts: registry),
-            pluginService: { StubPluginService() },
-            enrollmentService: service,
-            performAsync: { body in
-                do {
-                    try body()
-                    return nil
-                } catch {
-                    return ClaudePluginActionFailure(error)
-                }
-            },
-            performEnrollmentAsync: { body in
-                // Park until the test releases the gate, so the "sheet went
-                // away and the user rotated while ssh was still running"
-                // interleaving is deterministic — cooperative yields only, no
-                // wall-clock.
-                var latch = gate.makeAsyncIterator()
-                _ = await latch.next()
-                do {
-                    return ClaudeEnrollmentActionAttempt(steps: try body(), failure: nil)
-                } catch {
-                    return ClaudeEnrollmentActionAttempt(
-                        steps: [],
-                        failure: ClaudeEnrollmentActionFailure(error)
-                    )
-                }
-            },
-            now: { Date(timeIntervalSince1970: 1_000_000) }
-        )
-        model.enrollLabel = "buildhost"
-        model.enrollSSHAlias = "builder"
-        await model.enroll()
-        let hostID = try XCTUnwrap(model.presentedPlan).host.id
-
-        model.requestRemoteSetup()
-        let inFlight = Task { await model.confirmEnrollmentAction() }
-        while !model.isPerformingEnrollmentAction { await Task.yield() }
-
-        model.dismissPlan()
-        await model.rotate(hostID: hostID)
-        XCTAssertEqual(
-            model.presentedPlan?.host.id, hostID,
-            "rotation reuses the host id — that reuse is the trap"
-        )
-
-        releaseGate.yield(())
-        releaseGate.finish()
-        await inFlight.value
-
-        XCTAssertTrue(
-            model.enrollmentStepStatuses.isEmpty,
-            "an old-token result must not render under the rotation sheet"
-        )
-        XCTAssertNil(model.enrollmentResultsAction)
     }
 
     func testRemoteSetupTimeoutHasShortStepStatusAndClearDetail() async throws {
         let registry = try makeRegistry()
-        let service = ClaudeRemoteEnrollmentService(runner: { _ in
-            throw ClaudeRemoteEnrollmentService.RunnerFailure.timedOut(
-                seconds: 15,
-                message: "connection stalled"
-            )
-        })
+        let service = ClaudeRemoteEnrollmentService(
+            runner: { _ in
+                throw ClaudeRemoteEnrollmentService.RunnerFailure.timedOut(
+                    seconds: 15,
+                    message: "connection stalled"
+                )
+            },
+            sshConfigFileSystem: RecordingSSHConfigFileSystem()
+        )
         let model = makeModel(
             registry: registry,
-            listener: StubListener(hosts: registry),
+            listener: StubClaudeRemoteListener(hosts: registry),
             enrollmentService: service
         )
         model.enrollLabel = "buildhost"
         model.enrollSSHAlias = "builder"
         await model.enroll()
-        model.requestRemoteSetup()
+        model.requestHostSetup()
 
         await model.confirmEnrollmentAction()
 
-        XCTAssertEqual(model.enrollmentStepStatuses.first?.text, "Step 1 failed.")
-        XCTAssertTrue(model.alert?.detail.contains("within 15s") ?? false)
-        XCTAssertTrue(model.alert?.detail.contains("connection stalled") ?? false)
+        let run = try XCTUnwrap(model.setupRun)
+        XCTAssertEqual(failedReason(run.items[2].state), "The remote plugin could not be installed or updated.")
+        XCTAssertTrue(model.alert?.detail.contains("did not finish within 15s") ?? false)
     }
 
     // MARK: Remote plugin update
@@ -831,7 +1050,7 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
     ) async -> ClaudeIntegrationSettingsModel {
         let model = makeModel(
             registry: registry,
-            listener: StubListener(hosts: registry),
+            listener: StubClaudeRemoteListener(hosts: registry),
             enrollmentService: service,
             remoteForwardPort: remoteForwardPort
         )
@@ -845,7 +1064,7 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
     /// `claude plugin install` is not an update — on Claude Code 2.1.220 it
     /// exits 0 on an installed plugin and leaves the old version in place — so
     /// an enrolled host has no way to receive a plugin fix without this action.
-    func testPluginUpdateShowsThatHostsCommandsAndRunsNothingYet() async throws {
+    func testPluginUpdateTargetsThatHostsAliasAndRunsNothingYet() async throws {
         let registry = try makeRegistry()
         let calls = Mutex<[ClaudeRemoteEnrollmentService.Invocation]>([])
         let service = ClaudeRemoteEnrollmentService(
@@ -874,12 +1093,54 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
             "the update must target the enrolled alias, never the display name"
         )
         XCTAssertTrue(update.canRun)
-        let commands = update.commands.joined(separator: "\n")
-        XCTAssertTrue(commands.contains("ssh builder "))
-        XCTAssertFalse(commands.contains("ssh prod "), "updating the wrong host is the whole risk")
-        XCTAssertTrue(commands.contains("claude plugin update"))
         XCTAssertTrue(calls.withLock { $0 }.isEmpty, "disclosure must not run anything")
         XCTAssertNil(model.enrollmentConfirmation)
+    }
+
+    /// THE migration the release notes promise, through the shipped path.
+    ///
+    /// The owner's host was enrolled before `SendEnv LC_LVX_TTY` existed, so
+    /// its block already forwards the right port. A currency check that asked
+    /// about the PORT ALONE therefore answered "current", `requestPluginUpdate`
+    /// produced no ssh-config snippet, and `Update Plugin…` silently touched
+    /// only the remote plugin — the line the user was told that button adds
+    /// never arrived (review finding B1, 2026-09-06). The earlier test for this
+    /// fed the stale block to the pure splice and passed while the shipped path
+    /// was broken; this one goes through `requestPluginUpdate`.
+    @MainActor
+    func testUpdatePlanRewritesABlockThatHasThePortButNotSendEnv() async throws {
+        let registry = try makeRegistry()
+        let filesystem = RecordingSSHConfigFileSystem()
+        let service = ClaudeRemoteEnrollmentService(
+            runner: { _ in .init(exitCode: 0, message: "ok") },
+            sshConfigFileSystem: filesystem
+        )
+        let model = await enrolledModel(
+            label: "sandbox", alias: "sandbox-vpn", registry: registry, service: service,
+            remoteForwardPort: 28_542
+        )
+        let hostID = try XCTUnwrap(model.hosts.first).id
+
+        // Exactly the pre-#272 block: right port, no SendEnv.
+        filesystem.setConfig([
+            ClaudeRemoteEnrollmentService.blockBegin(hostID: hostID),
+            "Host sandbox-vpn",
+            "    RemoteForward 28542 127.0.0.1:8473",
+            "    ExitOnForwardFailure no",
+            ClaudeRemoteEnrollmentService.blockEnd(hostID: hostID),
+        ].joined(separator: "\n"))
+
+        model.requestPluginUpdate(hostID: hostID)
+        let update = try XCTUnwrap(model.presentedPluginUpdate)
+        let snippet = try XCTUnwrap(
+            update.sshConfigSnippet,
+            "a stale block must produce a rewrite, or Update Plugin… is a no-op on it"
+        )
+        XCTAssertTrue(
+            snippet.components(separatedBy: "\n")
+                .contains { $0.trimmingCharacters(in: .whitespaces) == "SendEnv LC_LVX_TTY" },
+            "and the rewrite must carry the line the release notes promise"
+        )
     }
 
     /// Every artifact the pane hands the user must name the SAME remote port —
@@ -887,17 +1148,13 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
     /// another is a tunnel to nothing, and it fails open, i.e. silently.
     func testEveryGeneratedArtifactUsesThisMacsAllocatedRemotePort() async throws {
         let registry = try makeRegistry()
-        let calls = Mutex<[ClaudeRemoteEnrollmentService.Invocation]>([])
         let service = ClaudeRemoteEnrollmentService(
-            runner: { invocation in
-                calls.withLock { $0.append(invocation) }
-                return .init(exitCode: 0, message: "ok")
-            },
+            runner: { _ in .init(exitCode: 0, message: "ok") },
             sshConfigFileSystem: RecordingSSHConfigFileSystem()
         )
         let model = makeModel(
             registry: registry,
-            listener: StubListener(hosts: registry),
+            listener: StubClaudeRemoteListener(hosts: registry),
             enrollmentService: service,
             remoteForwardPort: 28542
         )
@@ -911,23 +1168,28 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
             plan.sshConfigSnippet.contains("RemoteForward 28542 127.0.0.1:8473"),
             plan.sshConfigSnippet
         )
-        XCTAssertTrue(plan.remoteCommands.joined().contains("--config 'port=28542'"))
-        XCTAssertTrue(plan.verifyCommands.joined().contains("127.0.0.1:28542"))
-        XCTAssertTrue(plan.updateCommands.joined().contains("--config 'port=28542'"))
+        // The check probes the same allocation: the verify commands became an
+        // in-app action, so what used to be asserted on their text is now
+        // asserted on what the presentation hands the probe.
+        XCTAssertEqual(try XCTUnwrap(model.presentedPlan).remoteForwardPort, 28542)
         model.dismissPlan()
 
-        // …and so must the standalone update panel and what it actually runs.
+        // …and so must the standalone update panel. What the update run
+        // executes is pinned by the legacy-host test below.
         let hostID = try XCTUnwrap(model.hosts.first).id
         model.requestPluginUpdate(hostID: hostID)
         let update = try XCTUnwrap(model.presentedPluginUpdate)
-        XCTAssertTrue(update.commands.joined().contains("--config 'port=28542'"))
-
-        model.requestPluginUpdateRun()
-        await model.confirmEnrollmentAction()
-        let scripts = calls.withLock { $0 }.map { String(decoding: $0.standardInput, as: UTF8.self) }
+        XCTAssertTrue(try XCTUnwrap(update.sshConfigSnippet).contains("RemoteForward 28542 127.0.0.1:8473"))
         XCTAssertTrue(
-            scripts.contains { $0.contains("--config 'port=28542'") },
-            "the executed update must migrate the port, not just the panel text: \(scripts)"
+            // Fresh enrollment. The UPDATE path for an ALREADY-enrolled host
+            // regenerates this same snippet and inserts it, which is what the
+            // owner's host needed — pinned in
+            // `ClaudeRemoteEnrollmentServiceTests`.
+            plan.sshConfigSnippet.components(separatedBy: "\n")
+                .contains { $0.trimmingCharacters(in: .whitespaces) == "SendEnv LC_LVX_TTY" },
+            "the block must carry the terminal's tty into the session, or the "
+                + "plain-ssh join has nothing to compare: "
+                + plan.sshConfigSnippet
         )
     }
 
@@ -942,18 +1204,19 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
     /// pressed the button.
     func testUpdatingALegacyHostRewritesTheSSHBlockAndTheRemotePortTogether() async throws {
         let registry = try makeRegistry()
-        let calls = Mutex<[ClaudeRemoteEnrollmentService.Invocation]>([])
+        let recorder = SetupFlowRecorder()
         let filesystem = RecordingSSHConfigFileSystem()
+        // A legacy host already has an older plugin; an update run carries no
+        // token, so it can only update one.
+        var script = SetupFlowScript()
+        script.pluginVersionBefore = "1.6.0"
         let service = ClaudeRemoteEnrollmentService(
-            runner: { invocation in
-                calls.withLock { $0.append(invocation) }
-                return .init(exitCode: 0, message: "ok")
-            },
+            runner: setupFlowRunner(script: script, recorder: recorder),
             sshConfigFileSystem: filesystem
         )
         let model = makeModel(
             registry: registry,
-            listener: StubListener(hosts: registry),
+            listener: StubClaudeRemoteListener(hosts: registry),
             enrollmentService: service,
             remoteForwardPort: 28542
         )
@@ -985,12 +1248,7 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
         )
         XCTAssertTrue(snippet.contains("RemoteForward 28542 127.0.0.1:8473"))
 
-        // The confirmation has to repeat BOTH mutations, in order.
-        model.requestPluginUpdateRun()
-        let preview = try XCTUnwrap(model.enrollmentConfirmation).preview
-        XCTAssertTrue(preview.contains("RemoteForward 28542 127.0.0.1:8473"), preview)
-        XCTAssertTrue(preview.contains("--config 'port=28542'"), preview)
-
+        model.requestHostUpdateRun()
         await model.confirmEnrollmentAction()
 
         // Half one: the local block now forwards the allocated port, once.
@@ -1004,128 +1262,23 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
         XCTAssertTrue(written.contains("Host unrelated"), "the rest of the file is untouched")
 
         // Half two: the remote now stores the same port.
-        let scripts = calls.withLock { $0 }.map { String(decoding: $0.standardInput, as: UTF8.self) }
+        // The `claude` lines only: the plugin install also carries the shims'
+        // own text, whose comments mention `--config token=…`.
+        let scripts = recorder.all.map {
+            String(decoding: $0.standardInput, as: UTF8.self)
+                .components(separatedBy: "\n").filter { $0.hasPrefix("claude ") }.joined(separator: "\n")
+        }
         XCTAssertTrue(
             scripts.contains { $0.contains("--config 'port=28542'") },
             "the plugin-side port write must have run too: \(scripts)"
         )
-        XCTAssertTrue(model.enrollmentStepStatuses.allSatisfy(\.succeeded))
-    }
-
-    /// The half of the blocker that the first fix missed: the executable path
-    /// wrote the ssh block, but the PANEL displayed and copied only the remote
-    /// commands. Both copy-only routes lead straight back to the split brain —
-    /// a host with no recorded alias can ONLY be updated by hand, and the
-    /// symlink refusal deliberately sends the user to that same Copy button.
-    /// So the copy payload has to carry both mutations, in order.
-    func testTheCopyPayloadForAnAliaslessHostCarriesTheSSHBlockToo() async throws {
-        let registry = try makeRegistry()
-        let filesystem = RecordingSSHConfigFileSystem()
-        let service = ClaudeRemoteEnrollmentService(
-            runner: { _ in .init(exitCode: 0, message: "ok") },
-            sshConfigFileSystem: filesystem
+        XCTAssertFalse(
+            scripts.contains { $0.contains("\(ClaudeRemoteEnrollmentService.tokenConfigKey)=") },
+            "the update run has no token to send"
         )
-        // Enrolled before aliases were recorded: copy-only, forever, until the
-        // user re-enrolls. This is the population most likely to still be on a
-        // legacy 8473 block.
-        let enrollment = try registry.enroll(label: "buildhost")
-        let model = makeModel(
-            registry: registry,
-            listener: StubListener(hosts: registry),
-            enrollmentService: service,
-            remoteForwardPort: 28542
-        )
-
-        model.requestPluginUpdate(hostID: enrollment.host.id)
-
-        let update = try XCTUnwrap(model.presentedPluginUpdate)
-        XCTAssertFalse(update.canRun, "no alias means nothing may be run for them")
-        let payload = update.applicationText
-        XCTAssertTrue(
-            payload.contains("RemoteForward 28542 127.0.0.1:8473"),
-            "a copy that omits the ssh block updates the remote and strands this Mac: \(payload)"
-        )
-        XCTAssertTrue(payload.contains("--config 'port=28542'"), payload)
-        // Order matters as much as presence: the block first, the remote second.
-        let blockIndex = try XCTUnwrap(payload.range(of: "RemoteForward 28542")).lowerBound
-        let commandIndex = try XCTUnwrap(payload.range(of: "--config 'port=28542'")).lowerBound
-        XCTAssertLessThan(blockIndex, commandIndex)
-        XCTAssertTrue(payload.contains("~/.ssh/config"), "and it must say where the block goes")
-    }
-
-    /// The recovery path after the app refuses to write a symlinked config: the
-    /// user is told to copy, so what they copy must be enough to finish the job.
-    func testTheCopyPayloadAfterASymlinkRefusalStillCarriesTheSSHBlock() async throws {
-        let registry = try makeRegistry()
-        let calls = Mutex<[ClaudeRemoteEnrollmentService.Invocation]>([])
-        let filesystem = RecordingSSHConfigFileSystem()
-        filesystem.setSymlinked(true)
-        let service = ClaudeRemoteEnrollmentService(
-            runner: { invocation in
-                calls.withLock { $0.append(invocation) }
-                return .init(exitCode: 0, message: "ok")
-            },
-            sshConfigFileSystem: filesystem
-        )
-        let model = makeModel(
-            registry: registry,
-            listener: StubListener(hosts: registry),
-            enrollmentService: service,
-            remoteForwardPort: 28542
-        )
-        model.enrollLabel = "buildhost"
-        model.enrollSSHAlias = "builder"
-        await model.enroll()
-        model.dismissPlan()
-        let hostID = try XCTUnwrap(model.hosts.first).id
-
-        model.requestPluginUpdate(hostID: hostID)
-        model.requestPluginUpdateRun()
-        await model.confirmEnrollmentAction()
-
-        XCTAssertTrue(calls.withLock { $0 }.isEmpty, "the remote must stay untouched")
-        // The panel is still open, and what it offers to copy is the whole job.
-        let payload = try XCTUnwrap(model.presentedPluginUpdate).applicationText
-        XCTAssertTrue(
-            payload.contains("RemoteForward 28542 127.0.0.1:8473"),
-            "the refusal tells the user to copy; copying must hand them both halves: \(payload)"
-        )
-        XCTAssertTrue(payload.contains("--config 'port=28542'"))
-    }
-
-    func testThePanelTheConfirmationAndTheCopyAllShowTheSameText() async throws {
-        // Three surfaces rendered the same thing by hand once, and diverged —
-        // that divergence WAS the blocker. One source now.
-        let registry = try makeRegistry()
-        let service = ClaudeRemoteEnrollmentService(
-            runner: { _ in .init(exitCode: 0, message: "ok") },
-            sshConfigFileSystem: RecordingSSHConfigFileSystem()
-        )
-        let model = makeModel(
-            registry: registry,
-            listener: StubListener(hosts: registry),
-            enrollmentService: service,
-            remoteForwardPort: 28542
-        )
-        model.enrollLabel = "buildhost"
-        model.enrollSSHAlias = "builder"
-        await model.enroll()
-        model.dismissPlan()
-        let hostID = try XCTUnwrap(model.hosts.first).id
-
-        model.requestPluginUpdate(hostID: hostID)
-        model.requestPluginUpdateRun()
-
-        let update = try XCTUnwrap(model.presentedPluginUpdate)
-        XCTAssertEqual(
-            try XCTUnwrap(model.enrollmentConfirmation).preview,
-            update.applicationText,
-            "the confirmation must be the same text the panel shows and copies"
-        )
-        XCTAssertEqual(
-            ClaudeIntegrationSettingsModel.updatePreview(for: update),
-            update.applicationText
-        )
+        let run = try XCTUnwrap(model.setupRun)
+        XCTAssertEqual(run.items[0].state, .done("The SSH config block is current."))
+        XCTAssertEqual(run.items[2].state, .done("The remote plugin was updated and verified."))
     }
 
     func testAHostWhoseBlockIsAlreadyCurrentIsNotRewritten() async throws {
@@ -1137,7 +1290,7 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
         )
         let model = makeModel(
             registry: registry,
-            listener: StubListener(hosts: registry),
+            listener: StubClaudeRemoteListener(hosts: registry),
             enrollmentService: service,
             remoteForwardPort: 28542
         )
@@ -1186,7 +1339,7 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
         )
         let model = makeModel(
             registry: registry,
-            listener: StubListener(hosts: registry),
+            listener: StubClaudeRemoteListener(hosts: registry),
             enrollmentService: service,
             remoteForwardPort: 28542
         )
@@ -1197,13 +1350,15 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
         let hostID = try XCTUnwrap(model.hosts.first).id
 
         model.requestPluginUpdate(hostID: hostID)
-        model.requestPluginUpdateRun()
+        model.requestHostUpdateRun()
         await model.confirmEnrollmentAction()
 
         XCTAssertTrue(
             calls.withLock { $0 }.isEmpty,
             "nothing may reach the remote once the local half is known to have failed"
         )
+        let run = try XCTUnwrap(model.setupRun)
+        XCTAssertEqual(failedReason(run.items[0].state), "Could not update this Mac's SSH config.")
         XCTAssertNotNil(model.alert, "and the user has to be told")
     }
 
@@ -1211,7 +1366,11 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
     /// FRESH token to whatever answers to the guessed name.
     func testRotationTargetsTheEnrolledAliasNotTheDisplayName() async throws {
         let registry = try makeRegistry()
-        let service = ClaudeRemoteEnrollmentService(runner: { _ in .init(exitCode: 0, message: "ok") })
+        let recorder = SetupFlowRecorder()
+        let service = ClaudeRemoteEnrollmentService(
+            runner: setupFlowRunner(script: SetupFlowScript(), recorder: recorder),
+            sshConfigFileSystem: StubSSHConfigFileSystem()
+        )
         let model = await enrolledModel(
             label: "prod", alias: "builder", registry: registry, service: service
         )
@@ -1222,13 +1381,20 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
         let presentation = try XCTUnwrap(model.presentedPlan)
         XCTAssertEqual(presentation.sshHostAlias, "builder")
         XCTAssertTrue(presentation.canRunRemoteSetup)
-        XCTAssertTrue(presentation.plan.verifyCommands.joined().contains("ssh builder"))
-        XCTAssertFalse(presentation.plan.updateCommands.joined().contains("ssh prod"))
+
+        model.requestHostSetup()
+        await model.confirmEnrollmentAction()
+        let argvs = recorder.all.map(\.argv)
+        XCTAssertFalse(argvs.isEmpty, "the rotated host's setup must have run")
+        for argv in argvs {
+            XCTAssertTrue(argv.contains("builder"), "\(argv)")
+            XCTAssertFalse(argv.contains("prod"), "a fresh token to the wrong host is the whole risk: \(argv)")
+        }
     }
 
-    func testRotatingAHostEnrolledBeforeAliasesWereRecordedIsCopyOnly() async throws {
+    func testRotatingAHostEnrolledBeforeAliasesWereRecordedRequiresReenrollment() async throws {
         // No alias on file means we do not know where to send the new token,
-        // and a guess is exactly what this PR removed. Copy still works.
+        // and a guess is exactly what this path forbids.
         let registry = try makeRegistry()
         let calls = Mutex(0)
         let service = ClaudeRemoteEnrollmentService(runner: { _ in
@@ -1238,7 +1404,7 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
         let enrollment = try registry.enroll(label: "buildhost")
         let model = makeModel(
             registry: registry,
-            listener: StubListener(hosts: registry),
+            listener: StubClaudeRemoteListener(hosts: registry),
             enrollmentService: service
         )
 
@@ -1252,107 +1418,15 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
             "the label is not a stand-in for an alias we were never told"
         )
 
-        model.requestRemoteSetup()
+        model.requestHostSetup()
         await model.confirmEnrollmentAction()
 
         XCTAssertNil(model.enrollmentConfirmation)
+        XCTAssertNil(model.setupRun)
         XCTAssertEqual(calls.withLock { $0 }, 0, "a placeholder alias must never reach ssh")
     }
 
-    func testPluginUpdateRunsOnlyAfterAnExplicitConfirmation() async throws {
-        let registry = try makeRegistry()
-        let calls = Mutex<[ClaudeRemoteEnrollmentService.Invocation]>([])
-        let service = ClaudeRemoteEnrollmentService(
-            runner: { invocation in
-                calls.withLock { $0.append(invocation) }
-                return .init(exitCode: 0, message: "ok")
-            },
-            sshConfigFileSystem: RecordingSSHConfigFileSystem()
-        )
-        let model = await enrolledModel(label: "buildhost", registry: registry, service: service)
-        let hostID = try XCTUnwrap(model.hosts.first).id
-        model.requestPluginUpdate(hostID: hostID)
-
-        model.requestPluginUpdateRun()
-
-        XCTAssertTrue(calls.withLock { $0 }.isEmpty)
-        let confirmation = try XCTUnwrap(model.enrollmentConfirmation)
-        XCTAssertEqual(confirmation.action, .updateRemotePlugin(hostID: hostID))
-        XCTAssertEqual(
-            confirmation.preview,
-            ClaudeIntegrationSettingsModel.updatePreview(
-                for: try XCTUnwrap(model.presentedPluginUpdate)
-            ),
-            "the confirmation must repeat the exact mutations the row displays"
-        )
-        XCTAssertTrue(
-            confirmation.preview.contains(
-                try XCTUnwrap(model.presentedPluginUpdate).commands.joined(separator: "\n")
-            ),
-            "…including every command, verbatim"
-        )
-
-        await model.confirmEnrollmentAction()
-
-        // Three since per-Mac ports (#215): marketplace update, plugin update,
-        // and the token-free `--config port=` migration for a host enrolled
-        // before that option existed.
-        XCTAssertEqual(calls.withLock { $0 }.count, 3)
-        XCTAssertEqual(model.enrollmentStepStatuses.map(\.text), [
-            "Step 1 succeeded.", "Step 2 succeeded.", "Step 3 succeeded.",
-        ])
-        XCTAssertEqual(model.enrollmentResultsAction, .updateRemotePlugin(hostID: hostID))
-    }
-
-    func testCancellingThePluginUpdateConfirmationRunsNothing() async throws {
-        let registry = try makeRegistry()
-        let calls = Mutex<[ClaudeRemoteEnrollmentService.Invocation]>([])
-        let service = ClaudeRemoteEnrollmentService(runner: { invocation in
-            calls.withLock { $0.append(invocation) }
-            return .init(exitCode: 0, message: "ok")
-        })
-        let model = await enrolledModel(label: "buildhost", registry: registry, service: service)
-        let hostID = try XCTUnwrap(model.hosts.first).id
-        model.requestPluginUpdate(hostID: hostID)
-        model.requestPluginUpdateRun()
-
-        model.cancelEnrollmentActionConfirmation()
-        await model.confirmEnrollmentAction()
-
-        XCTAssertNil(model.enrollmentConfirmation)
-        XCTAssertTrue(calls.withLock { $0 }.isEmpty)
-        XCTAssertTrue(model.enrollmentStepStatuses.isEmpty)
-    }
-
-    /// The results render in the row whose button ran them (PR #194), so the
-    /// tag has to name the HOST as well as the action — and opening another
-    /// host's panel must not leave the first host's outcome sitting under it.
-    func testAnotherHostsPanelDoesNotInheritThePreviousResults() async throws {
-        let registry = try makeRegistry()
-        let service = ClaudeRemoteEnrollmentService(runner: { _ in .init(exitCode: 0, message: "ok") })
-        let model = await enrolledModel(label: "buildhost", registry: registry, service: service)
-        model.enrollLabel = "laptop"
-        model.enrollSSHAlias = "laptop"
-        await model.enroll()
-        model.dismissPlan()
-        let firstID = try XCTUnwrap(model.hosts.first).id
-        let secondID = try XCTUnwrap(model.hosts.last).id
-        XCTAssertNotEqual(firstID, secondID)
-
-        model.requestPluginUpdate(hostID: firstID)
-        model.requestPluginUpdateRun()
-        await model.confirmEnrollmentAction()
-        XCTAssertEqual(model.enrollmentResultsAction, .updateRemotePlugin(hostID: firstID))
-
-        model.requestPluginUpdate(hostID: secondID)
-
-        XCTAssertEqual(model.presentedPluginUpdate?.hostID, secondID)
-        XCTAssertTrue(model.enrollmentStepStatuses.isEmpty)
-        XCTAssertNil(model.enrollmentResultsAction)
-        XCTAssertNil(model.enrollmentConfirmation)
-    }
-
-    func testPluginUpdateIsCopyOnlyForAHostWithNoRecordedAlias() async throws {
+    func testPluginUpdateCannotRunForAHostWithNoRecordedAlias() async throws {
         // Hosts enrolled before the alias was persisted. The row says what it
         // does not know instead of ssh-ing at a name it made up.
         let registry = try makeRegistry()
@@ -1364,7 +1438,7 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
         let enrollment = try registry.enroll(label: "buildhost")
         let model = makeModel(
             registry: registry,
-            listener: StubListener(hosts: registry),
+            listener: StubClaudeRemoteListener(hosts: registry),
             enrollmentService: service
         )
 
@@ -1373,81 +1447,16 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
         let update = try XCTUnwrap(model.presentedPluginUpdate)
         XCTAssertNil(update.sshHostAlias)
         XCTAssertFalse(update.canRun)
-        XCTAssertTrue(
-            update.commands.joined(separator: "\n")
-                .contains(ClaudeIntegrationSettingsModel.unknownAliasPlaceholder)
-        )
+        let snippet = try XCTUnwrap(update.sshConfigSnippet)
+        XCTAssertTrue(snippet.contains("Host \(ClaudeIntegrationSettingsModel.unknownAliasPlaceholder)\n"))
+        XCTAssertFalse(snippet.contains("Host buildhost"), "the label is not a stand-in for an alias")
 
-        model.requestPluginUpdateRun()
+        model.requestHostUpdateRun()
         await model.confirmEnrollmentAction()
 
         XCTAssertNil(model.enrollmentConfirmation)
+        XCTAssertNil(model.setupRun)
         XCTAssertEqual(calls.withLock { $0 }, 0, "a placeholder alias must never reach ssh")
-    }
-
-    /// Review finding (PR #197): the removal test below waits for the update to
-    /// FINISH, so it never exercised the late-result guard. This is the
-    /// interleaving that guard exists for — the row goes away while ssh is
-    /// still running — and it is asserted the same way rotation's is: a gate
-    /// the test releases, no wall-clock.
-    func testAResultFromAHostRemovedMidUpdateNeverSurfaces() async throws {
-        let registry = try makeRegistry()
-        let (gate, releaseGate) = AsyncStream.makeStream(of: Void.self)
-        // Failing, so a leaked result would be loud: statuses AND an alert.
-        let service = ClaudeRemoteEnrollmentService(runner: { _ in
-            .init(exitCode: 1, message: "remote said no")
-        })
-        let model = ClaudeIntegrationSettingsModel(
-            registry: registry,
-            listener: StubListener(hosts: registry),
-            pluginService: { StubPluginService() },
-            enrollmentService: service,
-            performAsync: { body in
-                do {
-                    try body()
-                    return nil
-                } catch {
-                    return ClaudePluginActionFailure(error)
-                }
-            },
-            performEnrollmentAsync: { body in
-                var latch = gate.makeAsyncIterator()
-                _ = await latch.next()
-                do {
-                    return ClaudeEnrollmentActionAttempt(steps: try body(), failure: nil)
-                } catch {
-                    return ClaudeEnrollmentActionAttempt(
-                        steps: [],
-                        failure: ClaudeEnrollmentActionFailure(error)
-                    )
-                }
-            }
-        )
-        model.enrollLabel = "buildhost"
-        model.enrollSSHAlias = "builder"
-        await model.enroll()
-        model.dismissPlan()
-        let hostID = try XCTUnwrap(model.hosts.first).id
-
-        model.requestPluginUpdate(hostID: hostID)
-        model.requestPluginUpdateRun()
-        let inFlight = Task { await model.confirmEnrollmentAction() }
-        while !model.isPerformingEnrollmentAction { await Task.yield() }
-
-        await model.remove(hostID: hostID)
-
-        releaseGate.yield(())
-        releaseGate.finish()
-        await inFlight.value
-
-        XCTAssertTrue(model.hosts.isEmpty)
-        XCTAssertNil(model.presentedPluginUpdate)
-        XCTAssertTrue(
-            model.enrollmentStepStatuses.isEmpty,
-            "a removed host's outcome has no row to render in"
-        )
-        XCTAssertNil(model.enrollmentResultsAction)
-        XCTAssertNil(model.alert, "and no alert about a host that is gone")
     }
 
     func testRemovingAHostClosesItsOpenUpdatePanel() async throws {
@@ -1456,42 +1465,15 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
         let model = await enrolledModel(label: "buildhost", registry: registry, service: service)
         let hostID = try XCTUnwrap(model.hosts.first).id
         model.requestPluginUpdate(hostID: hostID)
-        model.requestPluginUpdateRun()
+        // The runner answers nothing the run can decode, so it fails and the
+        // panel stays open with its remedy.
+        model.requestHostUpdateRun()
         await model.confirmEnrollmentAction()
+        XCTAssertNotNil(model.presentedPluginUpdate)
 
         await model.remove(hostID: hostID)
 
         XCTAssertNil(model.presentedPluginUpdate, "the row is gone; its panel must not outlive it")
-        XCTAssertTrue(model.enrollmentStepStatuses.isEmpty)
-        XCTAssertNil(model.enrollmentResultsAction)
-    }
-
-    func testAFailedPluginUpdateIsAShortStatusAndADetailedAlert() async throws {
-        let registry = try makeRegistry()
-        let service = ClaudeRemoteEnrollmentService(
-            runner: { _ in
-                .init(exitCode: 1, message: "plugin localvoxtral-remote not found")
-            },
-            // The local ssh-block rewrite runs first and must SUCCEED here, so
-            // that what this test observes is the remote step failing.
-            sshConfigFileSystem: RecordingSSHConfigFileSystem()
-        )
-        let model = await enrolledModel(label: "buildhost", registry: registry, service: service)
-        let hostID = try XCTUnwrap(model.hosts.first).id
-        model.requestPluginUpdate(hostID: hostID)
-        model.requestPluginUpdateRun()
-
-        await model.confirmEnrollmentAction()
-
-        XCTAssertEqual(model.enrollmentStepStatuses.map(\.text), ["Step 1 failed."])
-        XCTAssertEqual(model.enrollmentResultsAction, .updateRemotePlugin(hostID: hostID))
-        XCTAssertEqual(model.alert?.title, "Remote Claude Code plugin")
-        let detail = try XCTUnwrap(model.alert?.detail)
-        XCTAssertTrue(detail.contains("plugin localvoxtral-remote not found"))
-        // The body has to name what the user pressed. "SSH setup exited with
-        // code 1" under an Update Plugin button reads as a different failure.
-        XCTAssertTrue(detail.hasPrefix("Plugin update exited with code 1."))
-        XCTAssertFalse(detail.contains("SSH setup"))
     }
 
     // MARK: Validation and failures
@@ -1509,7 +1491,7 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
 
     func testAnInvalidAliasIsReportedAndEnrollsNothing() async throws {
         let registry = try makeRegistry()
-        let model = makeModel(registry: registry, listener: StubListener(hosts: registry))
+        let model = makeModel(registry: registry, listener: StubClaudeRemoteListener(hosts: registry))
         model.enrollLabel = "buildhost"
         model.enrollSSHAlias = "bad alias"
         await model.enroll()
@@ -1521,7 +1503,7 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
 
     func testAPortConflictIsAShortActionableStatusPlusADetailedAlert() async throws {
         let registry = try makeRegistry()
-        let listener = StubListener(hosts: registry)
+        let listener = StubClaudeRemoteListener(hosts: registry)
         listener.bindError = ClaudeRemoteContextListener.StartFailure.bindFailed(errno: EADDRINUSE)
         let model = makeModel(registry: registry, listener: listener)
         model.enrollLabel = "buildhost"
@@ -1540,7 +1522,7 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
 
     func testRetryAfterAPortConflictBindsOnceTheConflictClears() async throws {
         let registry = try makeRegistry()
-        let listener = StubListener(hosts: registry)
+        let listener = StubClaudeRemoteListener(hosts: registry)
         listener.bindError = ClaudeRemoteContextListener.StartFailure.bindFailed(errno: EADDRINUSE)
         let model = makeModel(registry: registry, listener: listener)
         model.enrollLabel = "buildhost"
@@ -1553,6 +1535,31 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
 
         XCTAssertTrue(listener.isListening)
         XCTAssertEqual(model.listenerStatus, .listening(port: 8473))
+    }
+
+    /// A second copy of the app loses the listener port at launch. Its herdr
+    /// forwards wait on the launch orphan reap, so the failed bind must still
+    /// run it, or every remote herdr join waits out its readiness budget and
+    /// joins nothing (#1368).
+    func testAPortConflictAtLaunchStillRunsTheOrphanReap() async throws {
+        let registry = try makeRegistry()
+        _ = try registry.enroll(label: "buildhost", sshHostAlias: "builder")
+        let listener = StubClaudeRemoteListener(hosts: registry)
+        listener.bindError = ClaudeRemoteContextListener.StartFailure.bindFailed(errno: EADDRINUSE)
+        let reaps = EventCount()
+        let forwards = makeForwardCoordinator(
+            registry: registry,
+            stubs: ForwardStubs(),
+            isListenerBound: { listener.isListening },
+            reapOrphans: { reaps.increment() }
+        )
+        let model = makeModel(registry: registry, listener: listener, forwards: forwards)
+
+        model.synchronizeListenerAtLaunch()
+        await reaps.waitFor(1)
+
+        XCTAssertEqual(model.listenerStatus, .portConflict(port: 8473))
+        XCTAssertEqual(reaps.value, 1)
     }
 
     // MARK: Last-heard and rejection diagnostics
@@ -1601,7 +1608,7 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
         let registry = try makeRegistry()
         let model = makeModel(
             registry: registry,
-            listener: StubListener(hosts: registry),
+            listener: StubClaudeRemoteListener(hosts: registry),
             // 10 minutes after the registry's frozen clock.
             now: { Date(timeIntervalSince1970: 1_000_600) }
         )
@@ -1615,15 +1622,229 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
         XCTAssertEqual(model.hosts.first?.statusText, "Last context: 10 min ago")
     }
 
+    // MARK: Plugin update indicator
+
+    func testPluginIsCurrentNeedsAReportedVersion() {
+        let expected = ClaudeRemoteEnrollmentService.remotePluginVersion
+        XCTAssertFalse(ClaudeIntegrationSettingsModel.pluginIsCurrent(reported: nil, expected: expected))
+        XCTAssertFalse(ClaudeIntegrationSettingsModel.pluginIsCurrent(reported: .headerAbsent, expected: expected))
+        XCTAssertFalse(ClaudeIntegrationSettingsModel.pluginIsCurrent(reported: .version("1.9.0"), expected: expected))
+        XCTAssertTrue(ClaudeIntegrationSettingsModel.pluginIsCurrent(reported: .version(expected), expected: expected))
+        XCTAssertTrue(ClaudeIntegrationSettingsModel.pluginIsCurrent(reported: .version("99.0.0"), expected: expected))
+    }
+
+    func testRefreshDerivesPluginNeedsUpdateFromTheRegistrysReports() async throws {
+        let registry = try makeRegistry()
+        let model = makeModel(registry: registry, listener: StubClaudeRemoteListener(hosts: registry))
+        model.enrollLabel = "buildhost"
+        model.enrollSSHAlias = "builder"
+        await model.enroll()
+        let hostID = try XCTUnwrap(model.hosts.first?.id)
+        XCTAssertFalse(model.hosts[0].pluginNeedsUpdate, "never heard means no hint")
+        XCTAssertTrue(model.hosts[0].offersUpdate, "never heard is not known current either")
+
+        registry.notePluginVersion(hostID: hostID, .headerAbsent)
+        model.refreshHosts()
+        XCTAssertTrue(model.hosts[0].pluginNeedsUpdate)
+
+        registry.notePluginVersion(hostID: hostID, .version("1.9.0"))
+        model.refreshHosts()
+        XCTAssertTrue(model.hosts[0].pluginNeedsUpdate)
+
+        registry.notePluginVersion(hostID: hostID, .version("99.0.0"))
+        model.refreshHosts()
+        XCTAssertFalse(model.hosts[0].pluginNeedsUpdate, "a newer host is not outdated")
+        XCTAssertTrue(
+            model.hosts[0].offersUpdate,
+            "this model cannot read ~/.ssh/config, so the block is not known current"
+        )
+    }
+
+    /// A revoked host cannot authenticate and cannot update; its row must keep
+    /// saying "Revoked" rather than hijack the status position.
+    func testARevokedHostNeverShowsThePluginUpdateHint() async throws {
+        let registry = try makeRegistry()
+        let model = makeModel(registry: registry, listener: StubClaudeRemoteListener(hosts: registry))
+        model.enrollLabel = "buildhost"
+        model.enrollSSHAlias = "builder"
+        await model.enroll()
+        let hostID = try XCTUnwrap(model.hosts.first?.id)
+
+        registry.notePluginVersion(hostID: hostID, .headerAbsent)
+        await model.revoke(hostID: hostID)
+        model.refreshHosts()
+        XCTAssertFalse(model.hosts[0].pluginNeedsUpdate)
+        XCTAssertEqual(model.hosts[0].statusText, "Revoked")
+        XCTAssertFalse(
+            model.hosts[0].offersUpdate,
+            "the run carries no token, so it cannot bring a revoked host back"
+        )
+    }
+
+    /// The block was current when the update panel opened, so the panel
+    /// carries no snippet. A block that goes stale before Update Host is
+    /// confirmed must still be rewritten by the run.
+    @MainActor
+    func testTheUpdateRunRewritesABlockThatWentStaleAfterThePanelOpened() async throws {
+        let registry = try makeRegistry()
+        let sshFS = StubSSHConfigFileSystem()
+        let service = ClaudeRemoteEnrollmentService(
+            runner: setupFlowRunner(script: SetupFlowScript(), recorder: SetupFlowRecorder()),
+            sshConfigFileSystem: sshFS
+        )
+        let listener = StubClaudeRemoteListener(hosts: registry)
+        listener.isListening = true
+        let model = setupFlowModel(registry: registry, listener: listener, service: service)
+        model.enrollLabel = "buildhost"
+        model.enrollSSHAlias = "builder"
+        await model.enroll()
+        let hostID = try XCTUnwrap(model.hosts.first?.id)
+        let expectedBlock = try XCTUnwrap(model.presentedPlan).plan.sshConfigSnippet
+        let current = ClaudeRemoteEnrollmentService.applySSHConfigSnippet(
+            to: "", snippet: expectedBlock, hostID: hostID
+        )
+        sshFS.configText = current
+        model.dismissPlan()
+
+        model.requestPluginUpdate(hostID: hostID)
+        XCTAssertNil(model.presentedPluginUpdate?.sshConfigSnippet, "current when the panel opened")
+
+        // Edited while the panel is open: the forward now reaches the wrong port.
+        let stale = current.replacingOccurrences(of: "127.0.0.1:", with: "127.0.0.1:1")
+        XCTAssertNotEqual(stale, current)
+        sshFS.configText = stale
+        model.requestHostUpdateRun()
+        await model.confirmEnrollmentAction()
+
+        XCTAssertEqual(sshFS.configText, current, "the run rewrote the block it found stale")
+    }
+
+    /// The run's read-back already PROVED the installed version, so the
+    /// indicator clears on the run — not at the host's next hook, which may be
+    /// hours away while the user is staring at the row.
+    @MainActor
+    func testASuccessfulUpdateRunClearsTheIndicatorWithoutWaitingForAHook() async throws {
+        let registry = try makeRegistry()
+        let sshFS = StubSSHConfigFileSystem()
+        let recorder = SetupFlowRecorder()
+        var script = SetupFlowScript()
+        script.pluginVersionBefore = "1.9.0"
+        let service = ClaudeRemoteEnrollmentService(
+            runner: setupFlowRunner(script: script, recorder: recorder),
+            sshConfigFileSystem: sshFS
+        )
+        let listener = StubClaudeRemoteListener(hosts: registry)
+        listener.isListening = true
+        let rcFS = StubRCFileSystem(state: ClaudeShellRCState())
+        let model = setupFlowModel(
+            registry: registry, listener: listener, service: service, rcFileSystem: rcFS
+        )
+        model.enrollLabel = "buildhost"
+        model.enrollSSHAlias = "builder"
+        await model.enroll()
+        let hostID = try XCTUnwrap(model.hosts.first?.id)
+        let presentation = try XCTUnwrap(model.presentedPlan)
+        sshFS.configText = ClaudeRemoteEnrollmentService.applySSHConfigSnippet(
+            to: "", snippet: presentation.plan.sshConfigSnippet, hostID: hostID
+        )
+        model.dismissPlan()
+
+        // The field state: hooks reported an outdated plugin.
+        registry.notePluginVersion(hostID: hostID, .version("1.9.0"))
+        model.refreshHosts()
+        XCTAssertTrue(model.hosts[0].pluginNeedsUpdate)
+
+        model.requestPluginUpdate(hostID: hostID)
+        model.requestHostUpdateRun()
+        await model.confirmEnrollmentAction()
+
+        XCTAssertEqual(model.hosts.first?.setupStatusText, "Setup complete.")
+        XCTAssertFalse(
+            model.hosts[0].pluginNeedsUpdate,
+            "the verified read-back must clear the indicator on the run itself"
+        )
+        XCTAssertFalse(
+            model.hosts[0].offersUpdate,
+            "plugin and SSH block both proven current: another run would change nothing"
+        )
+
+        // Either local block going missing brings the button back even with a
+        // current plugin: the run would rewrite it.
+        let sshConfig = sshFS.configText
+        sshFS.configText = ""
+        model.refreshHosts()
+        XCTAssertTrue(model.hosts[0].offersUpdate, "stale SSH block")
+        sshFS.configText = sshConfig
+        rcFS.state = ClaudeShellRCState()
+        model.refreshHosts()
+        XCTAssertTrue(model.hosts[0].offersUpdate, "missing shell startup block")
+        XCTAssertEqual(
+            registry.host(id: hostID)?.reportedPluginVersion,
+            .version(ClaudeRemoteEnrollmentService.remotePluginVersion)
+        )
+    }
+
+    /// The follow-up defect (2026-09-17): Claude Code applies a plugin update
+    /// only on session restart, so a host's ALREADY-RUNNING sessions keep
+    /// executing the old plugin's post.sh after "Update Plugin…" succeeds.
+    /// Their next hook carries no version header — and a last-writer-wins
+    /// record flipped the row back to "Plugin update available" over an
+    /// install the read-back had just proven current, with an update button
+    /// whose run was a no-op. The headerless hook must cost nothing.
+    @MainActor
+    func testAHeaderlessHookAfterASuccessfulUpdateRunDoesNotFlagThePluginAgain() async throws {
+        let registry = try makeRegistry()
+        let sshFS = StubSSHConfigFileSystem()
+        let recorder = SetupFlowRecorder()
+        var script = SetupFlowScript()
+        script.pluginVersionBefore = "1.9.0"
+        let service = ClaudeRemoteEnrollmentService(
+            runner: setupFlowRunner(script: script, recorder: recorder),
+            sshConfigFileSystem: sshFS
+        )
+        let listener = StubClaudeRemoteListener(hosts: registry)
+        listener.isListening = true
+        let model = setupFlowModel(registry: registry, listener: listener, service: service)
+        model.enrollLabel = "buildhost"
+        model.enrollSSHAlias = "builder"
+        await model.enroll()
+        let hostID = try XCTUnwrap(model.hosts.first?.id)
+        let presentation = try XCTUnwrap(model.presentedPlan)
+        sshFS.configText = ClaudeRemoteEnrollmentService.applySSHConfigSnippet(
+            to: "", snippet: presentation.plan.sshConfigSnippet, hostID: hostID
+        )
+        model.dismissPlan()
+
+        // The field state before anything: only old-plugin hooks have spoken.
+        registry.notePluginVersion(hostID: hostID, .headerAbsent)
+        model.refreshHosts()
+        XCTAssertTrue(model.hosts[0].pluginNeedsUpdate)
+
+        model.requestPluginUpdate(hostID: hostID)
+        model.requestHostUpdateRun()
+        await model.confirmEnrollmentAction()
+        XCTAssertEqual(model.hosts.first?.setupStatusText, "Setup complete. Still manual: Mac shell startup. See Learn more.")
+        XCTAssertFalse(model.hosts[0].pluginNeedsUpdate)
+
+        // A pre-update session's next hook arrives header-less (this is the
+        // exact call the listener would make). The row must stay clear.
+        registry.notePluginVersion(hostID: hostID, .headerAbsent)
+        model.refreshHosts()
+        XCTAssertFalse(
+            model.hosts[0].pluginNeedsUpdate,
+            "an old session's headerless hook must not re-flag a verified update"
+        )
+    }
+
     /// Tonight's failure, made visible: the app knew connections were being
     /// rejected and said nothing anywhere the user would look.
-    func testRejectedConnectionsSurfaceAsOneShortInlineMessage() throws {
+    func testRejectedConnectionsSurfaceAsOneShortInlineMessageAndAModelWithNoListenerInventsNone() throws {
         let registry = try makeRegistry()
-        let listener = StubListener(hosts: registry)
+        let listener = StubClaudeRemoteListener(hosts: registry)
         let model = makeModel(registry: registry, listener: listener)
         XCTAssertNil(model.rejectionHint, "nothing rejected, nothing to say")
 
-        listener.rejectionSnapshot = ClaudeRemoteRejectionTally.Snapshot(missingToken: 42)
+        listener.rejectionSnapshot = ClaudeRemoteRejectionTally.Snapshot(emptyCredential: 42)
         model.refreshHosts()
 
         let hint = try XCTUnwrap(model.rejectionHint)
@@ -1632,6 +1853,11 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
         // Owner rule: no long text in the pane.
         XCTAssertLessThan(hint.count, 110)
         XCTAssertFalse(hint.contains("\n"))
+
+        // With no listener at all the pane never invents a hint.
+        let bare = makeModel(registry: nil, listener: nil)
+        bare.refreshRejectionHint()
+        XCTAssertNil(bare.rejectionHint)
     }
 
     func testTheHintNamesWhichKindOfRejectionItWas() {
@@ -1640,35 +1866,600 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
         }
         XCTAssertNil(hint(ClaudeRemoteRejectionTally.Snapshot()))
         XCTAssertEqual(
-            hint(ClaudeRemoteRejectionTally.Snapshot(missingToken: 1)),
-            "Rejected connections detected — a host may have an outdated plugin — use Update Plugin."
+            hint(ClaudeRemoteRejectionTally.Snapshot(emptyCredential: 1)),
+            "Rejected connections suggest an outdated plugin; use Update host."
         )
         XCTAssertEqual(
             hint(ClaudeRemoteRejectionTally.Snapshot(unknownToken: 1)),
-            "Rejected connections detected — a host may have a stale token — rotate it and re-run setup."
+            "Rejected connections suggest a stale token; rotate it and rerun setup."
         )
         XCTAssertEqual(
-            hint(ClaudeRemoteRejectionTally.Snapshot(missingToken: 1, unknownToken: 1)),
-            "Rejected connections detected — a host may have an outdated plugin or a stale token."
+            hint(ClaudeRemoteRejectionTally.Snapshot(emptyCredential: 1, unknownToken: 1)),
+            "Rejected connections suggest an outdated plugin or a stale token."
         )
         XCTAssertEqual(
             hint(ClaudeRemoteRejectionTally.Snapshot(malformedAuthorization: 1)),
-            "Rejected connections detected — a host may have a malformed authorization header."
+            "Rejected connections suggest a malformed authorization header."
         )
         for snapshot in [
-            ClaudeRemoteRejectionTally.Snapshot(missingToken: 1),
+            ClaudeRemoteRejectionTally.Snapshot(emptyCredential: 1),
             ClaudeRemoteRejectionTally.Snapshot(unknownToken: 1),
-            ClaudeRemoteRejectionTally.Snapshot(missingToken: 1, unknownToken: 1),
+            ClaudeRemoteRejectionTally.Snapshot(emptyCredential: 1, unknownToken: 1),
             ClaudeRemoteRejectionTally.Snapshot(malformedAuthorization: 1),
         ] {
             XCTAssertLessThan(hint(snapshot)?.count ?? .max, 110)
         }
     }
 
-    func testAModelWithNoListenerNeverInventsAHint() {
-        let model = makeModel(registry: nil, listener: nil)
-        model.refreshRejectionHint()
+    /// The hint's whole sentence is "a HOST may have <fault>", and a connection
+    /// that sent no credential is not a host's hook — the app's own verify probe
+    /// looks exactly like this. Raising a fault for it would put the log's old
+    /// phantom into the pane, where the user cannot even go read the detail.
+    func testAnUnauthenticatedProbeRaisesNoHintAtAll() throws {
+        let registry = try makeRegistry()
+        let listener = StubClaudeRemoteListener(hosts: registry)
+        let model = makeModel(registry: registry, listener: listener)
+
+        listener.rejectionSnapshot = ClaudeRemoteRejectionTally.Snapshot(absentAuthorization: 9)
+        model.refreshHosts()
         XCTAssertNil(model.rejectionHint)
+
+        // A real fault alongside the probes still speaks, and still names only
+        // the fault: the probes never become part of the diagnosis.
+        listener.rejectionSnapshot =
+            ClaudeRemoteRejectionTally.Snapshot(absentAuthorization: 9, unknownToken: 1)
+        model.refreshHosts()
+        XCTAssertEqual(
+            model.rejectionHint,
+            "Rejected connections suggest a stale token; rotate it and rerun setup."
+        )
+    }
+
+    // MARK: Step 3 — in-app verification
+
+    /// Collects probe invocations. A class rather than a `Mutex` because
+    /// `Mutex` is noncopyable and cannot be an optional parameter.
+    private final class InvocationLog: @unchecked Sendable {
+        private let storage = Mutex<[ClaudeRemoteEnrollmentService.Invocation]>([])
+        var all: [ClaudeRemoteEnrollmentService.Invocation] { storage.withLock { $0 } }
+        func record(_ invocation: ClaudeRemoteEnrollmentService.Invocation) {
+            storage.withLock { $0.append(invocation) }
+        }
+    }
+
+    /// Both probes answer healthily; whether that counts as a pass is the
+    /// model's call, because only it knows about this Mac's listener.
+    private func healthyVerificationService(
+        recording log: InvocationLog? = nil
+    ) -> ClaudeRemoteEnrollmentService {
+        let index = Mutex(0)
+        return ClaudeRemoteEnrollmentService(runner: { invocation in
+            log?.record(invocation)
+            let call = index.withLock { value -> Int in
+                defer { value += 1 }
+                return value
+            }
+            return call == 0
+                ? .init(exitCode: 0, message: "LVX_HTTP:401")
+                : .init(exitCode: 0, message: "localvoxtral-remote@localvoxtral")
+        })
+    }
+
+    private func listeningModel(
+        registry: ClaudeRemoteHostRegistry,
+        service: ClaudeRemoteEnrollmentService,
+        remoteForwardPort: UInt16 = ClaudeRemoteForwardPort.legacyPort
+    ) async -> ClaudeIntegrationSettingsModel {
+        let model = makeModel(
+            registry: registry,
+            listener: StubClaudeRemoteListener(hosts: registry),
+            enrollmentService: service,
+            remoteForwardPort: remoteForwardPort
+        )
+        model.enrollLabel = "buildhost"
+        model.enrollSSHAlias = "builder"
+        await model.enroll()
+        return model
+    }
+
+    func testCheckSetupPublishesInterpretedVerdictsAndNeedsNoConfirmation() async throws {
+        let registry = try makeRegistry()
+        let log = InvocationLog()
+        let model = await listeningModel(
+            registry: registry, service: healthyVerificationService(recording: log)
+        )
+        XCTAssertTrue(model.verificationChecks.isEmpty, "a sheet must not spawn ssh on opening")
+
+        await model.runVerification()
+
+        // Read-only, so there is deliberately no confirmation gate here — that
+        // gate exists for actions that WRITE.
+        XCTAssertNil(model.enrollmentConfirmation)
+        XCTAssertEqual(model.verificationChecks.map(\.passed), [true, true])
+        XCTAssertNil(model.alert, "all-pass must not raise an alert")
+        XCTAssertEqual(log.all.count, 2)
+        XCTAssertFalse(model.isPerformingVerification)
+    }
+
+    /// Review finding, round 1: the 401 verdict needs a fact only this Mac has.
+    func testA401WithNoLocalListenerIsReportedAsASquatterNotAPass() async throws {
+        let registry = try makeRegistry()
+        let listener = StubClaudeRemoteListener(hosts: registry)
+        listener.bindError = ClaudeRemoteContextListener.StartFailure.bindFailed(errno: EADDRINUSE)
+        let model = makeModel(
+            registry: registry,
+            listener: listener,
+            enrollmentService: healthyVerificationService()
+        )
+        model.enrollLabel = "buildhost"
+        model.enrollSSHAlias = "builder"
+        await model.enroll()
+        XCTAssertEqual(model.listenerStatus, .portConflict(port: 8473))
+        model.alert = nil
+
+        await model.runVerification()
+
+        let tunnel = try XCTUnwrap(model.verificationChecks.first { $0.kind == .tunnel })
+        XCTAssertFalse(
+            tunnel.passed,
+            "a squatter on our listener port answers forwarded requests too, and its 401 is not ours"
+        )
+        XCTAssertTrue(tunnel.summary.contains("Something else answered"))
+        XCTAssertTrue(model.alert?.detail.contains("not listening") ?? false)
+    }
+
+    func testAFailedCheckIsAShortLineInTheSheetAndTheDetailGoesToTheAlert() async throws {
+        let registry = try makeRegistry()
+        let service = ClaudeRemoteEnrollmentService(runner: { _ in
+            .init(exitCode: 255, message: String(repeating: "ssh debug line\n", count: 100))
+        })
+        let model = await listeningModel(registry: registry, service: service)
+
+        await model.runVerification()
+
+        let tunnel = try XCTUnwrap(model.verificationChecks.first { $0.kind == .tunnel })
+        XCTAssertFalse(tunnel.passed)
+        // Owner rule: the sheet gets one sentence, the alert and the log get
+        // the diagnostics.
+        XCTAssertLessThan(tunnel.summary.count, 80)
+        XCTAssertFalse(tunnel.summary.contains("ssh debug line"))
+        XCTAssertTrue(model.alert?.detail.contains("255") ?? false)
+        // And the host's own bytes are in NEITHER, by construction.
+        XCTAssertFalse(model.alert?.detail.contains("ssh debug line") ?? true)
+    }
+
+    /// Review finding, round 1. `claude plugin list` prints the plugin's stored
+    /// config; after a rotation that is the host's OLD token, which this model
+    /// cannot redact because it only ever knew the new one. The guarantee that
+    /// survives rotation is that no probe output travels at all.
+    func testAnOldTokenEchoedByTheHostCannotReachTheAlertOrTheChecks() async throws {
+        let registry = try makeRegistry()
+        let staleToken = Mutex("")
+        let service = ClaudeRemoteEnrollmentService(runner: { _ in
+            .init(
+                exitCode: 0,
+                message: "LVX_HTTP:401\nlocalvoxtral-remote@localvoxtral config: token=\(staleToken.withLock { $0 })"
+            )
+        })
+        let model = await listeningModel(registry: registry, service: service)
+        // The token the host still has configured is the pre-rotation one.
+        let old = try XCTUnwrap(model.presentedPlan).token
+        staleToken.withLock { $0 = old }
+        model.dismissPlan()
+        await model.rotate(hostID: try XCTUnwrap(model.hosts.first).id)
+        let new = try XCTUnwrap(model.presentedPlan).token
+        XCTAssertNotEqual(old, new)
+
+        await model.runVerification()
+
+        for check in model.verificationChecks {
+            XCTAssertFalse(check.summary.contains(old))
+            XCTAssertFalse(check.hint?.contains(old) ?? false)
+            XCTAssertFalse(check.detail.contains(old), check.detail)
+        }
+        XCTAssertFalse(model.alert?.detail.contains(old) ?? false)
+    }
+
+    func testAnEnrollmentActionAndACheckCannotInterleave() async throws {
+        let registry = try makeRegistry()
+        let (gate, releaseGate) = AsyncStream.makeStream(of: Void.self)
+        let model = ClaudeIntegrationSettingsModel(
+            registry: registry,
+            listener: StubClaudeRemoteListener(hosts: registry),
+            pluginService: { StubClaudePluginService() },
+            enrollmentService: healthyVerificationService(),
+            performAsync: { _ in nil },
+            performEnrollmentAsync: { _ in ClaudeEnrollmentActionAttempt(steps: [], failure: nil) },
+            performVerificationAsync: { body in
+                // Park until released — cooperative yields only, no wall-clock.
+                var latch = gate.makeAsyncIterator()
+                _ = await latch.next()
+                do {
+                    return ClaudeVerificationAttempt(checks: try body(), failure: nil)
+                } catch {
+                    return ClaudeVerificationAttempt(
+                        checks: [], failure: ClaudeEnrollmentActionFailure(error)
+                    )
+                }
+            },
+            now: { Date(timeIntervalSince1970: 1_000_000) }
+        )
+        model.enrollLabel = "buildhost"
+        model.enrollSSHAlias = "builder"
+        await model.enroll()
+
+        let inFlight = Task { await model.runVerification() }
+        await awaitCondition { model.isPerformingVerification }
+        XCTAssertTrue(model.isEnrollmentBusy)
+
+        // Every write path must refuse while a check runs: they share the sheet,
+        // the seams, and the result rows.
+        model.requestHostSetup()
+        model.requestPluginUpdate(hostID: try XCTUnwrap(model.hosts.first).id)
+        XCTAssertNil(model.enrollmentConfirmation)
+        XCTAssertNil(model.presentedPluginUpdate)
+        await model.runVerification()
+
+        releaseGate.yield(())
+        releaseGate.finish()
+        await inFlight.value
+        XCTAssertEqual(model.verificationChecks.count, 2)
+    }
+
+    func testALateCheckResultFromBeforeARotationNeverSurfacesUnderTheNewToken() async throws {
+        let registry = try makeRegistry()
+        let (gate, releaseGate) = AsyncStream.makeStream(of: Void.self)
+        let model = ClaudeIntegrationSettingsModel(
+            registry: registry,
+            listener: StubClaudeRemoteListener(hosts: registry),
+            pluginService: { StubClaudePluginService() },
+            enrollmentService: healthyVerificationService(),
+            performAsync: { _ in nil },
+            performEnrollmentAsync: { _ in ClaudeEnrollmentActionAttempt(steps: [], failure: nil) },
+            performVerificationAsync: { body in
+                var latch = gate.makeAsyncIterator()
+                _ = await latch.next()
+                do {
+                    return ClaudeVerificationAttempt(checks: try body(), failure: nil)
+                } catch {
+                    return ClaudeVerificationAttempt(
+                        checks: [], failure: ClaudeEnrollmentActionFailure(error)
+                    )
+                }
+            },
+            now: { Date(timeIntervalSince1970: 1_000_000) }
+        )
+        model.enrollLabel = "buildhost"
+        model.enrollSSHAlias = "builder"
+        await model.enroll()
+        let hostID = try XCTUnwrap(model.presentedPlan).host.id
+
+        let inFlight = Task { await model.runVerification() }
+        await awaitCondition { model.isPerformingVerification }
+
+        model.dismissPlan()
+        await model.rotate(hostID: hostID)
+        XCTAssertEqual(
+            model.presentedPlan?.host.id, hostID,
+            "rotation reuses the host id — that reuse is the trap"
+        )
+
+        releaseGate.yield(())
+        releaseGate.finish()
+        await inFlight.value
+
+        XCTAssertTrue(
+            model.verificationChecks.isEmpty,
+            "a check from the previous generation must not render under the rotation sheet"
+        )
+    }
+
+    func testDismissingTheSheetClearsTheVerdicts() async throws {
+        let registry = try makeRegistry()
+        let model = await listeningModel(registry: registry, service: healthyVerificationService())
+        await model.runVerification()
+        XCTAssertFalse(model.verificationChecks.isEmpty)
+
+        model.dismissPlan()
+
+        XCTAssertTrue(model.verificationChecks.isEmpty)
+    }
+
+    func testCheckSetupIsUnavailableWithoutARunnerAndSaysSo() async throws {
+        let registry = try makeRegistry()
+        let model = await listeningModel(
+            registry: registry, service: ClaudeRemoteEnrollmentService()
+        )
+
+        await model.runVerification()
+
+        XCTAssertTrue(model.verificationChecks.isEmpty)
+        XCTAssertEqual(model.alert?.detail, "Checking the setup is not available in this build.")
+    }
+
+    /// MAJOR 1 (review round 2): the listener fact handed to the service is up
+    /// to a full timeout old by the time the verdicts come back. A listener that
+    /// died in between leaves the port to whoever takes it next, and that
+    /// squatter's 401 is indistinguishable from ours over the wire — so the ✓
+    /// requires bound at BOTH moments, and this pins the second one.
+    func testAListenerThatDiesDuringTheProbesCannotLeaveAStalePass() async throws {
+        let registry = try makeRegistry()
+        let (gate, releaseGate) = AsyncStream.makeStream(of: Void.self)
+        let listener = StubClaudeRemoteListener(hosts: registry)
+        let model = ClaudeIntegrationSettingsModel(
+            registry: registry,
+            listener: listener,
+            pluginService: { StubClaudePluginService() },
+            enrollmentService: healthyVerificationService(),
+            performAsync: { _ in nil },
+            performEnrollmentAsync: { _ in ClaudeEnrollmentActionAttempt(steps: [], failure: nil) },
+            performVerificationAsync: { body in
+                // The probes run while the test kills the listener — cooperative
+                // yields only, no wall-clock.
+                var latch = gate.makeAsyncIterator()
+                _ = await latch.next()
+                do {
+                    return ClaudeVerificationAttempt(checks: try body(), failure: nil)
+                } catch {
+                    return ClaudeVerificationAttempt(
+                        checks: [], failure: ClaudeEnrollmentActionFailure(error)
+                    )
+                }
+            },
+            now: { Date(timeIntervalSince1970: 1_000_000) }
+        )
+        model.enrollLabel = "buildhost"
+        model.enrollSSHAlias = "builder"
+        await model.enroll()
+        XCTAssertEqual(model.listenerStatus, .listening(port: 8473))
+        XCTAssertTrue(model.listenerIsBound, "bound when the probes are launched")
+
+        let inFlight = Task { await model.runVerification() }
+        await awaitCondition { model.isPerformingVerification }
+
+        // …and gone by the time they answer: our bind dropped and something
+        // else now holds the port.
+        listener.isListening = false
+        listener.bindError = ClaudeRemoteContextListener.StartFailure.bindFailed(errno: EADDRINUSE)
+        model.retryListener()
+        XCTAssertEqual(model.listenerStatus, .portConflict(port: 8473))
+
+        releaseGate.yield(())
+        releaseGate.finish()
+        await inFlight.value
+
+        let tunnel = try XCTUnwrap(model.verificationChecks.first { $0.kind == .tunnel })
+        XCTAssertFalse(
+            tunnel.passed,
+            "the 401 that arrived was answered by whatever holds the port now, not by us"
+        )
+        XCTAssertTrue(tunnel.summary.contains("Something else answered"))
+    }
+
+    /// MINOR 1 (review round 2): a legacy host with no stored alias shows the
+    /// placeholder, and checking `your-ssh-host` would report on whatever
+    /// machine answers to that name — a wrong answer that looks like an answer.
+    func testAHostWithNoStoredAliasCannotBeChecked() async throws {
+        let registry = try makeRegistry()
+        let service = ClaudeRemoteEnrollmentService(runner: { _ in
+            XCTFail("a placeholder alias must never reach ssh")
+            return .init(exitCode: 0, message: "")
+        })
+        let model = makeModel(
+            registry: registry,
+            listener: StubClaudeRemoteListener(hosts: registry),
+            enrollmentService: service
+        )
+        // A host from before aliases were persisted.
+        let enrollment = try registry.enroll(label: "legacy")
+        model.refreshHosts()
+        await model.rotate(hostID: enrollment.host.id)
+
+        let presentation = try XCTUnwrap(model.presentedPlan)
+        XCTAssertFalse(presentation.canRunRemoteSetup)
+        XCTAssertEqual(presentation.sshHostAlias, ClaudeIntegrationSettingsModel.unknownAliasPlaceholder)
+
+        await model.runVerification()
+
+        XCTAssertTrue(model.verificationChecks.isEmpty, "no alias, no checks — and no guessing")
+        XCTAssertNil(model.alert, "the sheet already explains why; a modal would be noise")
+    }
+
+    /// MINOR 1 (review round 3), model half: the check follows `~/.ssh/config`,
+    /// so a host whose block still forwards the legacy port is DIAGNOSED
+    /// ("re-run step 1") instead of misreported as a dead tunnel.
+    func testAStaleSSHConfigPortIsProbedAndNamedRatherThanMisdiagnosed() async throws {
+        let registry = try makeRegistry()
+        let log = InvocationLog()
+        // The user's config still forwards 8473 for this host…
+        let filesystem = StubSSHConfigFileSystem()
+        let model = makeModel(
+            registry: registry,
+            listener: StubClaudeRemoteListener(hosts: registry),
+            enrollmentService: ClaudeRemoteEnrollmentService(
+                runner: { invocation in
+                    log.record(invocation)
+                    return .init(exitCode: 0, message: "LVX_HTTP:401")
+                },
+                sshConfigFileSystem: filesystem
+            ),
+            // …while THIS install allocates a different one.
+            remoteForwardPort: 28542
+        )
+        model.enrollLabel = "buildhost"
+        model.enrollSSHAlias = "builder"
+        await model.enroll()
+        let hostID = try XCTUnwrap(model.presentedPlan).host.id
+        filesystem.configText = """
+        # BEGIN localvoxtral claude context (\(hostID))
+        Host builder
+            RemoteForward 8473 127.0.0.1:8473
+            ExitOnForwardFailure no
+        # END localvoxtral claude context (\(hostID))
+        """
+
+        await model.runVerification()
+
+        let script = String(decoding: log.all[0].standardInput, as: UTF8.self)
+        XCTAssertTrue(
+            script.contains("127.0.0.1:8473"),
+            "the probe must ask about the tunnel that EXISTS, not the one the plan describes"
+        )
+        XCTAssertFalse(script.contains("28542"))
+        let tunnel = try XCTUnwrap(model.verificationChecks.first { $0.kind == .tunnel })
+        XCTAssertFalse(tunnel.passed)
+        XCTAssertTrue(tunnel.summary.contains("8473"))
+        XCTAssertTrue(try XCTUnwrap(tunnel.hint).contains("28542"))
+        XCTAssertTrue(try XCTUnwrap(tunnel.hint).contains("step 1"))
+    }
+
+    func testAConfigThatAlreadyForwardsThisMacsPortIsProbedAsUsual() async throws {
+        let registry = try makeRegistry()
+        let log = InvocationLog()
+        let filesystem = StubSSHConfigFileSystem()
+        let model = makeModel(
+            registry: registry,
+            listener: StubClaudeRemoteListener(hosts: registry),
+            enrollmentService: ClaudeRemoteEnrollmentService(
+                runner: { invocation in
+                    log.record(invocation)
+                    return .init(exitCode: 0, message: "LVX_HTTP:401")
+                },
+                sshConfigFileSystem: filesystem
+            ),
+            remoteForwardPort: 28542
+        )
+        model.enrollLabel = "buildhost"
+        model.enrollSSHAlias = "builder"
+        await model.enroll()
+        let presentation = try XCTUnwrap(model.presentedPlan)
+        filesystem.configText = ClaudeRemoteEnrollmentService.applySSHConfigSnippet(
+            to: "", snippet: presentation.plan.sshConfigSnippet, hostID: presentation.host.id
+        )
+
+        await model.runVerification()
+
+        let script = String(decoding: log.all[0].standardInput, as: UTF8.self)
+        XCTAssertTrue(script.contains("127.0.0.1:28542"))
+        XCTAssertTrue(try XCTUnwrap(model.verificationChecks.first { $0.kind == .tunnel }).passed)
+    }
+
+    func testWithNoBlockOnDiskTheCheckFallsBackToThePlansPort() async throws {
+        // Nothing written yet — the ordinary state right after enrolling, and
+        // the plan's port is the only thing there is to ask about.
+        let registry = try makeRegistry()
+        let log = InvocationLog()
+        let model = makeModel(
+            registry: registry,
+            listener: StubClaudeRemoteListener(hosts: registry),
+            enrollmentService: ClaudeRemoteEnrollmentService(
+                runner: { invocation in
+                    log.record(invocation)
+                    return .init(exitCode: 0, message: "LVX_HTTP:401")
+                },
+                sshConfigFileSystem: StubSSHConfigFileSystem()
+            ),
+            remoteForwardPort: 28542
+        )
+        model.enrollLabel = "buildhost"
+        model.enrollSSHAlias = "builder"
+        await model.enroll()
+
+        await model.runVerification()
+
+        let script = String(decoding: log.all[0].standardInput, as: UTF8.self)
+        XCTAssertTrue(script.contains("127.0.0.1:28542"))
+        XCTAssertFalse(script.contains("8473"), "the legacy port is not this Mac's tunnel")
+        XCTAssertTrue(try XCTUnwrap(model.verificationChecks.first { $0.kind == .tunnel }).passed)
+    }
+
+    /// MINOR 3 (review round 3): a verdict about the setup BEFORE a mutation
+    /// must not sit beside that mutation's result, where it reads as describing
+    /// the state after it.
+    func testStartingAMutationClearsTheVerdictsItWouldOtherwiseOutlive() async throws {
+        let registry = try makeRegistry()
+        let model = await listeningModel(registry: registry, service: healthyVerificationService())
+        await model.runVerification()
+        XCTAssertFalse(model.verificationChecks.isEmpty)
+
+        model.requestHostSetup()
+
+        XCTAssertTrue(
+            model.verificationChecks.isEmpty,
+            "the checks described the config before this run"
+        )
+    }
+
+    // MARK: Screenshot preview
+
+    /// The preview sheet exists to be photographed. It must be incapable of
+    /// touching the registry, `~/.ssh/config`, or an ssh process — so both
+    /// mutating seams fail the test if they are reached at all.
+    func testThePreviewSheetCannotReachTheRunnerOrTheFilesystem() async throws {
+        let registry = try makeRegistry()
+        let fileSystem = RecordingSSHConfigFileSystem()
+        let service = ClaudeRemoteEnrollmentService(
+            runner: { _ in
+                XCTFail("a preview must never spawn ssh")
+                return .init(exitCode: 0, message: "")
+            },
+            sshConfigFileSystem: fileSystem
+        )
+        let model = makeModel(
+            registry: registry,
+            listener: StubClaudeRemoteListener(hosts: registry),
+            enrollmentService: service
+        )
+
+        model.presentPreviewPlan()
+
+        let presentation = try XCTUnwrap(model.presentedPlan)
+        XCTAssertTrue(presentation.isPreview)
+        XCTAssertEqual(presentation.host.label, "build-host")
+        XCTAssertTrue(presentation.token.hasPrefix("lvx-preview-"), "a preview token must read as fake")
+        XCTAssertTrue(model.hosts.isEmpty, "a preview must not enroll anything")
+        XCTAssertNil(
+            registry.authenticate(token: presentation.token),
+            "the sample credential must authenticate nothing"
+        )
+
+        model.requestHostSetup()
+        await model.confirmEnrollmentAction()
+        await model.runVerification()
+
+        XCTAssertNil(model.enrollmentConfirmation)
+        XCTAssertNil(model.setupRun)
+        XCTAssertTrue(model.verificationChecks.isEmpty)
+        XCTAssertEqual(fileSystem.readCount, 0)
+        XCTAssertEqual(fileSystem.writeCount, 0)
+    }
+
+    func testThePreviewNeverReplacesARealSheet() async throws {
+        let registry = try makeRegistry()
+        let model = makeModel(registry: registry, listener: StubClaudeRemoteListener(hosts: registry))
+        model.enrollLabel = "buildhost"
+        model.enrollSSHAlias = "builder"
+        await model.enroll()
+        let real = try XCTUnwrap(model.presentedPlan)
+
+        model.presentPreviewPlan()
+
+        XCTAssertEqual(model.presentedPlan, real)
+        XCTAssertFalse(try XCTUnwrap(model.presentedPlan).isPreview)
+    }
+
+    func testThePreviewIsOffUnlessTheDebugDefaultIsArmed() throws {
+        let suiteName = "lvx-preview-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        XCTAssertFalse(ClaudeIntegrationSettingsModel.isEnrollmentSheetPreviewArmed(defaults: defaults))
+        defaults.set(true, forKey: ClaudeIntegrationSettingsModel.enrollmentSheetPreviewDefaultsKey)
+        XCTAssertTrue(ClaudeIntegrationSettingsModel.isEnrollmentSheetPreviewArmed(defaults: defaults))
+        // `debug.` prefixed: not a product preference, never in the Settings UI.
+        XCTAssertTrue(
+            ClaudeIntegrationSettingsModel.enrollmentSheetPreviewDefaultsKey.hasPrefix("debug.")
+        )
     }
 
     func testAnUnreadableRegistryDisablesTheRemoteSurfaceRatherThanFailingSilently() {
@@ -1679,4 +2470,1103 @@ final class ClaudeIntegrationSettingsModelTests: XCTestCase {
         XCTAssertFalse(model.isRemoteAvailable)
         XCTAssertTrue(model.hosts.isEmpty)
     }
+    // MARK: - Shell setup for the plain-ssh join
+
+    private final class StubRCFileSystem: ClaudeShellRCFileSystem, @unchecked Sendable {
+        var state: ClaudeShellRCState
+        var writes = 0
+        var reads = 0
+        init(state: ClaudeShellRCState) { self.state = state }
+        func readState() throws -> ClaudeShellRCState {
+            reads += 1
+            return state
+        }
+        func createDirectory(permissions: UInt16) throws {}
+        func atomicWrite(_ data: Data, permissions: UInt16, replacing _: Data?) throws {
+            writes += 1
+            state.data = data
+            state.fileExists = true
+        }
+    }
+
+    @MainActor
+    private func shellSetupModel(
+        shell: ClaudeShellKind? = .zsh,
+        fileSystem: StubRCFileSystem? = nil,
+        crossing: ClaudeShellSetupStatus.CrossingState = .noSessions
+    ) -> ClaudeIntegrationSettingsModel {
+        let stub = fileSystem
+        return ClaudeIntegrationSettingsModel(
+            registry: nil,
+            listener: nil,
+            pluginService: { StubClaudePluginService() },
+            performAsync: { body in
+                do {
+                    try body()
+                    return nil
+                } catch {
+                    return ClaudePluginActionFailure(error)
+                }
+            },
+            loginShell: { shell },
+            shellRCWriter: { _ in stub.map { ClaudeShellRCWriter(fileSystem: $0) } },
+            liveLocalTTYReport: { crossing }
+        )
+    }
+
+    @MainActor
+    func testShellSetupReportsBothHalvesSeparately() {
+        // Two facts that fail for different reasons: the block is in the rc
+        // file, and a session has actually arrived carrying the value. A block
+        // written five seconds ago proves nothing until a NEW ssh session
+        // starts, and saying so is the point of the second half.
+        let fileSystem = StubRCFileSystem(state: ClaudeShellRCState(
+            fileExists: true, data: Data("export EDITOR=vim\n".utf8), permissions: 0o644
+        ))
+        let model = shellSetupModel(fileSystem: fileSystem, crossing: .notSeen)
+        model.refreshShellSetupStatus()
+        XCTAssertEqual(model.shellSetupStatus.rc, .notApplied)
+        XCTAssertEqual(model.shellSetupStatus.crossing, .notSeen)
+        XCTAssertEqual(model.shellSetupStatus.rcSentence, "Not set up.")
+        XCTAssertEqual(
+            model.shellSetupStatus.crossingSentence,
+            "Open a new terminal window for it to take effect."
+        )
+    }
+
+    func testShellSetupButtonsFollowTheRCState() {
+        // This build's block gets no setup button, since writing it again
+        // changes nothing; an older one gets Update…; no clean block, no Remove.
+        let cases: [(ClaudeShellSetupStatus.RCState, String?, Bool)] = [
+            (.unsupportedShell, "Set up…", false),
+            (.notApplied, "Set up…", false),
+            (.applied, nil, true),
+            (.outdated, "Update…", true),
+            (.unknown, "Set up…", false),
+        ]
+        for (rc, title, remove) in cases {
+            let status = ClaudeShellSetupStatus(rc: rc)
+            XCTAssertEqual(status.setupButtonTitle, title, "\(rc)")
+            XCTAssertEqual(status.offersRemove, remove, "\(rc)")
+            XCTAssertFalse(status.offersManualSteps, "\(rc)")
+        }
+    }
+
+    /// Every write refuses a symlinked rc file (or directory), so the row
+    /// offers no button that writes; a missing or older block points at the
+    /// manual steps instead.
+    @MainActor
+    func testASymlinkedRCFileOffersTheManualStepsInsteadOfButtons() {
+        // Shaped like the live reader's states: it never reads through a
+        // link, so a symlinked file that exists comes back with no data.
+        let cases: [(ClaudeShellRCState, ClaudeShellSetupStatus.RCState, Bool)] = [
+            (ClaudeShellRCState(fileExists: false, directoryIsSymlink: true), .notApplied, true),
+            (ClaudeShellRCState(fileExists: true, fileIsSymlink: true, data: nil), .unknown, true),
+            (ClaudeShellRCState(fileExists: true, directoryIsSymlink: true, data: nil), .unknown, true),
+        ]
+        for (state, rc, manual) in cases {
+            let model = shellSetupModel(fileSystem: StubRCFileSystem(state: state))
+            model.refreshShellSetupStatus()
+            XCTAssertEqual(model.shellSetupStatus.rc, rc, "\(state)")
+            XCTAssertTrue(model.shellSetupStatus.isSymlinked)
+            XCTAssertNil(model.shellSetupStatus.setupButtonTitle, "\(state)")
+            XCTAssertFalse(model.shellSetupStatus.offersRemove, "\(state)")
+            XCTAssertEqual(model.shellSetupStatus.offersManualSteps, manual, "\(state)")
+        }
+    }
+
+    /// One read per refresh, so a save between two reads cannot mix answers.
+    @MainActor
+    func testShellSetupStatusReadsTheRCFileOnce() {
+        let fileSystem = StubRCFileSystem(state: ClaudeShellRCState(
+            fileExists: true, data: Data("\(ClaudeShellRCSetup.snippet(for: .zsh))\n".utf8)
+        ))
+        let model = shellSetupModel(fileSystem: fileSystem)
+        model.refreshShellSetupStatus()
+        XCTAssertEqual(fileSystem.reads, 1)
+        XCTAssertEqual(model.shellSetupStatus.rc, .applied)
+    }
+
+    @MainActor
+    func testAnOlderShellBlockReadsOutdatedAndSetupRewritesIt() async {
+        let older = ClaudeShellRCSetup.snippet(for: .zsh)
+            .replacingOccurrences(of: "# Publishes", with: "# Exports")
+        let fileSystem = StubRCFileSystem(state: ClaudeShellRCState(
+            fileExists: true, data: Data("export EDITOR=vim\n\n\(older)\n".utf8), permissions: 0o644
+        ))
+        let model = shellSetupModel(fileSystem: fileSystem)
+        model.refreshShellSetupStatus()
+        XCTAssertEqual(model.shellSetupStatus.rc, .outdated)
+        XCTAssertEqual(model.shellSetupStatus.rcSentence, "Update available.")
+
+        await model.applyShellSetup()
+        XCTAssertEqual(model.shellSetupStatus.rc, .applied)
+        XCTAssertNil(model.shellSetupStatus.setupButtonTitle)
+    }
+
+    @MainActor
+    func testApplyingTheShellSetupWritesTheBlockAndTheStatusFollows() async {
+        let fileSystem = StubRCFileSystem(state: ClaudeShellRCState(
+            fileExists: true, data: Data("export EDITOR=vim\n".utf8), permissions: 0o644
+        ))
+        let model = shellSetupModel(fileSystem: fileSystem, crossing: .seen)
+        model.refreshShellSetupStatus()
+        XCTAssertEqual(model.shellSetupStatus.rc, .notApplied)
+        XCTAssertEqual(
+            model.shellSetupConsentSentence,
+            "localvoxtral will edit ~/.zshrc on this Mac."
+        )
+        XCTAssertEqual(
+            model.hostSetupConsentSentence(sshHostAlias: "builder"),
+            "localvoxtral will edit ~/.ssh/config and ~/.zshrc on this Mac and install "
+                + "its Claude Code plugin on builder, plus its Mistral Vibe hooks if Vibe is installed there."
+        )
+        XCTAssertFalse(model.hostSetupConsentSentence(sshHostAlias: "builder").contains("export"))
+
+        await model.applyShellSetup()
+        XCTAssertEqual(fileSystem.writes, 1)
+        XCTAssertEqual(model.shellSetupStatus.rc, .applied, "the row reflects the write")
+        XCTAssertEqual(model.shellSetupStatus.crossingSentence,
+                       "A remote session is reporting its terminal.")
+        XCTAssertNil(model.alert)
+
+        await model.removeShellSetup()
+        XCTAssertEqual(fileSystem.writes, 2)
+        XCTAssertEqual(model.shellSetupStatus.rc, .notApplied)
+    }
+
+    @MainActor
+    func testAnUnsupportedLoginShellOffersNothingRatherThanGuessing() {
+        let model = shellSetupModel(shell: nil, fileSystem: StubRCFileSystem(
+            state: ClaudeShellRCState()
+        ))
+        model.refreshShellSetupStatus()
+        XCTAssertEqual(model.shellSetupStatus.rc, .unsupportedShell)
+        XCTAssertFalse(model.canApplyShellSetup)
+    }
+
+    @MainActor
+    func testAnUnwritableRCFileReportsUnknownRatherThanNotApplied() {
+        // "Not set up" invites a click that cannot work; "could not read"
+        // sends the user to the copy-paste path.
+        let model = shellSetupModel(fileSystem: nil)
+        model.refreshShellSetupStatus()
+        XCTAssertEqual(model.shellSetupStatus.rc, .unknown)
+    }
+
+    @MainActor
+    func testASymlinkedRCFileSurfacesAsAnAlertRatherThanSilence() async {
+        let fileSystem = StubRCFileSystem(state: ClaudeShellRCState(
+            fileExists: true, fileIsSymlink: true
+        ))
+        let model = shellSetupModel(fileSystem: fileSystem)
+        await model.applyShellSetup()
+        XCTAssertEqual(fileSystem.writes, 0, "a dotfiles symlink is never written through")
+        XCTAssertEqual(model.alert?.title, "Could not update your shell startup file")
+    }
+
+    // MARK: - One-flow setup run
+
+    private func failedReason(_ state: RemoteHostSetupRun.State) -> String? {
+        if case .failed(let reason, _) = state { return reason }
+        return nil
+    }
+
+    private func setupFlowRunner(
+        script: SetupFlowScript,
+        recorder: SetupFlowRecorder,
+        vibeHost: VibeFakeHost? = nil
+    ) -> ClaudeRemoteEnrollmentService.Runner {
+        let listingCalls = Mutex(0)
+        let vibeRunner = vibeHost?.runner
+        return { invocation in
+            let stdin = String(decoding: invocation.standardInput, as: UTF8.self)
+            // First: the plugin install carries the shims' own text, which
+            // names the Vibe directory, LC_LVX_TTY and SessionStart.
+            if stdin.contains(ClaudeRemoteEnrollmentService.remoteMarketplaceDirectory) {
+                recorder.record(invocation)
+                return script.plugin
+            }
+            // The Vibe scripts really run, against the fake host's own $HOME.
+            if let vibeRunner, stdin.contains(ClaudeRemoteEnrollmentService.vibeRemoteDirectory) {
+                return try vibeRunner(invocation)
+            }
+            recorder.record(invocation)
+            if invocation.argv.contains("-G") {
+                return .init(exitCode: 0, message: script.sendEnvOutput)
+            }
+            if stdin.contains(ClaudeRemoteEnrollmentService.claudeDesktopFramePrefix) {
+                return .init(
+                    exitCode: 0,
+                    message: ClaudeRemoteEnrollmentService.claudeDesktopFramePrefix
+                        + (script.claudeDesktop ? "yes" : "no")
+                )
+            }
+            if stdin.contains("LC_LVX_TTY") {
+                return script.envEchoesBack
+                    ? .init(
+                        exitCode: 0,
+                        message: "Welcome to builder\n"
+                            + ClaudeRemoteEnrollmentService.envProbeFramePrefix
+                            + (invocation.environment["LC_LVX_TTY"] ?? "")
+                            + "\nLast login: today\n"
+                    )
+                    : .init(exitCode: 0, message: "")
+            }
+            // The framed JSON listing runs twice: before the install call
+            // (decides install / update / current) and after it (read-back).
+            if stdin.contains(ClaudeRemoteEnrollmentService.pluginListFrameBegin), script.claudeMissing {
+                return .init(
+                    exitCode: 127,
+                    message: "localvoxtral: 'claude' was not found on this host's non-interactive PATH."
+                )
+            }
+            if stdin.contains(ClaudeRemoteEnrollmentService.pluginListFrameBegin) {
+                let isReadBack = listingCalls.withLock { calls -> Bool in
+                    calls += 1
+                    return calls > 1
+                }
+                let version = isReadBack ? script.pluginVersionAfter : script.pluginVersionBefore
+                return .init(exitCode: 0, message: framedPluginListing(version: version))
+            }
+            if stdin.contains("claude plugin install") { return script.plugin }
+            if stdin.contains("LVX_HERDR") { return script.herdr }
+            if stdin.contains("SessionStart") {
+                return .init(exitCode: 0, message: script.tunnelMessage)
+            }
+            if stdin.contains("claude plugin list") {
+                return .init(exitCode: 0, message: script.pluginListMessage)
+            }
+            return .init(exitCode: 1, message: "unexpected invocation")
+        }
+    }
+
+    @MainActor
+    private func setupFlowModel(
+        registry: ClaudeRemoteHostRegistry,
+        listener: StubClaudeRemoteListener,
+        service: ClaudeRemoteEnrollmentService,
+        shell: ClaudeShellKind? = .zsh,
+        rcFileSystem: StubRCFileSystem? = nil,
+        vibeFiles: @escaping @Sendable () -> VibeRemoteHooksFiles? = { nil },
+        remoteForwardPort: UInt16 = ClaudeRemoteForwardPort.legacyPort
+    ) -> ClaudeIntegrationSettingsModel {
+        let rc = rcFileSystem
+        return makeModel(
+            registry: registry,
+            listener: listener,
+            enrollmentService: service,
+            remoteForwardPort: remoteForwardPort,
+            loginShell: { shell },
+            shellRCWriter: { _ in rc.map { ClaudeShellRCWriter(fileSystem: $0) } },
+            vibeRemoteFiles: vibeFiles
+        )
+    }
+
+    /// Enroll one host and confirm the one-flow setup, returning the model and
+    /// host id for assertions on the finished run.
+    @MainActor
+    private func enrollAndRunSetup(
+        script: SetupFlowScript = SetupFlowScript(),
+        shell: ClaudeShellKind? = .zsh,
+        rcFileSystem: StubRCFileSystem? = StubRCFileSystem(state: ClaudeShellRCState(
+            fileExists: true, data: Data("export EDITOR=vim\n".utf8), permissions: 0o644
+        )),
+        vibeHost: VibeFakeHost? = nil,
+        registry suppliedRegistry: ClaudeRemoteHostRegistry? = nil,
+        vibeFiles suppliedVibeFiles: (@Sendable () -> VibeRemoteHooksFiles?)? = nil,
+        remoteForwardPort: UInt16 = ClaudeRemoteForwardPort.legacyPort
+    ) async throws -> (
+        model: ClaudeIntegrationSettingsModel,
+        hostID: String,
+        sshFS: StubSSHConfigFileSystem,
+        recorder: SetupFlowRecorder
+    ) {
+        let registry = try suppliedRegistry ?? makeRegistry()
+        let sshFS = StubSSHConfigFileSystem()
+        let recorder = SetupFlowRecorder()
+        let service = ClaudeRemoteEnrollmentService(
+            runner: setupFlowRunner(script: script, recorder: recorder, vibeHost: vibeHost),
+            sshConfigFileSystem: sshFS
+        )
+        let listener = StubClaudeRemoteListener(hosts: registry)
+        // Bound, or the final 401 reads as a squatter and the run cannot pass.
+        listener.isListening = true
+        let model = setupFlowModel(
+            registry: registry,
+            listener: listener,
+            service: service,
+            shell: shell,
+            rcFileSystem: rcFileSystem,
+            vibeFiles: try suppliedVibeFiles
+                ?? { [files = vibeHost == nil ? nil : try XCTUnwrap(VibeRemoteHooksFiles.bundled())] in files },
+            remoteForwardPort: remoteForwardPort
+        )
+        model.enrollLabel = "buildhost"
+        model.enrollSSHAlias = "builder"
+        await model.enroll()
+        let hostID = try XCTUnwrap(model.hosts.first?.id)
+        model.requestHostSetup()
+        await model.confirmEnrollmentAction()
+        return (model, hostID, sshFS, recorder)
+    }
+
+    /// The run's shell step skipped any file that had a block, so a block an
+    /// older app wrote was never replaced. It skips only a current block.
+    @MainActor
+    func testSetupRunRewritesAnOlderShellBlockAndSkipsACurrentOne() async throws {
+        let older = ClaudeShellRCSetup.snippet(for: .zsh)
+            .replacingOccurrences(of: "# Publishes", with: "# Exports")
+        let olderFS = StubRCFileSystem(state: ClaudeShellRCState(
+            fileExists: true, data: Data("\(older)\n".utf8), permissions: 0o644
+        ))
+        let (olderRun, _, _, _) = try await enrollAndRunSetup(rcFileSystem: olderFS)
+        XCTAssertEqual(
+            try XCTUnwrap(olderRun.setupRun).items[1].state,
+            .done("The shell startup block is applied.")
+        )
+        XCTAssertEqual(olderFS.writes, 1, "the older block is replaced")
+
+        let currentFS = StubRCFileSystem(state: ClaudeShellRCState(
+            fileExists: true,
+            data: Data("\(ClaudeShellRCSetup.snippet(for: .zsh))\n".utf8),
+            permissions: 0o644
+        ))
+        let (currentRun, _, _, _) = try await enrollAndRunSetup(rcFileSystem: currentFS)
+        XCTAssertEqual(
+            try XCTUnwrap(currentRun.setupRun).items[1].state,
+            .done("The shell startup block is already applied.")
+        )
+        XCTAssertEqual(currentFS.writes, 0)
+    }
+
+    /// #656: Claude Desktop's ssh clears every forward, so on a host it runs
+    /// sessions on, the config block alone delivers nothing. The run turns on
+    /// the app-held tunnel and says why, in the step that wrote the block.
+    @MainActor
+    func testSetupRunKeepsTheTunnelOpenOnAClaudeDesktopHost() async throws {
+        let (model, hostID, _, _) = try await enrollAndRunSetup(
+            script: SetupFlowScript(claudeDesktop: true)
+        )
+        let run = try XCTUnwrap(model.setupRun)
+        XCTAssertEqual(
+            run.items[0].state,
+            .done("Claude Desktop's ssh never opens the tunnel, so Keep the tunnel open is now on.")
+        )
+        XCTAssertTrue(try XCTUnwrap(model.hosts.first { $0.id == hostID }).persistentForwardEnabled)
+    }
+
+    @MainActor
+    func testSetupRunLeavesTheTunnelSettingAloneWithoutClaudeDesktop() async throws {
+        let (model, hostID, _, _) = try await enrollAndRunSetup()
+        XCTAssertEqual(
+            try XCTUnwrap(model.setupRun).items[0].state,
+            .done("The SSH config block is current.")
+        )
+        XCTAssertFalse(try XCTUnwrap(model.hosts.first { $0.id == hostID }).persistentForwardEnabled)
+    }
+
+    /// The probe runs only while the setting is off: a host that already has
+    /// the tunnel on costs no extra ssh connection. The probe itself clears
+    /// forwardings, like every connection with no use for the tunnel.
+    @MainActor
+    func testTheDesktopProbeRunsOnlyWhileTheTunnelIsOff() async throws {
+        let (_, _, _, offRecorder) = try await enrollAndRunSetup(script: SetupFlowScript(claudeDesktop: true))
+        let probes = offRecorder.all.filter {
+            String(decoding: $0.standardInput, as: UTF8.self)
+                .contains(ClaudeRemoteEnrollmentService.claudeDesktopFramePrefix)
+        }
+        XCTAssertEqual(probes.count, 1)
+        XCTAssertEqual(
+            probes[0].argv,
+            ["ssh", "-o", "BatchMode=yes", "-o", "ClearAllForwardings=yes", "--", "builder", "/bin/sh", "-s"]
+        )
+
+        let registry = try makeRegistry()
+        let recorder = SetupFlowRecorder()
+        let service = ClaudeRemoteEnrollmentService(
+            runner: setupFlowRunner(script: SetupFlowScript(claudeDesktop: true), recorder: recorder),
+            sshConfigFileSystem: StubSSHConfigFileSystem()
+        )
+        let listener = StubClaudeRemoteListener(hosts: registry)
+        listener.isListening = true
+        let model = setupFlowModel(registry: registry, listener: listener, service: service, rcFileSystem: StubRCFileSystem(state: ClaudeShellRCState(
+            fileExists: true, data: Data("export EDITOR=vim\n".utf8), permissions: 0o644
+        )))
+        model.enrollLabel = "buildhost"
+        model.enrollSSHAlias = "builder"
+        await model.enroll()
+        let hostID = try XCTUnwrap(model.hosts.first?.id)
+        try registry.setPersistentForwardEnabled(true, hostID: hostID)
+        model.requestHostSetup()
+        await model.confirmEnrollmentAction()
+        XCTAssertFalse(
+            recorder.all.contains {
+                String(decoding: $0.standardInput, as: UTF8.self)
+                    .contains(ClaudeRemoteEnrollmentService.claudeDesktopFramePrefix)
+            }
+        )
+        XCTAssertEqual(try XCTUnwrap(model.setupRun).items[0].state, .done("The SSH config block is current."))
+    }
+
+    /// The probe failing decides nothing and stops nothing.
+    @MainActor
+    func testAFailedDesktopProbeDoesNotStopTheRun() async throws {
+        let registry = try makeRegistry()
+        let recorder = SetupFlowRecorder()
+        let inner = setupFlowRunner(script: SetupFlowScript(), recorder: recorder)
+        let service = ClaudeRemoteEnrollmentService(
+            runner: { invocation in
+                if String(decoding: invocation.standardInput, as: UTF8.self)
+                    .contains(ClaudeRemoteEnrollmentService.claudeDesktopFramePrefix) {
+                    return .init(exitCode: 255, message: "ssh: connect to host builder: timed out")
+                }
+                return try inner(invocation)
+            },
+            sshConfigFileSystem: StubSSHConfigFileSystem()
+        )
+        let listener = StubClaudeRemoteListener(hosts: registry)
+        listener.isListening = true
+        let model = setupFlowModel(registry: registry, listener: listener, service: service, rcFileSystem: StubRCFileSystem(state: ClaudeShellRCState(
+            fileExists: true, data: Data("export EDITOR=vim\n".utf8), permissions: 0o644
+        )))
+        model.enrollLabel = "buildhost"
+        model.enrollSSHAlias = "builder"
+        await model.enroll()
+        model.requestHostSetup()
+        await model.confirmEnrollmentAction()
+        let run = try XCTUnwrap(model.setupRun)
+        XCTAssertEqual(run.items[0].state, .done("The SSH config block is current."))
+        XCTAssertEqual(run.items.last?.state, .done("The tunnel and remote plugin checks passed."))
+        XCTAssertFalse(try XCTUnwrap(model.hosts.first).persistentForwardEnabled)
+    }
+
+    @MainActor
+    func testSetupRunCompletesAllSevenStepsInOrder() async throws {
+        let rcFS = StubRCFileSystem(state: ClaudeShellRCState(
+            fileExists: true, data: Data("export EDITOR=vim\n".utf8), permissions: 0o644
+        ))
+        let (model, hostID, sshFS, recorder) = try await enrollAndRunSetup(rcFileSystem: rcFS)
+
+        let run = try XCTUnwrap(model.setupRun)
+        XCTAssertEqual(run.hostID, hostID)
+        XCTAssertEqual(run.items.map(\.step), RemoteHostSetupRun.Step.allCases)
+        XCTAssertEqual(run.items[0].state, .done("The SSH config block is current."))
+        XCTAssertEqual(run.items[1].state, .done("The shell startup block is applied."))
+        XCTAssertEqual(run.items[2].state, .done("The remote plugin was installed and verified."))
+        XCTAssertEqual(run.items[3].state, .done("LC_LVX_TTY crossed the SSH connection."))
+        XCTAssertEqual(run.items[4].state, .skipped("herdr is not installed on the remote host."))
+        XCTAssertEqual(run.items[5].state, .skipped("This build carries no Vibe hook files."))
+        XCTAssertEqual(run.items[6].state, .done("The tunnel and remote plugin checks passed."))
+        XCTAssertEqual(
+            model.hosts.first?.setupStatusText,
+            "Setup complete.",
+            "the row's sentence is the run's last word"
+        )
+        XCTAssertTrue(model.verificationChecks.allSatisfy(\.passed))
+        XCTAssertNil(model.alert)
+        XCTAssertEqual(rcFS.writes, 1, "the shell block was written, not just reported")
+        XCTAssertTrue(sshFS.configText?.contains("SendEnv LC_LVX_TTY") == true)
+        let invocationOrder = recorder.all.map { invocation in
+            let script = String(decoding: invocation.standardInput, as: UTF8.self)
+            if script.contains(ClaudeRemoteEnrollmentService.remoteMarketplaceDirectory) { return "remote plugin" }
+            if script.contains(ClaudeRemoteEnrollmentService.claudeDesktopFramePrefix) { return "claude desktop" }
+            if script.contains(ClaudeRemoteEnrollmentService.pluginListFrameBegin) { return "plugin listing" }
+            if script.contains("claude plugin install") { return "remote plugin" }
+            if script.contains("LC_LVX_TTY") { return "environment crossing" }
+            if script.contains("LVX_HERDR") { return "remote herdr" }
+            if script.contains("SessionStart") { return "tunnel check" }
+            if script.contains("claude plugin list") { return "plugin check" }
+            return "unexpected"
+        }
+        XCTAssertEqual(
+            invocationOrder,
+            [
+                "claude desktop", "plugin listing", "remote plugin", "plugin listing",
+                "environment crossing", "remote herdr", "tunnel check", "plugin check",
+            ],
+            "each step must finish before the next one starts"
+        )
+    }
+
+    /// The token the sheet shows is the one the install stores, beside this
+    /// Mac's allocated port, and it rides stdin: no argv on this Mac carries it.
+    @MainActor
+    func testTheSetupRunInstallsTheSheetsTokenThroughStdinOnly() async throws {
+        let (model, _, _, recorder) = try await enrollAndRunSetup(remoteForwardPort: 28542)
+        let plan = try XCTUnwrap(model.presentedPlan)
+        let token = plan.token
+        // The mod's channel key rides with it (#1412), derived from the
+        // stored hash, never from anything the host sent.
+        let channelKey = try XCTUnwrap(model.registry?.modChannelKey(hostID: plan.host.id))
+        let scripts = recorder.all.map { String(decoding: $0.standardInput, as: UTF8.self) }
+        XCTAssertEqual(
+            scripts.filter { $0.contains(token) }.count, 1,
+            "only the install call carries the token"
+        )
+        XCTAssertTrue(scripts.contains {
+            $0.contains("--config 'port=28542'\n") && $0.contains("--values-stdin")
+                && $0.contains("{\"channel_key\":\"\(channelKey)\",\"token\":\"\(token)\"}\n")
+        })
+        for invocation in recorder.all {
+            XCTAssertFalse(invocation.argv.joined(separator: " ").contains(token), "\(invocation.argv)")
+        }
+    }
+
+    // MARK: - Mistral Vibe inside the host's one run
+
+    private func vibeToken(_ host: VibeFakeHost) -> String? {
+        host.text(".vibe/localvoxtral/remote/token")?.trimmingCharacters(in: .newlines)
+    }
+
+    /// The bundled files until `newer` is set, then the same files claiming a
+    /// later version: what the next app build would carry.
+    private func switchableVibeFiles(newer: TestFlag) throws -> @Sendable () -> VibeRemoteHooksFiles? {
+        let bundled = try XCTUnwrap(VibeRemoteHooksFiles.bundled())
+        var later = bundled
+        later.postScript = bundled.postScript.replacingOccurrences(
+            of: "X-Lvx-Vibe-Hooks-Version: \(try XCTUnwrap(bundled.version))", with: "X-Lvx-Vibe-Hooks-Version: 9.9.9"
+        )
+        XCTAssertEqual(later.version, "9.9.9")
+        return { [later] in newer.isSet ? later : bundled }
+    }
+
+    /// The row's update run, confirmed.
+    @MainActor
+    private func runHostUpdate(_ model: ClaudeIntegrationSettingsModel, hostID: String) async {
+        model.dismissPlan()
+        model.requestPluginUpdate(hostID: hostID)
+        model.requestHostUpdateRun()
+        await model.confirmEnrollmentAction()
+    }
+
+    @MainActor
+    func testTheRunInstallsTheVibeHooksOnAHostThatHasVibe() async throws {
+        let host = try VibeFakeHost()
+        let registry = try makeRegistry()
+        let (model, hostID, _, _) = try await enrollAndRunSetup(vibeHost: host, registry: registry)
+
+        let run = try XCTUnwrap(model.setupRun)
+        XCTAssertEqual(run.items[5].step, .remoteVibe)
+        XCTAssertEqual(run.items[5].state, .done("The Vibe hooks are installed and verified."))
+        XCTAssertEqual(run.items[6].state, .done("The tunnel and remote plugin checks passed."))
+        XCTAssertEqual(registry.authenticate(token: try XCTUnwrap(vibeToken(host)))?.id, hostID)
+        XCTAssertEqual(registry.host(id: hostID)?.extraCredentialPurposes, [.vibe])
+        XCTAssertTrue(
+            model.hostSetupConsentSentence(sshHostAlias: "builder").contains("Mistral Vibe hooks"),
+            "the one consent names everything the run may write"
+        )
+
+        // The row hides the run while plugin and Vibe hooks are both settled.
+        // Asserted HERE, before the update run below, so it is the SETUP run
+        // alone that settles the row — the state the folded test originally
+        // pinned. Noting the plugin version first cannot change what the
+        // update run reports: the Vibe step reads `reportedVibeHooksVersion`
+        // and the credential purposes, never `reportedPluginVersion`
+        // (+SetupRun.swift), and the final check reads its own run's plugin
+        // outcome, so the two assertions below see the same update run either
+        // way.
+        registry.notePluginVersion(hostID: hostID, .version(ClaudeRemoteEnrollmentService.remotePluginVersion))
+        model.refreshHosts()
+        XCTAssertEqual(model.hosts.first?.offersUpdate, false, "plugin and Vibe hooks both verified by the run")
+        XCTAssertEqual(model.hosts.first?.pluginNeedsUpdate, false)
+
+        // An update the user starts for any other reason leaves current hooks
+        // alone (absorbed here: same fixture, same flow), and a FINISHED
+        // update WITH a Vibe step closes its panel and leaves the row one
+        // line again.
+        let working = try XCTUnwrap(vibeToken(host))
+        let scriptsAfterInstall = host.invocations.count
+        await runHostUpdate(model, hostID: hostID)
+
+        let updateRun = try XCTUnwrap(model.setupRun)
+        XCTAssertEqual(updateRun.items[5].state, .done("The Vibe hooks are already current."))
+        XCTAssertEqual(updateRun.items[6].state, .done("The tunnel and remote plugin checks passed."))
+        XCTAssertEqual(host.invocations.count, scriptsAfterInstall, "not one Vibe script went to the host")
+        XCTAssertEqual(vibeToken(host), working, "live Vibe sessions keep the token they post with")
+        XCTAssertEqual(registry.authenticate(token: working)?.id, hostID)
+        XCTAssertNil(model.presentedPluginUpdate, "nothing left to show: the row is one line again")
+        XCTAssertEqual(model.hosts.first?.setupStatusText, "Setup complete.")
+
+        // …and a Rotate token withdraws the Vibe credential, so the run has
+        // work again.
+        await model.rotate(hostID: hostID)
+        model.dismissPlan()
+        registry.notePluginVersion(hostID: hostID, .version(ClaudeRemoteEnrollmentService.remotePluginVersion))
+        model.refreshHosts()
+        XCTAssertEqual(model.hosts.first?.offersUpdate, true)
+    }
+
+    @MainActor
+    func testTheRunSkipsVibeOnAHostWithoutItAndStillCompletes() async throws {
+        let host = try VibeFakeHost(vibeInstalled: false)
+        let registry = try makeRegistry()
+        let (model, hostID, _, _) = try await enrollAndRunSetup(vibeHost: host, registry: registry)
+
+        let run = try XCTUnwrap(model.setupRun)
+        XCTAssertEqual(run.items[5].state, .skipped("Mistral Vibe is not installed on the remote host."))
+        XCTAssertEqual(run.items[6].state, .done("The tunnel and remote plugin checks passed."))
+        XCTAssertEqual(model.hosts.first?.setupStatusText, "Setup complete.")
+        XCTAssertNil(vibeToken(host))
+        XCTAssertEqual(registry.host(id: hostID)?.extraCredentialPurposes, [], "no credential for hooks nobody holds")
+        XCTAssertNil(model.alert)
+
+        // The row settles for this app session (absorbed here: same fixture,
+        // same flow, the same post-run state the folded test asserted on):
+        // the run probed and found no Vibe, so `withoutVibe` settles the
+        // vibe half and the run has nothing left to do.
+        registry.notePluginVersion(hostID: hostID, .version(ClaudeRemoteEnrollmentService.remotePluginVersion))
+        model.refreshHosts()
+        XCTAssertEqual(
+            model.hosts.first?.offersUpdate, false,
+            "the run found no Vibe, so it has nothing left to do"
+        )
+    }
+
+    @MainActor
+    func testAVibeUpdateWhoseLastScriptDiesFailsTheRunAndKeepsTheWorkingToken() async throws {
+        let host = try VibeFakeHost()
+        let registry = try makeRegistry()
+        let newer = TestFlag()
+        let (model, hostID, _, _) = try await enrollAndRunSetup(
+            vibeHost: host, registry: registry, vibeFiles: try switchableVibeFiles(newer: newer)
+        )
+        let working = try XCTUnwrap(vibeToken(host))
+
+        // A later build's hooks. The update's activation script (its 4th Vibe
+        // script, the 8th overall) never reaches the host.
+        newer.set()
+        model.refreshHosts()
+        XCTAssertEqual(model.hosts.first?.pluginNeedsUpdate, true, "outdated Vibe hooks flag the row")
+        host.droppedScripts = [8]
+        await runHostUpdate(model, hostID: hostID)
+
+        let run = try XCTUnwrap(model.setupRun)
+        XCTAssertEqual(failedReason(run.items[5].state), "The Vibe hooks could not be installed or updated.")
+        XCTAssertEqual(run.items[6].state, .pending)
+        XCTAssertEqual(vibeToken(host), working, "the token file was not replaced")
+        XCTAssertEqual(registry.authenticate(token: working)?.id, hostID, "and it still authenticates")
+        XCTAssertEqual(model.presentedPluginUpdate?.hostID, hostID, "a failed run keeps its panel: the remedy is in it")
+    }
+
+    @MainActor
+    func testRotatingTheHostDuringTheVibeStepActivatesNothing() async throws {
+        let host = try VibeFakeHost()
+        let registry = try makeRegistry()
+        host.beforeScript[2] = { [registry] in
+            guard let id = registry.hosts().first?.id else { return }
+            _ = try? registry.rotateToken(hostID: id)
+        }
+        let (model, hostID, _, _) = try await enrollAndRunSetup(vibeHost: host, registry: registry)
+
+        let run = try XCTUnwrap(model.setupRun)
+        XCTAssertEqual(failedReason(run.items[5].state), "The Vibe hooks could not be installed or updated.")
+        XCTAssertNil(vibeToken(host), "the token is the last thing written, and the commit before it refused")
+        XCTAssertEqual(registry.host(id: hostID)?.extraCredentialPurposes, [])
+    }
+
+    @MainActor
+    func testAHostWithVibeAndNoClaudeCodeIsSetUpForVibeAlone() async throws {
+        let host = try VibeFakeHost()
+        let registry = try makeRegistry()
+        let (model, hostID, _, recorder) = try await enrollAndRunSetup(
+            script: SetupFlowScript(claudeMissing: true), vibeHost: host, registry: registry
+        )
+
+        let run = try XCTUnwrap(model.setupRun)
+        XCTAssertEqual(run.items[2].state, .skipped("Claude Code is not installed on the remote host."))
+        XCTAssertEqual(run.items[5].state, .done("The Vibe hooks are installed and verified."))
+        XCTAssertEqual(run.items[6].state, .done("The tunnel check passed."))
+        XCTAssertEqual(model.hosts.first?.setupStatusText, "Setup complete.")
+        XCTAssertEqual(registry.authenticate(token: try XCTUnwrap(vibeToken(host)))?.id, hostID)
+        let scripts = recorder.all.map { String(decoding: $0.standardInput, as: UTF8.self) }
+        XCTAssertFalse(scripts.contains { $0.contains("claude plugin install") }, "nothing to install into")
+        XCTAssertFalse(
+            scripts.contains { $0.contains("claude plugin list") && !$0.contains(ClaudeRemoteEnrollmentService.pluginListFrameBegin) },
+            "the final check has no plugin to look for"
+        )
+        XCTAssertNil(registry.host(id: hostID)?.reportedPluginVersion, "no version was verified")
+        model.refreshHosts()
+        XCTAssertEqual(model.hosts.first?.offersUpdate, false, "a plugin that cannot exist is not pending")
+    }
+
+    @MainActor
+    func testAHostWithNeitherAgentFailsTheRunAndSaysSo() async throws {
+        let host = try VibeFakeHost(vibeInstalled: false)
+        let (model, _, _, _) = try await enrollAndRunSetup(
+            script: SetupFlowScript(claudeMissing: true), vibeHost: host
+        )
+        let run = try XCTUnwrap(model.setupRun)
+        XCTAssertEqual(run.items[2].state, .skipped("Claude Code is not installed on the remote host."))
+        XCTAssertEqual(failedReason(run.items[5].state), "No supported agent was found on the remote host.")
+        XCTAssertEqual(run.items[6].state, .pending)
+        model.refreshHosts()
+        XCTAssertEqual(
+            model.hosts.first?.offersUpdate, true,
+            "the remedy is to install an agent and run setup again, so the run stays on offer"
+        )
+
+        // The same with a build that carries no Vibe files at all.
+        let (bare, _, _, _) = try await enrollAndRunSetup(script: SetupFlowScript(claudeMissing: true))
+        XCTAssertEqual(
+            failedReason(try XCTUnwrap(bare.setupRun).items[5].state),
+            "No supported agent was found on the remote host."
+        )
+    }
+
+    @MainActor
+    func testAFinishedUpdateClosesItsPanel() async throws {
+        // No VibeFakeHost: no assertion here reads the host, and a build with
+        // no Vibe files reaches the same finished update (step 5 skipped)
+        // without running one real script per Vibe step.
+        let (model, hostID, _, _) = try await enrollAndRunSetup()
+
+        await runHostUpdate(model, hostID: hostID)
+        XCTAssertNil(model.presentedPluginUpdate, "nothing left to show: the row is one line again")
+        XCTAssertEqual(model.hosts.first?.setupStatusText, "Setup complete.")
+        XCTAssertNotNil(model.setupRun)
+    }
+
+    @MainActor
+    func testAManualStepOutlivesTheClosedPanelInTheRowsSentence() async throws {
+        let registry = try makeRegistry()
+        var script = SetupFlowScript()
+        script.herdr = .init(exitCode: 42, message: "LVX_HERDR_CUSTOMIZED")
+        let (model, hostID, _, _) = try await enrollAndRunSetup(script: script, registry: registry)
+        await runHostUpdate(model, hostID: hostID)
+        XCTAssertNil(model.presentedPluginUpdate)
+        XCTAssertEqual(
+            model.hosts.first?.setupStatusText,
+            "Setup complete. Still manual: Remote herdr. See Learn more.",
+            "the panel that named the step is closed, so the row names it"
+        )
+    }
+
+    @MainActor
+    func testInitialSetupSkipsACurrentBlockInASymlinkedSSHConfig() async throws {
+        let registry = try makeRegistry()
+        let sshFS = RecordingSSHConfigFileSystem()
+        let recorder = SetupFlowRecorder()
+        let service = ClaudeRemoteEnrollmentService(
+            runner: setupFlowRunner(script: SetupFlowScript(), recorder: recorder),
+            sshConfigFileSystem: sshFS
+        )
+        let listener = StubClaudeRemoteListener(hosts: registry)
+        listener.isListening = true
+        let model = setupFlowModel(
+            registry: registry,
+            listener: listener,
+            service: service,
+            rcFileSystem: StubRCFileSystem(state: ClaudeShellRCState(
+                fileExists: true,
+                data: Data("export EDITOR=vim\n".utf8),
+                permissions: 0o644
+            ))
+        )
+        model.enrollLabel = "buildhost"
+        model.enrollSSHAlias = "builder"
+        await model.enroll()
+        let presentation = try XCTUnwrap(model.presentedPlan)
+        sshFS.setConfig(ClaudeRemoteEnrollmentService.applySSHConfigSnippet(
+            to: "",
+            snippet: presentation.plan.sshConfigSnippet,
+            hostID: presentation.host.id
+        ))
+        sshFS.setSymlinked(true)
+
+        model.requestHostSetup()
+        await model.confirmEnrollmentAction()
+
+        let run = try XCTUnwrap(model.setupRun)
+        XCTAssertEqual(
+            run.items[0].state,
+            .done("The SSH config block is already current.")
+        )
+        XCTAssertEqual(sshFS.writeCount, 0, "a current symlink target must not be replaced")
+        XCTAssertEqual(model.hosts.first?.setupStatusText, "Setup complete.")
+        XCTAssertFalse(recorder.all.isEmpty, "setup must continue after the current block")
+    }
+
+    @MainActor
+    func testSetupRunStopsAtTheFirstFailure() async throws {
+        var script = SetupFlowScript()
+        script.plugin = .init(exitCode: 1, message: "boom")
+        let (model, _, _, recorder) = try await enrollAndRunSetup(script: script)
+
+        let run = try XCTUnwrap(model.setupRun)
+        XCTAssertEqual(failedReason(run.items[2].state), "The remote plugin could not be installed or updated.")
+        XCTAssertEqual(run.items[3].state, .pending)
+        XCTAssertEqual(run.items[4].state, .pending)
+        XCTAssertEqual(run.items[6].state, .pending)
+        XCTAssertEqual(
+            model.hosts.first?.setupStatusText,
+            "Setup stopped at Remote plugin."
+        )
+        XCTAssertEqual(model.alert?.title, "Remote plugin")
+        XCTAssertTrue(
+            recorder.all.allSatisfy { $0.environment.isEmpty },
+            "the env probe never ran after the plugin step failed"
+        )
+    }
+
+    @MainActor
+    func testSetupRunWithoutSendEnvBlamesThisMacsSSHBlock() async throws {
+        var script = SetupFlowScript()
+        script.envEchoesBack = false
+        script.sendEnvOutput = "hostname builder\nsendenv LANG\n"
+        let (model, _, _, _) = try await enrollAndRunSetup(script: script)
+
+        let run = try XCTUnwrap(model.setupRun)
+        XCTAssertEqual(
+            failedReason(run.items[3].state),
+            "This Mac is not sending LC_LVX_TTY for this SSH host."
+        )
+        XCTAssertEqual(
+            model.alert?.detail,
+            "This Mac is not sending LC_LVX_TTY for this SSH host.\n\n"
+                + "Open Details and follow the SSH environment setup."
+        )
+        XCTAssertFalse(model.alert?.detail.contains("SendEnv") == true)
+        XCTAssertEqual(run.items[4].state, .pending, "herdr never ran after the env failure")
+    }
+
+    @MainActor
+    func testSetupRunWithSendEnvButNoCrossingBlamesTheRemoteSshd() async throws {
+        var script = SetupFlowScript()
+        script.envEchoesBack = false
+        let (model, _, _, recorder) = try await enrollAndRunSetup(script: script)
+
+        let run = try XCTUnwrap(model.setupRun)
+        XCTAssertEqual(
+            failedReason(run.items[3].state),
+            "The remote SSH server did not accept LC_LVX_TTY."
+        )
+        XCTAssertEqual(
+            model.alert?.detail,
+            "The remote SSH server did not accept LC_LVX_TTY.\n\n"
+                + "Open Details and follow the remote SSH server setup."
+        )
+        XCTAssertFalse(model.alert?.detail.contains("AcceptEnv") == true)
+        XCTAssertTrue(recorder.all.contains { $0.argv.contains("-G") })
+    }
+
+    @MainActor
+    func testSetupRunLeavesACustomizedHerdrTableAloneAndStillCompletes() async throws {
+        var script = SetupFlowScript()
+        script.herdr = .init(exitCode: 42, message: "LVX_HERDR_CUSTOMIZED")
+        let (model, _, _, _) = try await enrollAndRunSetup(script: script)
+
+        let run = try XCTUnwrap(model.setupRun)
+        XCTAssertEqual(
+            run.items[4].state,
+            .skipped("The existing herdr agents table was left unchanged.")
+        )
+        XCTAssertEqual(
+            model.setupManualInstructions,
+            "The remote herdr table is customized; open Details to update it manually."
+        )
+        XCTAssertFalse(model.setupManualInstructions?.contains("[[rows]]") == true)
+        XCTAssertEqual(run.items[6].state, .done("The tunnel and remote plugin checks passed."))
+        XCTAssertEqual(model.hosts.first?.setupStatusText, "Setup complete. Still manual: Remote herdr. See Learn more.")
+    }
+
+    @MainActor
+    func testSetupRunWithAnUnsupportedShellSkipsWithTheManualBlock() async throws {
+        let (model, _, _, _) = try await enrollAndRunSetup(shell: nil, rcFileSystem: nil)
+
+        let run = try XCTUnwrap(model.setupRun)
+        XCTAssertEqual(
+            run.items[1].state,
+            .skipped("This login shell is not supported for automatic setup; configure it manually.")
+        )
+        XCTAssertEqual(model.setupManualInstructions, "Open Details for manual shell setup.")
+        XCTAssertFalse(model.setupManualInstructions?.contains("export") == true)
+        XCTAssertEqual(run.items[6].state, .done("The tunnel and remote plugin checks passed."))
+    }
+
+    @MainActor
+    func testUpdateHostRunsTheSameFlowWithoutAnSSHRewrite() async throws {
+        let registry = try makeRegistry()
+        let sshFS = StubSSHConfigFileSystem()
+        let recorder = SetupFlowRecorder()
+        var script = SetupFlowScript()
+        script.pluginVersionBefore = "1.6.0"
+        let service = ClaudeRemoteEnrollmentService(
+            runner: setupFlowRunner(script: script, recorder: recorder),
+            sshConfigFileSystem: sshFS
+        )
+        let listener = StubClaudeRemoteListener(hosts: registry)
+        listener.isListening = true
+        let model = setupFlowModel(registry: registry, listener: listener, service: service)
+        model.enrollLabel = "buildhost"
+        model.enrollSSHAlias = "builder"
+        await model.enroll()
+        let presentation = try XCTUnwrap(model.presentedPlan)
+        // The block on disk is already what this build would write.
+        sshFS.configText = ClaudeRemoteEnrollmentService.applySSHConfigSnippet(
+            to: "", snippet: presentation.plan.sshConfigSnippet, hostID: presentation.host.id
+        )
+        model.dismissPlan()
+
+        model.requestPluginUpdate(hostID: presentation.host.id)
+        let update = try XCTUnwrap(model.presentedPluginUpdate)
+        XCTAssertNil(update.sshConfigSnippet, "a current block is the update path, not a rewrite")
+        model.requestHostUpdateRun()
+        await model.confirmEnrollmentAction()
+
+        let run = try XCTUnwrap(model.setupRun)
+        XCTAssertEqual(
+            run.items[0].state,
+            .done("The SSH config block is already current.")
+        )
+        XCTAssertEqual(run.items[2].state, .done("The remote plugin was updated and verified."))
+        XCTAssertEqual(model.hosts.first?.setupStatusText, "Setup complete. Still manual: Mac shell startup. See Learn more.")
+    }
+
+    @MainActor
+    func testDismissingAHostUpdateClearsItsConfirmationAndRetainedRun() async throws {
+        let registry = try makeRegistry()
+        let sshFS = StubSSHConfigFileSystem()
+        let recorder = SetupFlowRecorder()
+        var script = SetupFlowScript()
+        script.herdr = .init(exitCode: 42, message: "LVX_HERDR_CUSTOMIZED")
+        let service = ClaudeRemoteEnrollmentService(
+            runner: setupFlowRunner(script: script, recorder: recorder),
+            sshConfigFileSystem: sshFS
+        )
+        let listener = StubClaudeRemoteListener(hosts: registry)
+        listener.isListening = true
+        let model = setupFlowModel(registry: registry, listener: listener, service: service)
+        model.enrollLabel = "buildhost"
+        model.enrollSSHAlias = "builder"
+        await model.enroll()
+        let presentation = try XCTUnwrap(model.presentedPlan)
+        sshFS.configText = ClaudeRemoteEnrollmentService.applySSHConfigSnippet(
+            to: "",
+            snippet: presentation.plan.sshConfigSnippet,
+            hostID: presentation.host.id
+        )
+        model.dismissPlan()
+
+        model.requestPluginUpdate(hostID: presentation.host.id)
+        model.requestHostUpdateRun()
+        await model.confirmEnrollmentAction()
+        XCTAssertNotNil(model.setupRun)
+        XCTAssertNotNil(model.setupManualInstructions)
+
+        model.dismissPluginUpdate()
+
+        XCTAssertNil(model.setupRun)
+        XCTAssertNil(model.setupManualInstructions)
+        XCTAssertNil(model.presentedPluginUpdate)
+
+        model.requestPluginUpdate(hostID: presentation.host.id)
+        model.requestHostUpdateRun()
+        guard case .updateHost? = model.enrollmentConfirmation?.action else {
+            return XCTFail("expected an update-host confirmation")
+        }
+
+        model.dismissPluginUpdate()
+
+        XCTAssertNil(model.enrollmentConfirmation)
+        XCTAssertNil(model.presentedPluginUpdate)
+    }
+
+    @MainActor
+    func testRemoveReversesTheMacSideQuietlyOnSuccess() async throws {
+        let registry = try makeRegistry()
+        let sshFS = StubSSHConfigFileSystem()
+        // The rc carries our block, so reversal has something to take out.
+        let rcFS = StubRCFileSystem(state: ClaudeShellRCState(
+            fileExists: true,
+            data: ClaudeShellRCSetup.apply(
+                to: "export EDITOR=vim\n",
+                snippet: ClaudeShellRCSetup.snippet(for: .zsh)
+            ).map { Data($0.utf8) },
+            permissions: 0o644
+        ))
+        let service = ClaudeRemoteEnrollmentService(sshConfigFileSystem: sshFS)
+        let listener = StubClaudeRemoteListener(hosts: registry)
+        let model = setupFlowModel(
+            registry: registry, listener: listener, service: service, rcFileSystem: rcFS
+        )
+        model.enrollLabel = "buildhost"
+        model.enrollSSHAlias = "builder"
+        await model.enroll()
+        let hostID = try XCTUnwrap(model.hosts.first?.id)
+        let presentation = try XCTUnwrap(model.presentedPlan)
+        sshFS.configText = ClaudeRemoteEnrollmentService.applySSHConfigSnippet(
+            to: "", snippet: presentation.plan.sshConfigSnippet, hostID: hostID
+        )
+        model.dismissPlan()
+
+        await model.remove(hostID: hostID)
+
+        XCTAssertTrue(model.hosts.isEmpty)
+        XCTAssertFalse(sshFS.configText?.contains("BEGIN localvoxtral") == true)
+        XCTAssertFalse(
+            String(decoding: rcFS.state.data ?? Data(), as: UTF8.self)
+                .contains("LC_LVX_TTY"),
+            "the last host takes the shell block with it"
+        )
+        XCTAssertEqual(rcFS.writes, 1, "the reversal is a write, not a no-op claim")
+        XCTAssertNil(model.alert, "a clean reversal has nothing to say")
+    }
+
+    @MainActor
+    func testRemoveStillRevokesWhenTheSSHBlockCannotBeRewritten() async throws {
+        let registry = try makeRegistry()
+        let sshFS = RecordingSSHConfigFileSystem()
+        // The one state the writer refuses: a symlinked config, where the
+        // atomic rename would replace the user's link. Revocation must not be
+        // held hostage by it — the registry entry is the off switch.
+        sshFS.setSymlinked(true)
+        let service = ClaudeRemoteEnrollmentService(sshConfigFileSystem: sshFS)
+        let listener = StubClaudeRemoteListener(hosts: registry)
+        let model = setupFlowModel(
+            registry: registry, listener: listener, service: service, rcFileSystem: nil
+        )
+        model.enrollLabel = "buildhost"
+        model.enrollSSHAlias = "builder"
+        await model.enroll()
+        let hostID = try XCTUnwrap(model.hosts.first?.id)
+        model.dismissPlan()
+
+        await model.remove(hostID: hostID)
+
+        XCTAssertTrue(model.hosts.isEmpty, "revocation is never blocked by the reversal")
+        XCTAssertEqual(sshFS.writeCount, 0)
+        XCTAssertEqual(model.alert?.title, "Remote host removed")
+        XCTAssertTrue(
+            model.alert?.detail.contains("is a symlink") == true,
+            "the leftover block is named with its manual remedy"
+        )
+    }
+
+    @MainActor
+    func testRemoveKeepsTheShellBlockWhileAnotherHostRemains() async throws {
+        let registry = try makeRegistry()
+        let sshFS = StubSSHConfigFileSystem()
+        let rcFS = StubRCFileSystem(state: ClaudeShellRCState(
+            fileExists: true, data: Data("export EDITOR=vim\n".utf8), permissions: 0o644
+        ))
+        let service = ClaudeRemoteEnrollmentService(sshConfigFileSystem: sshFS)
+        let listener = StubClaudeRemoteListener(hosts: registry)
+        let model = setupFlowModel(
+            registry: registry, listener: listener, service: service, rcFileSystem: rcFS
+        )
+        model.enrollLabel = "buildhost"
+        model.enrollSSHAlias = "builder"
+        await model.enroll()
+        let firstID = try XCTUnwrap(model.hosts.first?.id)
+        model.enrollLabel = "devbox"
+        model.enrollSSHAlias = "devbox"
+        await model.enroll()
+
+        await model.remove(hostID: firstID)
+
+        XCTAssertEqual(model.hosts.count, 1)
+        XCTAssertEqual(rcFS.writes, 0, "a remaining host still needs the shell block")
+    }
+
 }

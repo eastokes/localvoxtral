@@ -1,13 +1,13 @@
-import CryptoKit
 import Foundation
 
 @testable import localvoxtral
 
 /// Pure helpers for the agent-dictation end-to-end eval harness
-/// (`AgentDictationE2EEvalTests`): enablement/marker resolution, WAV-cache key
-/// derivation, per-pipeline stage routing, per-stratum polish-profile routing,
-/// corpus-contract scoring, `say -v ?` voice picking, and scoreboard
-/// rendering. Everything here is deterministic and unit-tested in the plain
+/// (`AgentDictationE2EEvalTests`): enablement/marker resolution, per-pipeline
+/// stage routing, per-stratum polish-profile routing, corpus-contract scoring,
+/// and scoreboard rendering. The WAV-cache key and voice picking are in
+/// `EvalSpeechStage`, the recorded-set reader in `RecordedAudioSet`, both in
+/// the shared test support. Everything here is deterministic and unit-tested in the plain
 /// tier-0 suite (`AgentDictationE2EEvalSupportTests`) — the live suite only
 /// adds recorded-or-TTS audio, ASR, and polish I/O around these functions.
 enum AgentDictationE2EEvalSupport {
@@ -26,7 +26,16 @@ enum AgentDictationE2EEvalSupport {
     static let polishEndpointEnvKey = "LV_AGENT_EVAL_E2E_POLISH_ENDPOINT"
     static let recordingDirectoryEnvKey = "LV_AGENT_EVAL_E2E_RECORDING_DIRECTORY"
     static let recordingSubsetEnvKey = "LV_AGENT_EVAL_E2E_RECORDING_SUBSET"
+    static let replayDirectoryEnvKey = "LV_AGENT_EVAL_E2E_REPLAY_DIRECTORY"
     static let caseIDsEnvKey = "LV_AGENT_EVAL_E2E_CASE_IDS"
+    /// Which provider runs BOTH live stages (`Provider.rawValue`).
+    static let providerEnvKey = "LV_AGENT_EVAL_E2E_PROVIDER"
+    /// The hosted provider's bearer token. Deliberately the repo-wide
+    /// `MISTRAL_API_KEY` name rather than an `LV_AGENT_EVAL_E2E_*` one: the
+    /// settings store, `integration-mistral` and the `eval-llm` mistral shape
+    /// all read that variable, and a second name for the same secret is how an
+    /// operator ends up exporting the one the lane does not read.
+    static let apiKeyEnvKey = "MISTRAL_API_KEY"
 
     static let defaultHelperPath =
         "PolishHelper/.build/xcode/Build/Products/Release/localvoxtral-polishd"
@@ -34,6 +43,21 @@ enum AgentDictationE2EEvalSupport {
     /// The realtime model the build host's speechd STT service serves (same pin
     /// as the tier-1 integration lane in `remote-build.sh integration`).
     static let defaultASRModel = "T0mSIlver/Voxtral-Mini-4B-Realtime-2602-4bit-qhead"
+
+    /// Which live services the two stages run against. Both stages move
+    /// together: the point of a provider arm is to prove ONE backend mode end
+    /// to end, exactly as the app drives it.
+    enum Provider: String, Equatable, Sendable {
+        /// ASR on the build host's local speechd STT service; polish on the
+        /// bundled helper, or on `polishEndpoint` when one is given. The
+        /// default, and what every marker written before the Mistral arm
+        /// existed still resolves to.
+        case speechd
+        /// Both stages on Mistral's hosted API, driven exactly as the app's
+        /// `Mistral API` backend mode drives them. Bills the owner's account
+        /// per minute of audio and per polish token, so it is by-hand only.
+        case mistral
+    }
 
     struct MarkerConfig: Decodable, Equatable {
         let helperPath: String?
@@ -43,6 +67,9 @@ enum AgentDictationE2EEvalSupport {
         let polishEndpoint: String?
         let recordingDirectory: String?
         let recordingSubset: Bool?
+        let provider: String?
+        let apiKey: String?
+        let replayDirectory: String?
 
         init(
             helperPath: String? = nil,
@@ -51,8 +78,12 @@ enum AgentDictationE2EEvalSupport {
             polishModel: String? = nil,
             polishEndpoint: String? = nil,
             recordingDirectory: String? = nil,
-            recordingSubset: Bool? = nil
+            recordingSubset: Bool? = nil,
+            provider: String? = nil,
+            apiKey: String? = nil,
+            replayDirectory: String? = nil
         ) {
+            self.replayDirectory = replayDirectory
             self.helperPath = helperPath
             self.voxmlxEndpoint = voxmlxEndpoint
             self.asrModel = asrModel
@@ -60,6 +91,8 @@ enum AgentDictationE2EEvalSupport {
             self.polishEndpoint = polishEndpoint
             self.recordingDirectory = recordingDirectory
             self.recordingSubset = recordingSubset
+            self.provider = provider
+            self.apiKey = apiKey
         }
     }
 
@@ -70,6 +103,8 @@ enum AgentDictationE2EEvalSupport {
         let polishModel: String
         /// Non-nil bypasses the bundled helper and sends production-shaped
         /// requests to this OpenAI-compatible chat/completions endpoint.
+        /// The Mistral arm ignores it: that arm polishes on Mistral by
+        /// definition, and the lane never writes both.
         let polishEndpoint: URL?
         /// Nil uses cached `say` synthesis. Non-nil is a strict human WAV set:
         /// no missing/stale recording silently falls back to TTS.
@@ -80,6 +115,21 @@ enum AgentDictationE2EEvalSupport {
         /// Optional explicit focused slice. Unlike recordingSubset, this does
         /// not add audio-independent cases: the operator asked for exact IDs.
         let caseIDs: Set<String>?
+        /// Which backend both live stages run against.
+        let provider: Provider
+        /// Bearer token for the hosted provider; empty for `.speechd`, which
+        /// authenticates nothing.
+        let apiKey: String
+        /// Non-nil replays a user's stored dictations
+        /// (`testReplayStoredDictations`) instead of scoring the corpus.
+        var replayDirectory: String? = nil
+
+        /// The bundled polishd helper is only in the loop for the local arm
+        /// with no explicit external endpoint. A hosted arm needs no `package`
+        /// run, so a missing helper binary must not fail it.
+        var usesBundledPolishHelper: Bool {
+            provider == .speechd && polishEndpoint == nil
+        }
     }
 
     static func parseMarker(_ data: Data) throws -> MarkerConfig {
@@ -90,6 +140,13 @@ enum AgentDictationE2EEvalSupport {
     /// is "1") or a parsed marker (when present); nil = the suite self-skips.
     /// Defaults are applied field-by-field so a marker only carrying
     /// `helperPath` still gets the pinned ASR endpoint/model.
+    ///
+    /// The provider selects the per-field DEFAULTS as well as the clients: a
+    /// Mistral marker that names no models gets Mistral's pinned transcription
+    /// and polishing models, never the local speechd/catalog pins, which would
+    /// be 404s on the hosted API. An unparseable endpoint or an unrecognized
+    /// provider resolves to nil (the suite self-skips) — same as it has always
+    /// treated a malformed marker.
     static func resolveEnablement(
         environment: [String: String],
         marker: MarkerConfig?
@@ -112,6 +169,11 @@ enum AgentDictationE2EEvalSupport {
             if let markerValue, !markerValue.isEmpty { return markerValue }
             return nil
         }
+
+        let providerString = pick(
+            providerEnvKey, marker?.provider, default: Provider.speechd.rawValue
+        )
+        guard let provider = Provider(rawValue: providerString) else { return nil }
 
         let endpointString = pick(
             voxmlxEndpointEnvKey, marker?.voxmlxEndpoint, default: defaultVoxmlxEndpoint
@@ -137,251 +199,116 @@ enum AgentDictationE2EEvalSupport {
         } else {
             caseIDs = nil
         }
-        return Enablement(
-            helperPath: pick(helperPathEnvKey, marker?.helperPath, default: defaultHelperPath),
-            voxmlxEndpoint: endpoint,
-            asrModel: pick(asrModelEnvKey, marker?.asrModel, default: defaultASRModel),
+        let defaultASRModelForProvider: String
+        let defaultPolishModelForProvider: String
+        switch provider {
+        case .speechd:
+            defaultASRModelForProvider = defaultASRModel
             // Same pin as production's default (SettingsStore
             // .defaultLLMPolishingModel resolves to this catalog entry; the
             // settings store itself is MainActor-isolated, the catalog is not).
+            defaultPolishModelForProvider = PolishModelCatalog.defaultOption.repoID
+        case .mistral:
+            // The hosted pins, stated where the app states them.
+            defaultASRModelForProvider = MistralRealtimeWebSocketClient.defaultModel
+            defaultPolishModelForProvider = MistralPolishDefaults.model
+        }
+        return Enablement(
+            helperPath: pick(helperPathEnvKey, marker?.helperPath, default: defaultHelperPath),
+            voxmlxEndpoint: endpoint,
+            asrModel: pick(
+                asrModelEnvKey, marker?.asrModel, default: defaultASRModelForProvider
+            ),
             polishModel: pick(
                 polishModelEnvKey, marker?.polishModel,
-                default: PolishModelCatalog.defaultOption.repoID
+                default: defaultPolishModelForProvider
             ),
             polishEndpoint: polishEndpoint,
             recordingDirectory: pickOptional(
                 recordingDirectoryEnvKey, marker?.recordingDirectory
             ),
             recordingSubset: recordingSubset,
-            caseIDs: caseIDs
+            caseIDs: caseIDs,
+            provider: provider,
+            apiKey: pickOptional(apiKeyEnvKey, marker?.apiKey) ?? "",
+            replayDirectory: pickOptional(replayDirectoryEnvKey, marker?.replayDirectory)
         )
     }
 
-    // MARK: - WAV cache
+    // MARK: - Per-provider stage wiring
 
-    static let ttsDataFormat = "LEI16@16000"
-
-    /// Cache key for a synthesized utterance: SHA-256 over the exact
-    /// text + voice + data format, so any change to what `say` would produce
-    /// changes the key and a rerun over an unchanged corpus is a pure cache
-    /// hit (TTS is the slow step across ~150 cases x reruns). `voice == nil`
-    /// (the system default voice) keys as "default". Each field is
-    /// length-prefixed before hashing — a plain separator join is ambiguous
-    /// (text "a|B" + voice nil collides with text "a" + voice "B|default";
-    /// caught by the tier-0 collision test).
-    static func wavCacheKey(
-        text: String,
-        voice: String?,
-        dataFormat: String = ttsDataFormat
-    ) -> String {
-        var hasher = SHA256()
-        for field in [text, voice ?? "default", dataFormat] {
-            let bytes = Data(field.utf8)
-            withUnsafeBytes(of: UInt64(bytes.count).littleEndian) {
-                hasher.update(bufferPointer: $0)
-            }
-            hasher.update(data: bytes)
-        }
-        return hasher.finalize()
-            .map { String(format: "%02x", $0) }
-            .joined()
+    /// Everything the ASR stage needs to open its socket. The Mistral endpoint
+    /// is PINNED here exactly as `SettingsStore.resolvedWebSocketURL` pins it
+    /// in the app: the client appends its own `?model=` query item, so a
+    /// hand-supplied endpoint could only break it.
+    struct ASRStageConfiguration: Equatable {
+        let endpoint: URL
+        let apiKey: String
+        let model: String
     }
 
-    // MARK: - Human recording sets
-
-    static let recordingManifestFileName = "manifest.json"
-    static let recordingSchemaVersion = 1
-    static let recordingDataFormat = "pcm_s16le@16000Hz-mono"
-
-    struct RecordingManifest: Codable, Equatable {
-        let schemaVersion: Int
-        let dataFormat: String
-        let recordings: [Recording]
-    }
-
-    struct Recording: Codable, Equatable {
-        let id: String
-        let lang: AgentDictationEvalCorpus.Language
-        let spokenForm: String
-        let file: String
-        let sha256: String
-    }
-
-    struct RecordingExpectation: Equatable {
-        let id: String
-        let lang: AgentDictationEvalCorpus.Language
-        let spokenForm: String
-    }
-
-    struct RecordingSetError: Error, LocalizedError, Equatable {
-        let message: String
-        var errorDescription: String? { message }
-    }
-
-    static func parseRecordingManifest(_ data: Data) throws -> RecordingManifest {
-        try JSONDecoder().decode(RecordingManifest.self, from: data)
-    }
-
-    /// Validates the manifest against the exact speech-running corpus before
-    /// model load. Recorded mode is deliberately all-or-nothing by default:
-    /// partial sets, corpus drift, duplicate IDs, unsafe filenames, and stale
-    /// extras fail loudly rather than producing a TTS/human hybrid baseline.
-    /// `allowSubset` is an explicit exploratory mode that validates and runs
-    /// only known recorded IDs; it never fills missing cases with TTS.
-    static func validateRecordingManifest(
-        _ manifest: RecordingManifest,
-        expected: [RecordingExpectation],
-        allowSubset: Bool = false
-    ) throws -> [String: Recording] {
-        guard manifest.schemaVersion == recordingSchemaVersion else {
-            throw RecordingSetError(message: "recording manifest schemaVersion must be \(recordingSchemaVersion)")
-        }
-        guard manifest.dataFormat == recordingDataFormat else {
-            throw RecordingSetError(message: "recording manifest dataFormat must be \(recordingDataFormat)")
-        }
-
-        var byID: [String: Recording] = [:]
-        for recording in manifest.recordings {
-            guard byID[recording.id] == nil else {
-                throw RecordingSetError(message: "duplicate recording id: \(recording.id)")
-            }
-            guard recording.file == "\(recording.id).wav",
-                  !recording.file.contains("/"), !recording.file.contains("..")
-            else {
-                throw RecordingSetError(message: "unsafe recording filename for \(recording.id)")
-            }
-            guard recording.sha256.count == 64,
-                  recording.sha256.allSatisfy({ $0.isHexDigit && !$0.isUppercase })
-            else {
-                throw RecordingSetError(message: "invalid SHA-256 for recording \(recording.id)")
-            }
-            byID[recording.id] = recording
-        }
-
-        let actualIDs = Set(byID.keys)
-        let expectedForRun: [RecordingExpectation]
-        if allowSubset {
-            guard !actualIDs.isEmpty else {
-                throw RecordingSetError(message: "recording subset is empty")
-            }
-            expectedForRun = expected.filter { actualIDs.contains($0.id) }
-        } else {
-            expectedForRun = expected
-        }
-        let expectedIDs = Set(expectedForRun.map(\.id))
-        let missing = expectedIDs.subtracting(actualIDs).sorted()
-        let extra = actualIDs.subtracting(expectedIDs).sorted()
-        guard missing.isEmpty else {
-            throw RecordingSetError(message: "recording set is incomplete; missing: \(missing.joined(separator: ", "))")
-        }
-        guard extra.isEmpty else {
-            throw RecordingSetError(message: "recording set has stale/unknown cases: \(extra.joined(separator: ", "))")
-        }
-        for item in expectedForRun {
-            guard let recording = byID[item.id] else { continue }
-            guard recording.lang == item.lang, recording.spokenForm == item.spokenForm else {
-                throw RecordingSetError(
-                    message: "recording \(item.id) is stale; language or spokenForm changed"
-                )
-            }
-        }
-        return byID
-    }
-
-    static func sha256Hex(_ data: Data) -> String {
-        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-    }
-
-    /// Validates the exact format the websocket client expects and returns the
-    /// data chunk. The recorder command writes this format directly, avoiding
-    /// an implicit resample during eval.
-    static func recordedPCM16(fromWAVData wav: Data) throws -> Data {
-        guard wav.count >= 44,
-              String(data: wav[0..<4], encoding: .ascii) == "RIFF",
-              String(data: wav[8..<12], encoding: .ascii) == "WAVE"
-        else { throw RecordingSetError(message: "recording is not a RIFF/WAVE file") }
-
-        var format: (code: UInt16, channels: UInt16, rate: UInt32, bits: UInt16)?
-        var pcm: Data?
-        var index = 12
-        while index + 8 <= wav.count {
-            let chunkID = String(data: wav[index..<(index + 4)], encoding: .ascii) ?? ""
-            let size = Int(readLEUInt32(wav, at: index + 4))
-            let start = index + 8
-            let end = start + size
-            guard end <= wav.count else {
-                throw RecordingSetError(message: "recording has a truncated WAV chunk")
-            }
-            if chunkID == "fmt ", size >= 16 {
-                format = (
-                    readLEUInt16(wav, at: start),
-                    readLEUInt16(wav, at: start + 2),
-                    readLEUInt32(wav, at: start + 4),
-                    readLEUInt16(wav, at: start + 14)
-                )
-            } else if chunkID == "data" {
-                pcm = wav.subdata(in: start..<end)
-            }
-            index = end + (size % 2)
-        }
-        guard let format else {
-            throw RecordingSetError(message: "recording has no WAV fmt chunk")
-        }
-        guard format.code == 1, format.channels == 1,
-              format.rate == 16_000, format.bits == 16
-        else {
-            throw RecordingSetError(
-                message: "recording must be mono 16-bit PCM at 16000 Hz"
+    static func asrStageConfiguration(_ enablement: Enablement) -> ASRStageConfiguration {
+        switch enablement.provider {
+        case .speechd:
+            // The local STT service authenticates nothing.
+            return ASRStageConfiguration(
+                endpoint: enablement.voxmlxEndpoint, apiKey: "", model: enablement.asrModel
+            )
+        case .mistral:
+            return ASRStageConfiguration(
+                endpoint: MistralRealtimeWebSocketClient.defaultEndpoint,
+                apiKey: enablement.apiKey,
+                model: enablement.asrModel
             )
         }
-        guard let pcm, pcm.count >= 8_000, pcm.count.isMultiple(of: 2) else {
-            throw RecordingSetError(message: "recording is missing or shorter than 0.25 seconds")
-        }
-        var containsSignal = false
-        var sampleOffset = 0
-        while sampleOffset < pcm.count {
-            if readLEUInt16(pcm, at: sampleOffset) != 0 {
-                containsSignal = true
-                break
-            }
-            sampleOffset += 2
-        }
-        guard containsSignal else {
-            throw RecordingSetError(message: "recording is digitally silent")
-        }
-        return pcm
     }
 
-    private static func readLEUInt16(_ data: Data, at offset: Int) -> UInt16 {
-        UInt16(data[offset]) | UInt16(data[offset + 1]) << 8
+    /// The PRODUCTION realtime client each provider's dictation runs through —
+    /// the same selection `DictationViewModel` makes from the backend mode.
+    /// Constructing one opens nothing; the caller connects.
+    static func makeRealtimeClient(for provider: Provider) -> any RealtimeClient {
+        switch provider {
+        case .speechd:
+            return RealtimeAPIWebSocketClient()
+        case .mistral:
+            return MistralRealtimeWebSocketClient()
+        }
     }
 
-    private static func readLEUInt32(_ data: Data, at offset: Int) -> UInt32 {
-        UInt32(data[offset])
-            | UInt32(data[offset + 1]) << 8
-            | UInt32(data[offset + 2]) << 16
-            | UInt32(data[offset + 3]) << 24
+    /// Puts a settings store into the app's own `Mistral API` polishing mode
+    /// and returns the configuration THAT STORE produces.
+    ///
+    /// The eval must send what the app sends. Hand-rolling a second
+    /// `LLMPolishingConfiguration` beside `SettingsStore.llmPolishingConfiguration`
+    /// would let the two drift — and a drifted eval scores a request shape no
+    /// user ever gets. So the store is the only author of the configuration,
+    /// here and in the per-case polish stage.
+    ///
+    /// `polishContextTrustedEndpointEnabled` is the one thing this turns on
+    /// that a default install has off: `api.mistral.ai` is not loopback, so
+    /// without that opt-in every clipboard and repo-vocabulary case would run
+    /// ungrounded and score nothing but the gate. It is exactly the switch a
+    /// real user flips to use context with a hosted model; the gate itself is
+    /// untouched.
+    ///
+    /// Returns nil when polishing is off or the key is empty — the same
+    /// "no key, no request" answer production gives.
+    @MainActor
+    @discardableResult
+    static func configureMistralPolishing(
+        _ settings: SettingsStore,
+        apiKey: String,
+        model: String
+    ) -> LLMPolishingConfiguration? {
+        settings.llmPolishingEnabled = true
+        settings.polishingBackendMode = .mistralAPI
+        settings.mistralAPIKey = apiKey
+        settings.mistralPolishingModel = model
+        settings.polishContextTrustedEndpointEnabled = true
+        return settings.llmPolishingConfiguration
     }
 
     // MARK: - Pipeline routing
-
-    struct StagePlan: Equatable {
-        /// Recorded speech or TTS(spokenForm) -> websocket ASR.
-        let runsSpeechRecognition: Bool
-        /// The polish stop-commit path.
-        let runsPolish: Bool
-    }
-
-    static func stagePlan(for pipeline: AgentDictationEvalCorpus.Pipeline) -> StagePlan {
-        switch pipeline {
-        case .full:
-            return StagePlan(runsSpeechRecognition: true, runsPolish: true)
-        case .asrOnly:
-            return StagePlan(runsSpeechRecognition: true, runsPolish: false)
-        case .polishOnly:
-            return StagePlan(runsSpeechRecognition: false, runsPolish: true)
-        }
-    }
 
     /// A partial human recording set limits only speech-driven rows. Cases
     /// that do not need audio (notably all polish-only required checks) still
@@ -394,7 +321,7 @@ enum AgentDictationE2EEvalSupport {
         guard isSubset else { return nil }
         var selected = recordedCaseIDs
         for loaded in strata
-        where !stagePlan(for: loaded.stratum.resolvedPipeline).runsSpeechRecognition
+        where !AgentDictationEvalCorpus.stagePlan(for: loaded.stratum.resolvedPipeline).runsSpeechRecognition
         {
             selected.formUnion(loaded.stratum.cases.map(\.id))
         }
@@ -411,7 +338,7 @@ enum AgentDictationE2EEvalSupport {
     static let textFieldTargetBundleID = "com.localvoxtral.eval.textfield"
 
     /// The commit-target bundle ID injected per stratum, which drives the
-    /// production `selectedPolishProfile` switch. The agent-dictation corpus
+    /// production `StopCommitCoordinator.polishProfile` switch. The agent-dictation corpus
     /// runs the AGENT profile — except `punctuation-spacing-migration`, whose
     /// cases (including all 7 day-one required cases) are byte-for-byte
     /// migrations of the `LLMPolishEvalSupport` corpus whose required-case
@@ -424,73 +351,7 @@ enum AgentDictationE2EEvalSupport {
             : terminalTargetBundleID
     }
 
-    // MARK: - Voice picking
-
-    /// Picks a TTS voice from `say -v ?` output: the first `preferred` name
-    /// present wins, else the first voice whose locale starts with
-    /// `languagePrefix` ("en"/"fr"), else nil. Voice names may contain spaces
-    /// ("Bad News"), so lines parse as name + 2+ spaces + locale.
-    static func pickVoice(
-        fromSayVoicesOutput output: String,
-        languagePrefix: String,
-        preferred: [String]
-    ) -> String? {
-        var candidates: [String] = []
-        for line in output.split(separator: "\n") {
-            guard let (name, locale) = parseVoiceLine(String(line)) else { continue }
-            let normalizedLocale = locale.replacingOccurrences(of: "-", with: "_").lowercased()
-            guard normalizedLocale.hasPrefix(languagePrefix.lowercased()) else { continue }
-            candidates.append(name)
-        }
-        for name in preferred where candidates.contains(name) {
-            return name
-        }
-        return candidates.first
-    }
-
-    private static func parseVoiceLine(_ line: String) -> (name: String, locale: String)? {
-        // "Thomas              fr_FR    # Bonjour! ..." — name up to the first
-        // run of 2+ spaces, locale is the next token.
-        guard let separator = line.range(of: "  ") else { return nil }
-        let name = String(line[..<separator.lowerBound]).trimmingCharacters(in: .whitespaces)
-        guard !name.isEmpty else { return nil }
-        let rest = line[separator.upperBound...].trimmingCharacters(in: .whitespaces)
-        guard let locale = rest.split(whereSeparator: \.isWhitespace).first else { return nil }
-        // Locale tokens look like en_US / fr-FR / fr_CA.
-        guard locale.contains("_") || locale.contains("-") else { return nil }
-        return (name, String(locale))
-    }
-
     // MARK: - Scoring (corpus contract)
-
-    /// `tokens` metric: every `requiredTokens` entry present (byte-exact after
-    /// spacing normalization; case-sensitive unless the case sets
-    /// `caseInsensitive`) AND no `forbiddenSubstrings` entry present (always
-    /// case-insensitive). Returns human-readable failure descriptions; empty
-    /// means pass.
-    static func tokensFailures(
-        output: String,
-        evalCase: AgentDictationEvalCorpus.Case
-    ) -> [String] {
-        let normalized = LLMPolishEvalSupport.normalizedSpacing(output)
-        let requiredHaystack = evalCase.isCaseInsensitive ? normalized.lowercased() : normalized
-        var failures: [String] = []
-        for token in evalCase.requiredTokens {
-            var needle = LLMPolishEvalSupport.normalizedSpacing(token)
-            if evalCase.isCaseInsensitive { needle = needle.lowercased() }
-            if !requiredHaystack.contains(needle) {
-                failures.append("missing \"\(token)\"")
-            }
-        }
-        let forbiddenHaystack = normalized.lowercased()
-        for needle in evalCase.forbidden {
-            let normalizedNeedle = LLMPolishEvalSupport.normalizedSpacing(needle).lowercased()
-            if forbiddenHaystack.contains(normalizedNeedle) {
-                failures.append("contains forbidden \"\(needle)\"")
-            }
-        }
-        return failures
-    }
 
     /// `exactText` metric: normalized whole-output equality with
     /// `intendedText` (spacing normalization; lowercased when the case is
@@ -500,8 +361,8 @@ enum AgentDictationE2EEvalSupport {
         output: String,
         evalCase: AgentDictationEvalCorpus.Case
     ) -> String? {
-        var actual = LLMPolishEvalSupport.normalizedSpacing(output)
-        var expected = LLMPolishEvalSupport.normalizedSpacing(evalCase.intendedText)
+        var actual = AgentDictationEvalCorpus.normalizedSpacing(output)
+        var expected = AgentDictationEvalCorpus.normalizedSpacing(evalCase.intendedText)
         if evalCase.isCaseInsensitive {
             actual = actual.lowercased()
             expected = expected.lowercased()
@@ -837,6 +698,8 @@ enum AgentDictationE2EEvalSupport {
     struct CaseCapture {
         /// ASR output (nil when the pipeline skipped speech recognition).
         var transcript: String?
+        /// Why speech recognition threw, for the STT service watch.
+        var speechError: (any Error)?
         /// The system prompt exactly as the production request carried it.
         var polishSystemPrompt: String?
         var polishUserPrompts: [String]?

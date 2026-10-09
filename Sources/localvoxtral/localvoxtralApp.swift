@@ -3,14 +3,20 @@ import ClaudeContextWire
 import SwiftUI
 import Synchronization
 
-@main
+// No `@main`: `Sources/localvoxtral/main.swift` is the entry point, so
+// `--probe-surface` can answer and exit before any scene is constructed.
 struct localvoxtralApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     var body: some Scene {
         MenuBarExtra {
-            StatusPopoverView(viewModel: appDelegate.viewModel)
+            StatusPopoverView(
+                viewModel: appDelegate.viewModel, navigator: appDelegate.settingsNavigator)
         } label: {
+            // The label is the one view that exists from launch, so it is
+            // where the app can be handed SwiftUI's own way to open the
+            // window — see `SettingsOpenerHandoff`.
+            SettingsOpenerHandoff { appDelegate.settingsOpener = $0 }
             let viewModel = appDelegate.viewModel
             let state = viewModel.menuBarIndicatorState
             if let idleIcon = MenuBarIconAsset.idleIcon {
@@ -53,6 +59,14 @@ struct localvoxtralApp: App {
                             "secure-input-warning",
                             "localvoxtral, Secure Keyboard Entry is blocking dictation typing"
                         )
+                    case .agentNeedsYou:
+                        return (
+                            MenuBarIconAsset.attentionIcon(
+                                appDelegate.settingsStore.agentAttentionMark) ?? idleIcon,
+                            .original,
+                            "agent-needs-you-\(appDelegate.settingsStore.agentAttentionMark.rawValue)",
+                            "localvoxtral, an agent needs you"
+                        )
                     case .failure:
                         if let failureIcon = MenuBarIconAsset.failureIcon {
                             return (
@@ -60,7 +74,7 @@ struct localvoxtralApp: App {
                                 .original,
                                 "realtime-failed",
                                 viewModel.realtimeSessionIndicatorState == .recentFailure
-                                    ? "localvoxtral, realtime connection failed recently"
+                                    ? "localvoxtral, dictation failed recently"
                                     : "localvoxtral, dictation backend not ready"
                             )
                         }
@@ -69,7 +83,7 @@ struct localvoxtralApp: App {
                             .template,
                             "realtime-failed",
                             viewModel.realtimeSessionIndicatorState == .recentFailure
-                                ? "localvoxtral, realtime connection failed recently"
+                                ? "localvoxtral, dictation failed recently"
                                 : "localvoxtral, dictation backend not ready"
                         )
                     }
@@ -95,6 +109,8 @@ struct localvoxtralApp: App {
                 case .secureInputWarning:
                     Label("localvoxtral", systemImage: "exclamationmark.triangle.fill")
                         .foregroundStyle(.orange)
+                case .agentNeedsYou:
+                    Label("localvoxtral", systemImage: "bell.badge")
                 }
             }
         }
@@ -105,12 +121,77 @@ struct localvoxtralApp: App {
                 settings: appDelegate.settingsStore,
                 viewModel: appDelegate.viewModel,
                 backendManager: appDelegate.backendManager,
-                navigator: appDelegate.settingsNavigator
+                navigator: appDelegate.settingsNavigator,
+                loginItem: appDelegate.loginItemController,
+                historyModel: appDelegate.historyModel,
+                insightsModel: appDelegate.insightsModel
             )
-            .frame(minWidth: 560, idealWidth: 580, minHeight: 380, idealHeight: 420)
+            // Fixed width, resizable height: the two-column layout has a fixed
+            // 208pt sidebar and dense right-hand rows, so horizontal resizing
+            // only ever makes the panes worse. Height stays free because pane
+            // content differs by hundreds of points.
+            //
+            // Deliberately NOT `.windowResizability(.contentSize)` — that makes
+            // the window snap to whichever pane is showing, so switching tabs
+            // resizes the window under the pointer.
+            .frame(width: 780)
+            .frame(minHeight: 480, idealHeight: 560, maxHeight: .infinity)
+            // Declared to SwiftUI rather than only set on the NSWindow: on
+            // macOS 26 SwiftUI re-asserts its own titlebar and paints an opaque
+            // strip over the sidebar (PR #310 hand-check), which AppKit flags
+            // alone did not survive.
+            .toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
+            // Puts the app in the Dock and the app switcher while this window
+            // is open, so it can be switched back to without going through the
+            // menu bar item.
+            .background {
+                DockIconWindowRegistrar(policy: appDelegate.dockIconPolicy)
+                    .frame(width: 0, height: 0)
+                    .accessibilityHidden(true)
+            }
         }
-        .defaultSize(width: 580, height: 420)
+        .windowStyle(.hiddenTitleBar)
+        .defaultSize(width: 780, height: 560)
         .restorationBehavior(.disabled)
+    }
+}
+
+/// Hands the app delegate SwiftUI's `openSettings` action.
+///
+/// The delegate has to open the window at launch ("Open the window at launch",
+/// #449) and is not a view, so the action has to be captured by one. The menu
+/// bar item's label is the only view alive at launch — it is rendered into the
+/// status item before anything else exists — and it renders nothing itself.
+struct SettingsOpenerHandoff: View {
+    @Environment(\.openSettings) private var openSettings
+    let hand: @MainActor (@escaping @MainActor () -> Void) -> Void
+
+    var body: some View {
+        Color.clear
+            .frame(width: 0, height: 0)
+            .accessibilityHidden(true)
+            .onAppear { hand { openSettings() } }
+    }
+}
+
+/// The answer to a `.terminateLater`, sent once.
+@MainActor
+private final class QuitReply {
+    private let application: NSApplication
+    private(set) var isSent = false
+
+    init(application: NSApplication) {
+        self.application = application
+    }
+
+    func send() {
+        guard !isSent else { return }
+        isSent = true
+        // Async: the session may answer inside `applicationShouldTerminate`,
+        // before it has returned `.terminateLater`.
+        DispatchQueue.main.async { [application] in
+            application.reply(toApplicationShouldTerminate: true)
+        }
     }
 }
 
@@ -123,6 +204,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     let backendManager: BackendManager
     let viewModel: DictationViewModel
     let settingsNavigator = SettingsNavigator()
+    /// What the History and Insights panes show, kept while the app runs so
+    /// that neither starts from nothing each time it opens.
+    lazy var historyModel = DictationHistoryModel(viewModel: viewModel)
+    lazy var insightsModel = DictationInsightsModel(viewModel: viewModel)
+    private var widgetSnapshotWriter: WidgetSnapshotWriter?
+    /// "Open localvoxtral at login". Built here so the pane reads the login
+    /// item once per launch rather than on every view update.
+    let loginItemController = LoginItemController()
+    /// SwiftUI's own `openSettings`, handed over by the menu bar label
+    /// (`SettingsOpenerHandoff`). Nil until the label has appeared.
+    var settingsOpener: (@MainActor () -> Void)?
+    let dockIconPolicy = DockIconPolicy(apply: AppDelegate.applyActivationPolicy)
 
     private var onboardingController: OnboardingWindowController?
     private let appConfigStore = AppConfigStore()
@@ -131,12 +224,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// sessions; the broker is the socket that feeds it.
     ///
     /// Owned HERE rather than by `DictationViewModel` because the hooks fire on
-    /// Claude Code's schedule, not on dictation's: a session's marker and cwd
-    /// are published while the user is typing, long before they press the hotkey.
+    /// Claude Code's schedule, not on dictation's: a session's tty, pane and
+    /// cwd are published while the user is typing, long before they press the
+    /// hotkey.
     /// A broker that only listened during a dictation session would miss the very
     /// records it exists to collect.
-    private let claudeSessionRegistry = ClaudeSessionRegistry()
+    private let claudeSessionRegistry: ClaudeSessionRegistry
     private var claudeContextBroker: ClaudeContextBroker?
+    /// The channels Claude Code sessions' mods hold open (#1408). Outlives
+    /// each broker: a restarted broker hands new attaches to the same hub.
+    private let claudeModChannels = ClaudeModChannelHub()
+    /// Set only when launch lost a hook socket to another running copy.
+    private var hookSocketTakeover: ClaudeHookSocketTakeover?
     private var terminalConsentPrewarmObserver:
         TerminalAutomationConsentPrewarmSettingsObserver?
     /// The browser half of the same pre-warm, kept separate because it is armed
@@ -144,9 +243,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// use a browser tab join.
     private var browserConsentPrewarmObserver:
         TerminalAutomationConsentPrewarmSettingsObserver?
-    /// Remote (SSH) Claude Code sessions. Both the host registry and the
-    /// listener are lazy and optional: a user who has never enrolled a host has
-    /// no file to read and no port bound.
+    /// Remote (SSH) Claude Code sessions. The host registry loads before the
+    /// session cache so restore can reject revoked hosts. The listener remains
+    /// optional, and a user with no active host has no port bound.
     private var claudeRemoteHosts: ClaudeRemoteHostRegistry?
     /// Owns the listener and the bind/unbind decision. Settings reconciles
     /// through it on every enroll/revoke, so the port follows enrollment without
@@ -156,16 +255,89 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// listener binds, and torn down before the app exits so no orphan ssh
     /// outlives the process that spawned it.
     private var claudeRemoteForwards: ClaudeRemoteForwardCoordinator?
+    /// Wake and network-change signals that restart failed or parked forwards.
+    private var claudeRemoteForwardRecovery: ClaudeRemoteForwardRecoveryTriggers?
+    /// Shared lifecycle for both remote-hook `-R` and remote-herdr `-L`
+    /// children: one ledger/reaper sees every app-held SSH process.
+    private let claudeRemoteForwardPidLedger = ClaudeRemoteForwardPidLedger()
+    /// Shared by the remote listener and the forward supervisors: one mints
+    /// ownership-probe nonces, the other reports the ones that arrive. It lives
+    /// here because both are rebuilt independently and neither may own it.
+    private let claudeRemoteForwardProbes = ClaudeRemoteForwardProbeWitness()
+    private lazy var claudeRemoteHerdrForwards = ClaudeRemoteHerdrForwardService(
+        spawner: ClaudeRemoteHerdrForwardSpawner(),
+        workspaces: ClaudeRemoteHerdrForwardWorkspaces(),
+        pidLedger: claudeRemoteForwardPidLedger,
+        orphanReapInitiallyComplete: false,
+        hostIDForAlias: { [weak self] alias in
+            guard let matches = self?.claudeRemoteHosts?.hosts(
+                matchingSSHDestination: alias
+            ), matches.count == 1 else { return nil }
+            return matches[0].id
+        }
+    )
     /// Customized-but-outdated config files awaiting the user's
     /// update-or-keep decision; held here while onboarding is on screen.
     private var pendingConfigDefaultsPromptFileNames: [String]?
 
+    #if DEBUG || LOCALVOXTRAL_E2E_HARNESS
+    /// The harness-only local control socket and the service behind it.
+    ///
+    /// Owned here for the same reason the broker is: the socket answers
+    /// questions about the registry and the resolver, both of which live at
+    /// this level, and it must be stopped on the app's own terminate path so no
+    /// listener outlives the process that bound it.
+    private var dogfoodControlSocket: DogfoodControlSocket?
+    private var dogfoodControlService: DogfoodControlService?
+    #endif
+
     override init() {
         let settings = SettingsStore()
+        let remoteHosts: ClaudeRemoteHostRegistry?
+        do {
+            remoteHosts = try ClaudeRemoteHostRegistry()
+        } catch {
+            Log.claudeContext.error(
+                "Claude remote host registry unreadable: \(String(describing: error), privacy: .public)"
+            )
+            remoteHosts = nil
+        }
+        // Nil when the registry failed to load: channels unknown, not none,
+        // so the restore keeps remote sessions in the file (#1041).
+        let activeRemoteChannels = remoteHosts.map { registry in
+            Set(
+                registry.hosts()
+                    .filter { !$0.isRevoked }
+                    .map { ClaudeRemoteSessionScope.channel(hostID: $0.id) }
+            )
+        }
+        claudeSessionRegistry = ClaudeSessionRegistry(
+            store: ClaudeSessionFileStore(),
+            allowedRemoteChannels: activeRemoteChannels
+        )
+        claudeRemoteHosts = remoteHosts
+        // The one-time-per-launch terminal_apps.toml import (owner decision,
+        // 2026-09-07): the file is read HERE and never written — Settings →
+        // Terminals owns the list from then on. Runs before anything that
+        // consults the user-added list (the session verdict, the agent polish
+        // profile), so those read settings only.
+        //
+        // Transactional by design: the stored list is persisted FIRST and the
+        // imported-ids ledger SECOND, so a crash between the two writes
+        // re-imports on the next launch instead of silently dropping apps
+        // the ledger already claims.
+        let terminalAppsImport = UserTerminalAppsMigrator.planImport(
+            tomlBundleIDs: appConfigStore.loadTerminalAppBundleIDs(),
+            storedApps: settings.userTerminalApps,
+            defaults: AppDefaults.shared
+        )
+        if !terminalAppsImport.isEmpty {
+            settings.userTerminalApps += terminalAppsImport.additions
+            UserTerminalAppsMigrator.record(terminalAppsImport, defaults: AppDefaults.shared)
+        }
         let manager = BackendManager(
             polishingModelProvider: { settings.resolvedManagedLLMPolishingModel },
-            speechdCacheLimitProvider: { settings.speechdCacheLimit.megabytes },
-            speechdStepCadenceProvider: { settings.speechdStepCadence.milliseconds }
+            speechModelProvider: { settings.resolvedManagedSpeechModel }
         )
         settingsStore = settings
         backendManager = manager
@@ -182,15 +354,74 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             LegacyMLXLMCleanup().run()
             LegacyVoxmlxCleanup().run()
         }
-        startClaudeContextBroker()
-        startClaudeRemoteListener()
+        if StartupPermissionSuppression.leavesHookSocketsAlone() {
+            Log.claudeContext.notice(
+                "Claude hook sockets and remote forwards left alone: a CI copy beside the owner's"
+            )
+        } else {
+            let brokerStart = startClaudeContextBroker()
+            startClaudeRemoteListener()
+            armHookSocketTakeover(brokerStart: brokerStart)
+        }
+        maintainLocalClaudePlugin()
+        #if DEBUG || LOCALVOXTRAL_E2E_HARNESS
+        // After the broker, because the control service's `surface probe` uses
+        // the resolver the broker installs on the view model.
+        startDogfoodControlSocket()
+        #endif
         reconcileBundledConfigDefaults()
-        viewModel.preflightConfiguredLocalNetworkEndpoints()
-        guard !settingsStore.onboardingCompleted else { return }
-        presentOnboarding()
+        widgetSnapshotWriter = WidgetSnapshotWriter(viewModel: viewModel)
+        widgetSnapshotWriter?.start()
+        viewModel.engines.preflightConfiguredLocalNetworkEndpoints()
+        switch LaunchWindowPolicy.decide(
+            onboardingCompleted: settingsStore.onboardingCompleted,
+            opensWindowAtLaunch: settingsStore.opensWindowAtLaunch,
+            isLaunchSmoke: StartupPermissionSuppression.isActive()
+        ) {
+        case .onboarding:
+            presentOnboarding()
+        case .window:
+            openWindow(on: .history)
+        case .nothing:
+            break
+        }
+    }
+
+    /// A quit during a dictation waits, bounded, for the backend's last
+    /// words before `applicationWillTerminate` saves it (#1756).
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        let reply = QuitReply(application: sender)
+        guard viewModel.finalizeDictationBeforeQuit(then: { reply.send() }) else { return .terminateNow }
+        // The stop's own bound ends the wait; this one holds if its tasks
+        // never run. A quit must never hang.
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + TimingConstants.quitStopFinalizationTimeout + 2.0
+        ) {
+            MainActor.assumeIsolated {
+                if !reply.isSent {
+                    Log.backends.error("quit: the stop's finalization did not end within its bound; quitting")
+                }
+                reply.send()
+            }
+        }
+        return .terminateLater
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        // Queued here, so the History drain at the end of quit writes it.
+        viewModel.saveStoppedDictationForQuit()
+        widgetSnapshotWriter?.writeAppQuit()
+        widgetSnapshotWriter = nil
+        #if DEBUG || LOCALVOXTRAL_E2E_HARNESS
+        // First: `stop()` does not return until the accept loop has unlinked
+        // the socket, so nothing that follows can race a client connecting to
+        // an app that is halfway through quitting. The service's bounded
+        // auto-stop is released with it.
+        dogfoodControlSocket?.stop()
+        dogfoodControlSocket = nil
+        dogfoodControlService?.shutdown()
+        dogfoodControlService = nil
+        #endif
         // Unlinks the socket, so a publisher from a surviving Claude Code
         // session fails open (silent exit 0) instead of blocking on a path
         // nothing is accepting on.
@@ -202,7 +433,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // connection refused through the tunnel and fails open. Quitting says
         // nothing about enrollment — the hosts stay enrolled for next launch.
         // Forwards first, listener second — the mirror of startup order.
+        claudeRemoteForwardRecovery?.stop()
+        claudeRemoteForwardRecovery = nil
         claudeRemoteForwards?.stopAll()
+        claudeRemoteHerdrForwards.stopAllForQuit()
         // `stopAll` only STARTS each SIGTERM→SIGKILL escalation. Returning
         // here without it finishing is how an ssh that is slow to die outlives
         // the app: reparented to launchd, still holding the remote bind, and
@@ -210,6 +444,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // launch finds its own port taken. The wait is bounded and short; a
         // quit must never hang on a wedged network.
         drainRemoteForwardTeardowns(within: 3.0)
+        // A drafting or project-terms agent still running would outlive the
+        // app, reparented to launchd and still spending tokens (#1225).
+        BoundedProcessChildren.shared.terminateAll(grace: 1.0, within: 2.0)
         claudeRemoteForwards = nil
         claudeRemoteListenerCoordinator?.shutdown()
         claudeRemoteListenerCoordinator = nil
@@ -217,14 +454,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         TerminalScreenRawAttachmentPolicy.configure(authorizer: nil)
         // The resolver holds the registry; the view model must not keep
         // resolving joins against sessions nothing is feeding any more.
-        viewModel.claudeSessionJoinResolver = nil
-        viewModel.claudeSessionJoin = nil
-        // Quitting mid-dictation must take every remote herdr `ssh -L` with us.
-        // Asked of the view model, which OWNS them: during polish the join has
-        // already been consumed, so a quit that reached the child only through
-        // `claudeSessionJoin` found nil and left the ssh running past app exit
-        // (review finding 4).
-        viewModel.closeRemoteHerdrForwards()
+        viewModel.context.claudeSessionJoinResolver = nil
+        viewModel.context.claudeModChannels = nil
+        viewModel.context.claudeSessionJoin = nil
+        claudeSessionRegistry.flushPersistence()
+        // Drop any dictation leases after the app-owned service has stopped all
+        // persistent `ssh -L` children. During polish the join has already been
+        // consumed, so the explicit service owner is what makes quit complete.
+        viewModel.context.closeRemoteHerdrForwards()
+        drainHistoryWrites(within: 3.0)
+    }
+
+    /// Waits for the dictations already queued for History to reach the
+    /// disk. The queue is serial and each write is one SQLite transaction; a
+    /// quit that returned first dropped the last dictation (#985).
+    private func drainHistoryWrites(within seconds: TimeInterval) {
+        guard let pending = viewModel.sessionStore?.pendingWrites else { return }
+        let deadline = Date().addingTimeInterval(seconds)
+        let finished = Mutex(false)
+        Task { @MainActor in
+            await pending.value
+            finished.withLock { $0 = true }
+        }
+        while !finished.withLock({ $0 }), Date() < deadline {
+            RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.02))
+        }
+        if !finished.withLock({ $0 }) {
+            Log.persistence.error("History writes did not finish before quit; the last dictation may be lost")
+        }
     }
 
     /// Spin the run loop until every forward teardown has finished, or the
@@ -237,7 +494,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// at quit, never a hang, and the escalation's own SIGKILL means the
     /// ordinary case finishes far inside it.
     private func drainRemoteForwardTeardowns(within seconds: TimeInterval) {
-        guard let teardowns = claudeRemoteForwards?.drainingTeardowns, !teardowns.isEmpty else {
+        let teardowns = (claudeRemoteForwards?.drainingTeardowns ?? [])
+            + claudeRemoteHerdrForwards.drainingTeardowns
+        guard !teardowns.isEmpty else {
             return
         }
         let deadline = Date().addingTimeInterval(seconds)
@@ -256,6 +515,238 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    #if DEBUG || LOCALVOXTRAL_E2E_HARNESS
+    /// Binds the harness-only control socket, if the owner armed it.
+    ///
+    /// Two gates, both required, exactly like the capture: this code is only
+    /// compiled under `DEBUG || LOCALVOXTRAL_E2E_HARNESS`, and even then the socket binds
+    /// only when `debug.dogfood_control_socket_enabled` is set. A shipped build
+    /// contains none of this.
+    ///
+    /// Failure is non-fatal and LOUD (AGENTS: keep new paths loud). Nothing the
+    /// app does for the user depends on this socket; an operator who cannot
+    /// reach it needs to know why, and a bind refused because the directory is
+    /// not private is precisely the case that must never be papered over.
+    private func startDogfoodControlSocket() {
+        guard settingsStore.dogfoodControlSocketEnabled else {
+            Log.claudeContext.info(
+                "Dogfood control socket disarmed (debug.dogfood_control_socket_enabled)"
+            )
+            return
+        }
+        let service = DogfoodControlService(
+            viewModel: viewModel,
+            liveSessions: { [claudeSessionRegistry] in claudeSessionRegistry.liveSessions() },
+            hasLiveSessions: { [claudeSessionRegistry] in claudeSessionRegistry.hasLiveSessions() },
+            accessibilityTrusted: { [weak viewModel] in
+                viewModel?.isAccessibilityTrusted ?? false
+            },
+            // The context source's version, not the probe verb's: this process
+            // HAS windows (the overlay), and a dictation must never ground
+            // itself in our own panel — so the same self-exclusion the real
+            // dictation path uses applies here.
+            frontmostTarget: { TerminalScreenContextSource.frontmostTarget() },
+            // Read at call time, not captured: the resolver is installed by
+            // `startClaudeContextBroker` and is nil when the broker never
+            // bound. And deliberately the app's FULL-capability resolver —
+            // unlike `--probe-surface`, which withholds the forward and the
+            // panel nonce because a one-shot process is a bad owner for
+            // either. This process is the owner: the forward service is
+            // supervised and reaped at quit, and the nonce lease is cleared.
+            // Withholding them here would make the probe answer a different
+            // question from the one a dictation asks, which is the whole
+            // reason this verb exists.
+            resolveSurface: { [weak viewModel] target in
+                guard let resolver = viewModel?.context.claudeSessionJoinResolver else { return nil }
+                return await resolver.resolve(target: target)
+            }
+        )
+        dogfoodControlService = service
+        let socket = DogfoodControlSocket(
+            socketPath: DogfoodControlSocket.defaultSocketPath(),
+            handler: { line in
+                switch DogfoodControlProtocol.parse(request: line) {
+                case .failure(let error):
+                    return DogfoodControlProtocol.reply(
+                        command: nil,
+                        result: nil,
+                        error: error.rawValue
+                    )
+                case .success(let command):
+                    let outcome = await service.execute(command)
+                    switch outcome {
+                    case .success(let result):
+                        return DogfoodControlProtocol.reply(
+                            command: command,
+                            result: result,
+                            error: nil
+                        )
+                    case .failure(let refusal):
+                        return DogfoodControlProtocol.reply(
+                            command: command,
+                            result: nil,
+                            error: refusal.rawValue
+                        )
+                    }
+                }
+            }
+        )
+        do {
+            try socket.start()
+            dogfoodControlSocket = socket
+        } catch {
+            dogfoodControlService = nil
+            Log.claudeContext.error(
+                "Dogfood control socket failed to start: \(String(describing: error), privacy: .public)"
+            )
+        }
+    }
+    #endif
+
+    /// A herdr pane (#1012): the window found with the join's process-table
+    /// probes, herdr reached over its local socket or the join's `ssh -L`
+    /// forward, the window raised with the terminal focuser's tty path.
+    private func liveHerdrFocuser(
+        terminal: TerminalSessionPaneFocuser,
+        herdrClient: HerdrSocketClient,
+        canonicalizer: SSHDestinationCanonicalizer
+    ) -> HerdrSessionPaneFocuser {
+        let locator = HerdrWindowLocator(
+            herdrClientTTYs: { HerdrWindowLocator.liveForegroundTTYs(named: "herdr") },
+            sshClientTTYs: { HerdrWindowLocator.liveForegroundTTYs(named: "ssh") },
+            sshConnection: { SSHDestinationTTYProbe.connection(onTTYDevicePath: $0) },
+            federation: { HerdrMachineFederationReader.live().federation() },
+            liveLocalHerdrSockets: { [claudeSessionRegistry] in claudeSessionRegistry.liveLocalHerdrSocketPaths() },
+            enrolledHosts: { [weak self] destination in
+                self?.claudeRemoteHosts?.hosts(matchingSSHDestination: destination) ?? []
+            },
+            canonicalizedEnrolledHosts: { [weak self] destination in
+                guard let hosts = self?.claudeRemoteHosts?.activeHostsIfReadable() else { return [] }
+                return await canonicalizer.matchingHosts(destination: destination, enrolledHosts: hosts)
+            }
+        )
+        return HerdrSessionPaneFocuser(
+            windowTTY: { await locator.windowTTY(for: $0) },
+            openSocket: { [weak self] target in
+                switch target {
+                case .local(_, let socketPath):
+                    return HerdrFocusSocket(path: socketPath)
+                case .remote(let hostID, _, let remoteSocketPath):
+                    guard let self,
+                          let host = self.claudeRemoteHosts?.host(id: hostID),
+                          !host.isRevoked,
+                          let alias = host.sshHostAlias,
+                          let forward = await self.claudeRemoteHerdrForwards.open(
+                              alias: alias, remoteSocketPath: remoteSocketPath
+                          )
+                    else { return nil }
+                    return HerdrFocusSocket(path: forward.localSocketPath, release: { forward.close() })
+                }
+            },
+            // A write waits longer than a read, like the pane route's.
+            focuser: HerdrSocketClient(timeout: 2),
+            panes: herdrClient,
+            raiseTTY: { await terminal.focus(tty: $0, termProgram: $1) },
+            focusedTTY: { await terminal.frontmostTTY(bundleID: $0) },
+            paneSessionID: { [claudeSessionRegistry] in claudeSessionRegistry.sessionID(shownIn: $0) }
+        )
+    }
+
+    /// Claude Desktop's session link, opened in Desktop itself (another app
+    /// may also claim `claude://`), read back through the join's resolver.
+    private static func liveClaudeDesktopFocuser(
+        resolver: ClaudeSessionJoinResolver,
+        sleep: @escaping @Sendable (Duration) async -> Void
+    ) -> ClaudeDesktopSessionPaneFocuser {
+        let runningDesktop = {
+            NSRunningApplication.runningApplications(withBundleIdentifier: ClaudeDesktopAllowlist.bundleID).first
+        }
+        return ClaudeDesktopSessionPaneFocuser(
+            desktopPID: { runningDesktop()?.processIdentifier },
+            frontmostPID: { NSWorkspace.shared.frontmostApplication?.processIdentifier },
+            open: { link in
+                guard let appURL = runningDesktop()?.bundleURL else { return false }
+                NSWorkspace.shared.open([link], withApplicationAt: appURL, configuration: NSWorkspace.OpenConfiguration()) { _, error in
+                    if error != nil {
+                        Log.claudeContext.error("go to session: Claude Desktop refused its session link")
+                    }
+                }
+                return true
+            },
+            shownSessionID: { pid in
+                await resolver.sessionShown(
+                    target: TerminalScreenTarget(pid: pid, bundleID: ClaudeDesktopAllowlist.bundleID)
+                )
+            },
+            sleep: sleep
+        )
+    }
+
+    /// The needs-you cue (#717). Its own resolver asks only the local
+    /// questions (`sessionShown`): nothing here can open a forward, stamp a
+    /// herdr panel or dial cmux. A terminal it has no Automation consent for
+    /// is not asked at all, so a turn's end never raises the consent sheet;
+    /// that answer counts as not looking, and the cue fires.
+    private func installAgentAttention(
+        ttyReader: AppleScriptTerminalTTYReader,
+        desktopSessionReader: AXClaudeDesktopSessionURLReader,
+        herdrClient: HerdrSocketClient,
+        nicknames: SessionNicknameStore,
+        desktopTitles: ClaudeDesktopSessionTitles
+    ) {
+        let registry = claudeSessionRegistry
+        let paneResolver = ClaudeSessionJoinResolver(
+            registry: registry,
+            focusedTerminalTTY: { bundleID in
+                guard await AutomationConsent.isGranted(bundleID: bundleID) else { return nil }
+                return await ttyReader.focusedTerminalTTY(bundleID: bundleID)
+            },
+            focusedDesktopSessionURL: { await desktopSessionReader.focusedSessionURL(applicationPID: $0) },
+            herdrClientProbe: { HerdrClientTTYProbe.isHerdrClient(onTTYDevicePath: $0) },
+            herdrFederation: { HerdrMachineFederationReader.live().federation() },
+            herdrClientSurfaceCount: { HerdrClientTTYProbe.clientSurfaceCount() },
+            herdrPanes: herdrClient
+        )
+        let settings = viewModel.settings
+        let tracker = AgentAttentionTracker(
+            isEnabled: { settings.agentAttentionEnabled },
+            isWatching: { session in
+                guard let target = TerminalScreenContextSource.frontmostTarget() else { return false }
+                return await paneResolver.sessionShown(target: target) == session.sessionID
+            },
+            liveSessionIDs: { Set(registry.liveSessions().map(\.sessionID)) },
+            now: { Date() },
+            name: { session in
+                AgentAttentionText.name(
+                    of: session,
+                    among: registry.liveSessions(),
+                    title: desktopTitles.title(of:),
+                    nickname: nicknames.nickname(for:)
+                )
+            }
+        )
+        let announcer = AgentAttentionAnnouncer()
+        if settings.agentAttentionEnabled { announcer.requestSoundIfMissing() }
+        let attention = AgentAttentionModel(tracker: tracker, announcer: announcer)
+        viewModel.agentAttention = attention
+        // The other waiting sessions, in each attached mod's band (#1695).
+        let waitingBand = AgentWaitingBand(hub: claudeModChannels)
+        attention.waitingBand = waitingBand
+        claudeModChannels.observeAttach { sessionID in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { waitingBand.attached(sessionID: sessionID) }
+            }
+        }
+        // The registry calls this on whichever socket thread ingested; the
+        // sequence it stamps under its lock puts a session's events back in
+        // order.
+        registry.setTurnObserver { event, session, sequence in
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated { _ = tracker.receive(event, session: session, sequence: sequence) }
+            }
+        }
+    }
+
     /// Binds the hook socket and installs the pane authorizer that depends on it.
     ///
     /// Failure is non-fatal by design: the app's own dictation does not need the
@@ -265,16 +756,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// only installed on success — so a build where the broker never bound
     /// degrades to vocabulary-only screen context rather than to an unguarded
     /// attachment.
-    private func startClaudeContextBroker() {
+    @discardableResult
+    private func startClaudeContextBroker() -> ClaudeHookSocketTakeover.Outcome {
         guard let socketPath = ClaudeHookSocketPath.resolve() else {
             Log.claudeContext.error("Claude context broker not started: no socket path (HOME unset)")
-            return
+            return .failed
         }
+        // The `localvoxtral` command's requests arrive on the same socket
+        // (#721) and are answered from the app's own stores.
+        let agentCLI = AgentCLIService(
+            source: AgentCLIAppDataSource(
+                viewModel: viewModel,
+                sessions: claudeSessionRegistry,
+                openInbox: { [weak self] in self?.openWindow(on: .inbox) }
+            )
+        )
         let broker = ClaudeContextBroker(
             socketPath: socketPath,
             registry: claudeSessionRegistry,
-            shouldEmitLocalTitleMarker:
-                settingsStore.makeClaudeLocalTitleMarkerFallbackProvider()
+            agentCLI: { await agentCLI.respond(to: $0) },
+            modChannels: claudeModChannels
         )
         do {
             try broker.start()
@@ -291,25 +792,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // test that forgot to inject — constructs them.
             let ttyReader = AppleScriptTerminalTTYReader()
             let browserTabReader = AppleScriptFocusedBrowserTabURLReader()
+            let desktopSessionReader = AXClaudeDesktopSessionURLReader()
+            let herdrClient = HerdrSocketClient()
             // The cmux password is read from the Keychain lazily, per query, so
             // a user who never enables the arm is never prompted for keychain
             // access and the secret is not held in memory between dictations.
             let cmuxPasswords = CmuxSocketPasswordStore()
+            let sshDestinationCanonicalizer = SSHDestinationCanonicalizer.live()
             let resolver = ClaudeSessionJoinResolver(
                 registry: claudeSessionRegistry,
                 focusedTerminalTTY: { await ttyReader.focusedTerminalTTY(bundleID: $0) },
                 focusedBrowserTabURL: { await browserTabReader.focusedTabURL(bundleID: $0) },
+                focusedDesktopSessionURL: {
+                    await desktopSessionReader.focusedSessionURL(applicationPID: $0)
+                },
+                focusedWindowID: { TerminalScreenAXReader.focusedWindowIdentity(applicationPID: $0) },
                 herdrClientProbe: {
                     HerdrClientTTYProbe.isHerdrClient(onTTYDevicePath: $0)
                 },
-                herdrPanes: HerdrSocketClient(),
-                cmuxSurfaces: CmuxSocketClient(password: { cmuxPasswords.password() }),
+                herdrFederation: { HerdrMachineFederationReader.live().federation() },
+                herdrClientSurfaceCount: { HerdrClientTTYProbe.clientSurfaceCount() },
+                herdrPanes: herdrClient,
+                // Writes wait longer than reads: a write that times out after
+                // landing would be typed a second time by the fallback.
+                herdrPaneWriter: HerdrSocketClient(timeout: 2),
+                cmuxSurfaces: CmuxSocketClient(
+                    password: { cmuxPasswords.password() },
+                    bundleIDOfRunningPID: { CmuxSocketClient.runningBundleID(ofPID: $0) }
+                ),
                 cmuxJoinEnabled: { [weak viewModel] in
                     viewModel?.settings.cmuxSurfaceJoinEnabled ?? false
                 },
                 reportCmuxStatus: { [weak viewModel] status in
                     viewModel?.claudeIntegrationSettings?.cmuxStatus = status
                 },
+                ttyForegroundPIDs: { TTYProcessTable.foregroundPIDs(onTTYDevicePath: $0) },
                 sshDestinationProbe: {
                     SSHDestinationTTYProbe.connection(onTTYDevicePath: $0)
                 },
@@ -321,12 +838,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 enrolledHosts: { [weak self] destination in
                     self?.claudeRemoteHosts?.hosts(matchingSSHDestination: destination) ?? []
                 },
-                remoteHerdrForwards: ClaudeRemoteHerdrForwardService(
-                    spawner: ClaudeRemoteHerdrForwardSpawner(),
-                    workspaces: ClaudeRemoteHerdrForwardWorkspaces()
-                )
+                canonicalizedEnrolledHosts: { [weak self] destination in
+                    guard let hosts = self?.claudeRemoteHosts?.activeHostsIfReadable() else { return [] }
+                    return await sshDestinationCanonicalizer.matchingHosts(
+                        destination: destination,
+                        enrolledHosts: hosts
+                    )
+                },
+                proxyJumpShape: { destination in
+                    await sshDestinationCanonicalizer.proxyJumpShape(for: destination)
+                },
+                speculativeHosts: { [weak self] in
+                    self?.claudeRemoteHosts?.activeHostsIfReadable() ?? []
+                },
+                remoteHerdrForwards: claudeRemoteHerdrForwards,
+                herdrPanelMetadata: herdrClient,
+                readFocusedGrid: { target in
+                    TerminalScreenContextSource.readVisibleScreen(target: target)?.text
+                }
             )
-            viewModel.claudeSessionJoinResolver = resolver
+            viewModel.context.claudeSessionJoinResolver = resolver
+            viewModel.context.claudeModChannels = claudeModChannels
+            viewModel.session.projectTermProposer?.attachSessionChannels(claudeModChannels)
+            // "Go to <name>" (#723): the same registry and the same
+            // focused-pane reader as the join, so a pane counts as brought
+            // forward by the evidence the join trusts.
+            let nicknames = SessionNicknameStore.userDefaults(AppDefaults.shared, key: "session_navigation.nicknames")
+            let desktopTitles = ClaudeDesktopSessionTitles.live()
+            let terminalFocuser = TerminalSessionPaneFocuser.live(ttyReader: ttyReader)
+            viewModel.session.sessionNavigator = SessionNavigator(
+                liveSessions: { [claudeSessionRegistry] in claudeSessionRegistry.liveSessions() },
+                repositoryRoot: SessionNavigator.liveRepositoryRoot,
+                focuser: SessionPaneFocuserRouter(
+                    terminal: terminalFocuser,
+                    claudeDesktop: Self.liveClaudeDesktopFocuser(
+                        resolver: resolver,
+                        sleep: viewModel.session.dependencies.clock.sleep
+                    ),
+                    herdr: liveHerdrFocuser(
+                        terminal: terminalFocuser,
+                        herdrClient: herdrClient,
+                        canonicalizer: sshDestinationCanonicalizer
+                    )
+                ),
+                sleep: viewModel.session.dependencies.clock.sleep,
+                nicknames: nicknames,
+                branch: { RepoIndexing.branch(root: $0) },
+                title: desktopTitles.title(of:),
+                ttyForegroundPIDs: { TTYProcessTable.foregroundPIDs(onTTYDevicePath: $0) }
+            )
+            installAgentAttention(
+                ttyReader: ttyReader,
+                desktopSessionReader: desktopSessionReader,
+                herdrClient: herdrClient,
+                nicknames: nicknames,
+                desktopTitles: desktopTitles
+            )
+            // Correction learning compares each submitted prompt with the
+            // dictation the app inserted into that session. The registry
+            // calls this on the ingesting socket thread.
+            claudeSessionRegistry.setSubmittedPromptObserver { [weak viewModel] sessionID, prompt in
+                Task { @MainActor in
+                    viewModel?.promptSubmitted(sessionID: sessionID, prompt: prompt)
+                }
+            }
             // Pre-warm the Automation consent sheet OFF the dictation-start
             // path: the first Apple event to a terminal blocks in TCC until
             // the user answers, and that freeze must not land mid-dictation.
@@ -394,7 +969,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             browserConsentPrewarmObserver = browserPrewarmObserver
             browserPrewarmObserver.start()
             // The join gate for raw terminal screen attachment. Installed only
-            // now: without a running broker there are no markers to resolve, and
+            // now: without a running broker there are no sessions to resolve, and
             // an authorizer over an empty registry would answer `.unknown` to
             // everything anyway — but making the dependency explicit is what
             // keeps "no broker ⇒ no raw attachment" true by construction rather
@@ -402,47 +977,213 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             TerminalScreenRawAttachmentPolicy.configure(
                 authorizer: TerminalScreenClaudeJoinAuthorizer(
                     resolver: resolver,
-                    currentJoin: { [weak viewModel] in viewModel?.claudeSessionJoin }
+                    currentJoin: { [weak viewModel] in viewModel?.context.claudeSessionJoin }
                 )
             )
+            return .bound
         } catch {
             Log.claudeContext.error(
                 "Claude context broker failed to start: \(String(describing: error), privacy: .public)"
             )
+            return ClaudeHookSocketTakeover.Outcome(startError: error)
         }
+    }
+
+    /// A copy launched while another runs (a `try-pr.sh` build, a CI launch
+    /// smoke) loses the broker socket and the listener's port to it. Without
+    /// this it stayed deaf after the other copy quit, and every join abstained
+    /// until a relaunch (#655). The broker step reruns the whole start, since
+    /// everything after the bind is wired only on success.
+    private func armHookSocketTakeover(brokerStart: ClaudeHookSocketTakeover.Outcome) {
+        var steps: [ClaudeHookSocketTakeover.Step] = []
+        if brokerStart == .heldByAnotherCopy {
+            steps.append(.init(name: "broker") { [weak self] in
+                self?.startClaudeContextBroker() ?? .failed
+            })
+        }
+        if let settings = viewModel.claudeIntegrationSettings,
+           case .portConflict = settings.listenerStatus {
+            // On a clock too: the port's holder may be no copy of the app,
+            // and a failed bind touches no one (#892).
+            steps.append(.init(name: "remote listener", retryInterval: .seconds(10)) { [weak settings] in
+                guard let settings else { return .failed }
+                // Through the model, so Settings shows the new status; it
+                // also starts the forwards once the port is bound. The
+                // takeover logs the wait once, not every ten seconds.
+                settings.synchronizeListenerAtLaunch(logsPortConflict: false)
+                switch settings.listenerStatus {
+                case .portConflict: return .heldByAnotherCopy
+                case .failed: return .failed
+                case .idle, .listening: return .bound
+                }
+            })
+        }
+        guard !steps.isEmpty else { return }
+        let ownPID = ProcessInfo.processInfo.processIdentifier
+        let bundleID = Bundle.main.bundleIdentifier
+        let takeover = ClaudeHookSocketTakeover(
+            steps: steps,
+            otherCopies: {
+                guard let bundleID else { return [] }
+                return NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+                    .map(\.processIdentifier)
+                    .filter { $0 != ownPID }
+            },
+            watchExit: { pid, onExit in ProcessExitWatch(pid: pid, onExit: onExit) }
+        )
+        hookSocketTakeover = takeover
+        takeover.begin()
+    }
+
+    /// Keeps an installed local Claude Code plugin working without a click:
+    /// repoints the publisher link at this app, wherever it now lives, and
+    /// updates a plugin older than the one bundled. Never installs a plugin
+    /// that is not there.
+    ///
+    /// CI launches of the packaged app on the owner's Mac are skipped: they
+    /// run a temporary copy, and pointing the owner's plugin at it would leave
+    /// the link dangling once the run deletes it.
+    private func maintainLocalClaudePlugin() {
+        guard !StartupPermissionSuppression.loginKeychainIsDisabled() else {
+            Log.claudeContext.info("Claude plugin maintenance skipped for a CI launch")
+            return
+        }
+        if let publisher = ClaudePluginAssets.publisherURL() {
+            do {
+                if case .updated(let previous) = try ClaudePublisherPointer.refresh(publisher: publisher) {
+                    Log.claudeContext.info(
+                        "Claude publisher link now names \(publisher.path, privacy: .public) (was \(previous ?? "absent", privacy: .public))"
+                    )
+                }
+            } catch {
+                Log.claudeContext.error(
+                    "Claude publisher link refresh failed: \(String(describing: error), privacy: .public)"
+                )
+            }
+        }
+        if let bundled = ClaudePluginAssets.marketplaceURL() {
+            do {
+                let outcome = try ClaudeMarketplaceMirror.refresh(source: bundled)
+                if outcome != .unchanged {
+                    Log.claudeContext.info(
+                        "Claude marketplace mirror \(String(describing: outcome), privacy: .public) from \(bundled.path, privacy: .public)"
+                    )
+                }
+            } catch {
+                Log.claudeContext.error(
+                    "Claude marketplace mirror refresh failed: \(String(describing: error), privacy: .public)"
+                )
+            }
+        }
+        // Codex reads its local marketplace in place, from the path it was
+        // added with, so it gets the same fixed-path copy.
+        if let bundled = CodexPluginAssets.marketplaceURL() {
+            do {
+                let outcome = try ClaudeMarketplaceMirror.refresh(
+                    source: bundled, mirrorURL: CodexPluginAssets.mirrorURL()
+                )
+                if outcome != .unchanged {
+                    Log.claudeContext.info(
+                        "Codex marketplace mirror \(String(describing: outcome), privacy: .public) from \(bundled.path, privacy: .public)"
+                    )
+                }
+            } catch {
+                Log.claudeContext.error(
+                    "Codex marketplace mirror refresh failed: \(String(describing: error), privacy: .public)"
+                )
+            }
+        }
+        guard let settings = viewModel.claudeIntegrationSettings else { return }
+        Task {
+            // Order matters: the registration is re-pointed at the mirror
+            // refreshed above BEFORE the version check, so an update lands in
+            // a marketplace Claude Code can actually read.
+            await settings.repairMarketplaceRegistrationAtLaunch()
+            await settings.updateOutdatedPluginAtLaunch()
+        }
+        Task { await settings.updateOutdatedVibeHooksAtLaunch() }
     }
 
     /// Binds the remote (SSH) hook listener, but only for a user who has
     /// actually enrolled a host.
     ///
     /// "No enrollment ⇒ no open port" is the point: everyone else's Mac gets
-    /// exactly what it had before, with nothing listening on 8473. That is also
-    /// why the host registry is constructed here rather than as a stored
-    /// property — reading (and failing to read) a file nobody has is not
-    /// something to do at init.
+    /// exactly what it had before, with nothing listening on 8473. The host
+    /// registry was loaded during app initialization so session restore could
+    /// filter remote entries before the broker starts.
     ///
     /// Failure is non-fatal and loud, matching the local broker. The coordinator
     /// — not this method — owns the bind/unbind decision from here on, so
     /// enrolling the first host in Settings binds the port immediately and
     /// revoking the last one closes it. There is no relaunch step.
     private func startClaudeRemoteListener() {
-        let registry: ClaudeRemoteHostRegistry?
-        do {
-            registry = try ClaudeRemoteHostRegistry()
-        } catch {
-            // The list exists but is unreadable — a state the user must be able
-            // to SEE, not just one we log. The Settings row says the list could
-            // not be read rather than offering an Enroll button that would
-            // silently fail.
-            Log.claudeContext.error(
-                "Claude remote host registry unreadable: \(String(describing: error), privacy: .public)"
-            )
-            registry = nil
+        let registry = claudeRemoteHosts
+        // A remote project's terms come from a run on its host (#641); the
+        // proposer marks the session, the listener asks and takes the answer.
+        let projectTerms: RemoteProjectTermRequests? = registry.flatMap { hosts in
+            viewModel.learnedTermStore.map {
+                RemoteProjectTermRequests(store: $0, hosts: hosts, usageRecorder: viewModel.engines.usageLedger)
+            }
         }
-        claudeRemoteHosts = registry
+        viewModel.session.projectTermProposer?.attachRemote(projectTerms)
+        // Quick capture's README summaries and drafts for remote projects
+        // (#745), on the same channel.
+        let quickCapture: RemoteQuickCaptureRequests? = registry.flatMap { hosts in
+            viewModel.learnedTermStore.map {
+                RemoteQuickCaptureRequests(
+                    store: $0, hosts: hosts, registry: claudeSessionRegistry,
+                    usageRecorder: viewModel.engines.usageLedger
+                )
+            }
+        }
+        viewModel.quickCapture?.attachRemote(quickCapture)
+        viewModel.quickCapture?.enrolledHosts = {
+            registry?.activeHostsIfReadable().map { (id: $0.id, name: $0.label) } ?? []
+        }
+        viewModel.quickCapture?.liveSessions = { [claudeSessionRegistry] in claudeSessionRegistry.liveSessions() }
 
         let coordinator = registry.map { hosts in
-            ClaudeRemoteListenerCoordinator(hosts: hosts, sessions: claudeSessionRegistry)
+            ClaudeRemoteListenerCoordinator(
+                hosts: hosts,
+                sessions: claudeSessionRegistry,
+                forwardProbes: claudeRemoteForwardProbes,
+                onRemoteHerdrActivity: { [weak self] hostID, remoteSocketPath in
+                    Task { @MainActor [weak self] in
+                        guard let self,
+                              let host = self.claudeRemoteHosts?.host(id: hostID),
+                              !host.isRevoked,
+                              let alias = host.sshHostAlias
+                        else { return }
+                        await self.claudeRemoteHerdrForwards.prepare(
+                            hostID: hostID,
+                            alias: alias,
+                            remoteSocketPath: remoteSocketPath
+                        )
+                    }
+                },
+                onRemoteSkills: { [store = viewModel.session.agentSkillStore] hostID, names in
+                    store?.record(hostID: hostID, names: names)
+                },
+                projectTerms: projectTerms,
+                quickCapture: quickCapture,
+                doctor: RemoteDoctorRoute { @MainActor [weak viewModel, claudeSessionRegistry] hostID in
+                    guard let viewModel else { return [] }
+                    return await AgentCLIAppDataSource(viewModel: viewModel, sessions: claudeSessionRegistry)
+                        .hostDoctorChecks(hostID: hostID)
+                },
+                // Remote sessions' mods poll through the same hub the local
+                // broker hands attaches to (#1412).
+                modChannels: ClaudeRemoteModChannels(hub: claudeModChannels, registry: claudeSessionRegistry),
+                inbox: RemoteInboxRoute(
+                    registry: claudeSessionRegistry,
+                    captures: { @MainActor [weak viewModel] in viewModel?.quickCapture?.model.items },
+                    open: { @MainActor [weak viewModel, claudeSessionRegistry] id in
+                        guard let viewModel else { return nil }
+                        return await AgentCLIAppDataSource(viewModel: viewModel, sessions: claudeSessionRegistry)
+                            .openCapture(id)
+                    }
+                )
+            )
         }
         claudeRemoteListenerCoordinator = coordinator
 
@@ -465,18 +1206,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // outran the quit drain) are killed before this run's forwards dial —
         // otherwise the fresh forward is refused its own port and the pane
         // reports "Port held" terminally at this Mac's own leftover.
-        let forwardPidLedger = ClaudeRemoteForwardPidLedger()
-        let forwardOrphanReaper = ClaudeRemoteForwardOrphanReaper(ledger: forwardPidLedger)
+        let forwardOrphanReaper = ClaudeRemoteForwardOrphanReaper(
+            ledger: claudeRemoteForwardPidLedger
+        )
         let forwards = registry.map { hosts in
             ClaudeRemoteForwardCoordinator(
                 hosts: hosts,
                 remoteForwardPort: remoteForwardPort,
                 isListenerBound: { coordinator?.isListening ?? false },
-                pidLedger: forwardPidLedger,
-                reapOrphans: { await forwardOrphanReaper.reap() }
+                // Turns "the remote refused our bind" from one verdict into
+                // two: a stranger holds the port, or our own forward is already
+                // up because the user has an ssh session to that host. Only the
+                // nonce round-trip can tell them apart, and without it every
+                // refusal stays the pessimistic reading.
+                ownershipProbe: ClaudeRemoteForwardOwnershipCheck.live(
+                    witness: claudeRemoteForwardProbes
+                ),
+                pidLedger: claudeRemoteForwardPidLedger,
+                reapOrphans: { [weak self] in
+                    await forwardOrphanReaper.reap()
+                    await MainActor.run { self?.claudeRemoteHerdrForwards.markOrphanReapComplete() }
+                },
+                reconcileHerdrEnrollment: { [weak self] activeHostIDs in
+                    self?.claudeRemoteHerdrForwards.reconcileEnrollment(
+                        activeHostIDs: activeHostIDs
+                    )
+                }
             )
         }
         claudeRemoteForwards = forwards
+        if forwards != nil {
+            claudeRemoteForwardRecovery = ClaudeRemoteForwardRecoveryTriggers { [weak self] trigger in
+                self?.claudeRemoteForwards?.recover(after: trigger)
+            }
+        }
 
         viewModel.claudeIntegrationSettings = ClaudeIntegrationSettingsModel(
             registry: registry,
@@ -485,7 +1248,157 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             enrollmentService: ClaudeRemoteEnrollmentService.live(),
             remoteForwardPort: remoteForwardPort,
             cmuxPasswords: CmuxSocketPasswordStore(),
-            forwards: forwards
+            forwards: forwards,
+            // Read once per pane refresh, not cached at launch: a `chsh` while
+            // the app runs would otherwise write the wrong shell's syntax.
+            loginShell: {
+                ClaudeShellKind.detect(
+                    loginShellPath: ClaudeLoginShellReader.loginShellPath()
+                )
+            },
+            shellRCWriter: { shell in
+                ClaudeShellRCWriter(
+                    fileSystem: LiveClaudeShellRCFileSystem(
+                        relativePath: ClaudeShellRCSetup.relativeRCPath(for: shell) { relative in
+                            FileManager.default.fileExists(
+                                atPath: FileManager.default.homeDirectoryForCurrentUser
+                                    .appendingPathComponent(relative).path
+                            )
+                        }
+                    )
+                )
+            },
+            // The app-visible half of the setup step: has a session actually
+            // arrived carrying the value. Reads the registry, never a file.
+            liveLocalTTYReport: { [weak claudeSessionRegistry] in
+                guard let sessions = claudeSessionRegistry?.liveSessions(),
+                      !sessions.isEmpty
+                else { return .noSessions }
+                let remote = sessions.filter { $0.remoteSessionEnvironment != nil }
+                guard !remote.isEmpty else { return .noSessions }
+                return remote.contains { $0.remoteSessionEnvironment?.localTTY != nil }
+                    ? .seen : .notSeen
+            },
+            // Off the main actor: `claude plugin list` shells out.
+            fetchPluginListOutput: {
+                await Task.detached(priority: .userInitiated) {
+                    try? ClaudePluginInstallService.live().pluginListOutput()
+                }.value
+            },
+            // Off the main actor for the same reason as the listing above.
+            fetchMarketplaceListOutput: {
+                await Task.detached(priority: .userInitiated) {
+                    try? ClaudePluginInstallService.live().marketplaceListOutput()
+                }.value
+            },
+            // Read at repair time, not now: this model is built before the
+            // launch maintenance that creates the mirror.
+            desiredMarketplacePath: { ClaudeMarketplaceMirror.usableURL()?.path },
+            bundledPluginVersion: ClaudePluginAssets.localPluginVersion(),
+            statuslineService: {
+                ClaudeStatuslineInstallService(
+                    fileSystem: LiveClaudeStatuslineFileSystem(),
+                    scriptFileSystem: LiveClaudeStatuslineFileSystem(
+                        relativePath: ClaudeStatuslineCombine.scriptRelativePath
+                    )
+                )
+            },
+            // The same publisher the plugin shim execs, in `--statusline`
+            // mode. Nil when the binary is not where this build put it — the
+            // row then reports it cannot install rather than writing a path
+            // that prints nothing.
+            statuslineHookCommand: {
+                guard let publisher = ClaudePluginAssets.publisherURL() else { return nil }
+                // Quoted when it must be: an app under `~/My Apps` would
+                // otherwise split into two words.
+                return "\(ClaudeStatuslineCombine.shellWord(publisher.path)) --statusline"
+            },
+            opencodeService: {
+                OpencodePluginInstallService(
+                    bundledPluginData: {
+                        guard let url = ClaudePluginAssets.opencodePluginURL() else { return nil }
+                        return try? Data(contentsOf: url)
+                    },
+                    fileSystem: LiveOpencodePluginFileSystem()
+                )
+            },
+            vibeService: {
+                VibeHooksInstallService(
+                    bundledShimData: {
+                        ClaudePluginAssets.vibeFileURL(named: ClaudePluginAssets.vibeShimFileName)
+                            .flatMap { try? Data(contentsOf: $0) }
+                    },
+                    bundledHooksBlock: {
+                        ClaudePluginAssets.vibeFileURL(named: ClaudePluginAssets.vibeHooksBlockFileName)
+                            .flatMap { try? String(contentsOf: $0, encoding: .utf8) }
+                    },
+                    fileSystem: LiveVibeHooksFileSystem()
+                )
+            },
+            dictationNoteService: { agent in
+                DictationNoteInstallService(agent: agent, fileSystem: LiveDictationNoteFileSystem())
+            },
+            doctorSkillService: { agent in
+                AgentSkillInstallService(
+                    agent: agent,
+                    bundledSkill: { ClaudePluginAssets.doctorSkill() },
+                    fileSystem: LiveDictationNoteFileSystem()
+                )
+            },
+            vibeRemoteFiles: { VibeRemoteHooksFiles.bundled() },
+            codexService: { CodexPluginInstallService.live() },
+            codexBundledVersion: CodexPluginAssets.bundledPluginVersion(),
+            codexHookMemory: CodexHookHeardMemory(
+                registry: claudeSessionRegistry,
+                load: { AppDefaults.shared.bool(forKey: CodexHookHeardMemory.defaultsKey) },
+                save: { AppDefaults.shared.set($0, forKey: CodexHookHeardMemory.defaultsKey) }
+            ),
+            // A binary on this Mac: a synchronous PATH scan, decided at model
+            // construction so the row paints on first paint.
+            herdrBinaryAvailable: {
+                ClaudeHerdrAvailability.isHerdrBinaryAvailable()
+            },
+            // Any live session — local or remote — reporting a herdr pane.
+            // Reads the registry, never the screen. Refreshes with the pane.
+            herdrPresenceReport: { [weak claudeSessionRegistry] in
+                guard let sessions = claudeSessionRegistry?.liveSessions() else { return false }
+                return sessions.contains { snapshot in
+                    snapshot.process?.herdrPaneID != nil
+                        || snapshot.remoteSessionEnvironment?.herdrPaneID != nil
+                }
+            },
+            // The enrolled hosts whose live REMOTE sessions report a herdr
+            // pane, for the herdr pane's host list. A local herdr pane
+            // belongs to no enrolled host and is never listed.
+            herdrPaneReportingHostIDs: { [weak claudeSessionRegistry] in
+                guard let sessions = claudeSessionRegistry?.liveSessions() else { return [] }
+                return sessions.compactMap { snapshot in
+                    guard snapshot.remoteSessionEnvironment?.herdrPaneID != nil else {
+                        return nil
+                    }
+                    return ClaudeRemoteSessionScope.hostID(
+                        fromScopedSessionID: snapshot.sessionID
+                    )
+                }
+            },
+            // The live herdr catalog: wired here, not defaulted in the model,
+            // so the filesystem-reading reader stays out of the model's
+            // public signature.
+            herdrMachineCatalogReading: {
+                HerdrMachineFederationReader.live().catalog()
+            },
+            // The federated panel row is offered only when the live catalog
+            // has an enabled machine. Read at refresh, never cached at launch:
+            // machines can be added, removed, enabled, or disabled while the
+            // app runs.
+            hasEnabledHerdrMachineReport: {
+                switch HerdrMachineFederationReader.live().catalog() {
+                case .catalog(let catalog):
+                    return !catalog.enabledProfiles.isEmpty
+                case .absent, .unreadable:
+                    return false
+                }
+            }
         )
 
         // Route launch through the same model that owns the Settings status.
@@ -538,7 +1451,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         """
         alert.addButton(withTitle: "Update (Keep Backups)")
         alert.addButton(withTitle: "Keep Mine")
-        alert.addButton(withTitle: "Show Files…")
+        // No ellipsis: it reveals the files in Finder, with no dialog to
+        // fill in. The macOS rule, which the app's buttons follow: "…" only
+        // when pressing asks for more input or a confirmation first.
+        alert.addButton(withTitle: "Show Files")
 
         decision: while true {
             switch alert.runModal() {
@@ -566,6 +1482,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Moves the process between menu-bar-only and Dock-and-app-switcher, and
+    /// reports whether it took.
+    ///
+    /// Going `.regular` gives the process a Dock tile, an app switcher entry
+    /// and a main menu, but does not by itself bring it forward — without the
+    /// activation the window it was opened for can end up behind whatever was
+    /// frontmost. `activate` is a no-op when the app is already active, which
+    /// it usually is, since the window that triggered this was just opened.
+    private static func applyActivationPolicy(_ policy: NSApplication.ActivationPolicy) -> Bool {
+        guard NSApp.setActivationPolicy(policy) else {
+            Log.diagnostics.error(
+                "Activation policy change to \(String(describing: policy), privacy: .public) was refused."
+            )
+            return false
+        }
+        // One line per transition, not per window: the transitions are the
+        // whole behavior, and this is the only place an outside observer can
+        // read which one the app believes it is in.
+        Log.diagnostics.notice(
+            "Activation policy is now \(policy == .regular ? "regular (Dock icon shown)" : "accessory (menu bar only)", privacy: .public)."
+        )
+        if policy == .regular {
+            NSApp.activate(ignoringOtherApps: true)
+        }
+        return true
+    }
+
     private func presentOnboarding() {
         if let onboardingController {
             onboardingController.present()
@@ -575,26 +1518,107 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             settings: settingsStore,
             viewModel: viewModel,
             backendManager: backendManager,
-            openEndpointsSettings: { [weak self] in self?.openEndpointsSettings() }
+            dockIconPolicy: dockIconPolicy,
+            openEndpointsSettings: { [weak self] in self?.openWindow(on: .endpoints) }
         )
         controller.onFinished = { [weak self] in
             self?.onboardingController = nil
             // First launch skips the eager warmup (the wizard owns bootstrap);
             // once the wizard is done — finished or skipped — start whatever
             // required managed backends it didn't already start.
-            self?.viewModel.warmUpManagedBackendsAtLaunchIfNeeded()
+            self?.viewModel.engines.warmUpManagedBackendsAtLaunchIfNeeded()
             self?.presentPendingConfigDefaultsPromptIfNeeded()
         }
         onboardingController = controller
         controller.present()
     }
 
-    private func openEndpointsSettings() {
-        settingsNavigator.selectedTab = .endpoints
-        NSApp.activate(ignoringOtherApps: true)
-        // AppKit entry point for the SwiftUI `Settings` scene on macOS 14+.
-        NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+    /// Brings up the app's one window on `tab`. The Settings scene hosts it,
+    /// History and Insights included, so this is also how the window opens on
+    /// a pane that is not a settings pane.
+    private func openWindow(on tab: SettingsTab) {
+        settingsNavigator.selectedTab = tab
+        Task { @MainActor in
+            let opener = AppWindowOpener(
+                show: { [weak self] in self?.askForTheWindow() },
+                isOnScreen: { AppDelegate.windowIsOnScreen() },
+                sleepFor: { try? await Task.sleep(for: $0) }
+            )
+            guard let attempt = await opener.open() else {
+                Log.diagnostics.error(
+                    """
+                    The localvoxtral window never opened; showSettingsWindow: was answered \
+                    but no window appeared. Windows now: \
+                    \(AppDelegate.windowSummary(), privacy: .public)
+                    """
+                )
+                return
+            }
+            if attempt > 1 {
+                Log.diagnostics.notice(
+                    "The localvoxtral window opened on attempt \(attempt, privacy: .public)."
+                )
+            }
+        }
     }
+
+    /// Asks for the window, by the two routes the app has, the one that works
+    /// at launch first.
+    ///
+    /// `NSApp.sendAction(showSettingsWindow:)` — the route the onboarding
+    /// Engines link has always used — is ACCEPTED at launch and opens nothing
+    /// (#449, measured on the packaged build over eight asks in 1.75 s, and
+    /// not for want of the main menu: it fails with the Dock icon up too).
+    /// SwiftUI's own `openSettings` is what the menu bar item's Settings…
+    /// uses, and that one works; the label hands it over at launch.
+    ///
+    /// The send stays behind it, addressed through the main menu's own item
+    /// when the app has one, since `to: nil` walks a responder chain that
+    /// answers without acting.
+    private func askForTheWindow() {
+        NSApp.activate(ignoringOtherApps: true)
+        if let settingsOpener {
+            settingsOpener()
+            return
+        }
+        let selector = Selector(("showSettingsWindow:"))
+        if let item = AppDelegate.mainMenuItem(for: selector) {
+            NSApp.sendAction(selector, to: item.target, from: item)
+            return
+        }
+        NSApp.sendAction(selector, to: nil, from: nil)
+    }
+
+    /// A main-menu item by its action. There is a main menu only while the
+    /// process is `.regular` — AppKit synthesizes none for an accessory app.
+    private static func mainMenuItem(for action: Selector) -> NSMenuItem? {
+        for top in NSApp.mainMenu?.items ?? [] {
+            for item in top.submenu?.items ?? [] where item.action == action {
+                return item
+            }
+        }
+        return nil
+    }
+
+    /// Every window the process has, for the one log line that has to explain
+    /// why the window the user asked for is not on screen.
+    private static func windowSummary() -> String {
+        let windows = NSApp.windows.map { window in
+            "\(window.title.isEmpty ? "<untitled>" : window.title)"
+                + "[\(type(of: window)) visible=\(window.isVisible)]"
+        }
+        return windows.isEmpty ? "none" : windows.joined(separator: ", ")
+    }
+
+    /// The scene's window, by the title `SettingsWindowChromeView` keeps on it.
+    /// Hidden-title chrome does not clear `window.title`, precisely so the AX
+    /// drills — and this — can find it.
+    private static func windowIsOnScreen() -> Bool {
+        NSApp.windows.contains {
+            $0.title == SettingsWindowChromeView.windowTitle && $0.isVisible
+        }
+    }
+
 }
 
 @MainActor
@@ -604,15 +1628,34 @@ private enum MenuBarIconAsset {
         "MicIconTemplate",
     ], asTemplate: true)
 
-    static let connectedIcon: NSImage? = loadIcon(candidates: [
+    static let connectedIcon: NSImage? = adaptiveIcon(coloredCandidates: [
         "MicIconTemplate_connected",
         "MicIconTemplate@2x_connected",
-    ], asTemplate: false)
+    ])
 
-    static let failureIcon: NSImage? = loadIcon(candidates: [
+    static let failureIcon: NSImage? = adaptiveIcon(coloredCandidates: [
         "MicIconTemplate_failure",
         "MicIconTemplate@2x_failure",
-    ], asTemplate: false)
+    ])
+
+    private static var attentionIcons: [AgentAttentionMark: NSImage] = [:]
+
+    static func attentionIcon(_ mark: AgentAttentionMark) -> NSImage? {
+        if let icon = attentionIcons[mark] { return icon }
+        guard let template = idleIcon else { return nil }
+        let icon = MenuBarStatusIcon.withAttentionMark(template: template, mark: mark)
+        attentionIcons[mark] = icon
+        return icon
+    }
+
+    private static func adaptiveIcon(coloredCandidates: [String]) -> NSImage? {
+        guard let template = idleIcon,
+              let colored = loadIcon(candidates: coloredCandidates, asTemplate: false)
+        else {
+            return nil
+        }
+        return MenuBarStatusIcon.appearanceAdaptive(template: template, colored: colored)
+    }
 
     private static func loadIcon(candidates: [String], asTemplate: Bool) -> NSImage? {
         let bundle = Bundle.main

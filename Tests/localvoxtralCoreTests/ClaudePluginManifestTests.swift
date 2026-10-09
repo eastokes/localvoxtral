@@ -1,0 +1,578 @@
+import ClaudeContextWire
+import Foundation
+import XCTest
+@testable import localvoxtralCore
+
+/// Validates the in-repo Claude Code marketplace as an artifact.
+///
+/// These assertions are cheap and catch the class of breakage that is otherwise
+/// only visible when a user runs `claude plugin install` and it fails: a typo'd
+/// hook event, a plugin source that does not exist, a hook command that lost its
+/// `${CLAUDE_PLUGIN_ROOT}` prefix and silently resolves to nothing.
+final class ClaudePluginManifestTests: XCTestCase {
+    private var marketplace: URL!
+
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        try Self.writePublisherStubsOnce()
+        marketplace = try XCTUnwrap(
+            ClaudePluginAssets.developmentMarketplaceURL(),
+            "the repo checkout must contain integrations/claude-code"
+        )
+    }
+
+    private func json(at url: URL) throws -> [String: Any] {
+        let data = try Data(contentsOf: url)
+        return try XCTUnwrap(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+    }
+
+    /// Every string that appears as a KEY or VALUE anywhere in a parsed JSON
+    /// tree. Lets a check assert on the manifest's actual content rather than
+    /// its raw file text — a structural read that cannot be fooled by, or trip
+    /// over, formatting.
+    private static func jsonStrings(in object: Any) -> [String] {
+        switch object {
+        case let string as String:
+            return [string]
+        case let array as [Any]:
+            return array.flatMap { jsonStrings(in: $0) }
+        case let dictionary as [String: Any]:
+            return dictionary.flatMap { key, value in [key] + jsonStrings(in: value) }
+        default:
+            return []
+        }
+    }
+
+    private var marketplaceManifest: URL {
+        marketplace.appendingPathComponent(".claude-plugin/marketplace.json")
+    }
+
+    private var pluginRoot: URL {
+        marketplace.appendingPathComponent("plugins/localvoxtral")
+    }
+
+    private var remotePluginRoot: URL {
+        marketplace.appendingPathComponent("plugins/\(ClaudePluginAssets.remotePluginName)")
+    }
+
+    // MARK: Marketplace
+
+    func testMarketplaceIsRecognisedAsAMarketplace() {
+        XCTAssertTrue(ClaudePluginAssets.isMarketplace(marketplace))
+    }
+
+    func testMarketplaceManifestIsValidJSONWithRequiredFields() throws {
+        let manifest = try json(at: marketplaceManifest)
+        XCTAssertEqual(manifest["name"] as? String, ClaudePluginAssets.marketplaceName)
+        XCTAssertNotNil(manifest["owner"] as? [String: Any])
+        let plugins = try XCTUnwrap(manifest["plugins"] as? [[String: Any]])
+        XCTAssertEqual(
+            plugins.compactMap { $0["name"] as? String },
+            [ClaudePluginAssets.pluginName, ClaudePluginAssets.remotePluginName, ClaudePluginAssets.modPluginName]
+        )
+    }
+
+    func testEveryMarketplacePluginSourceResolvesToARealDirectory() throws {
+        let manifest = try json(at: marketplaceManifest)
+        let plugins = try XCTUnwrap(manifest["plugins"] as? [[String: Any]])
+        for plugin in plugins {
+            let source = try XCTUnwrap(plugin["source"] as? String)
+            let resolved = marketplace.appendingPathComponent(source).standardizedFileURL
+            var isDirectory: ObjCBool = false
+            XCTAssertTrue(
+                FileManager.default.fileExists(atPath: resolved.path, isDirectory: &isDirectory),
+                "plugin source \(source) does not exist"
+            )
+            XCTAssertTrue(isDirectory.boolValue)
+            XCTAssertTrue(
+                FileManager.default.fileExists(
+                    atPath: resolved.appendingPathComponent(".claude-plugin/plugin.json").path
+                ),
+                "plugin source \(source) has no manifest"
+            )
+        }
+    }
+
+    // MARK: Root marketplace (what a remote host installs from)
+
+    /// A remote host has no app bundle to register a directory from, so it runs
+    /// `claude plugin marketplace add T0mSIlver/localvoxtral` — which resolves
+    /// `.claude-plugin/marketplace.json` at the repository ROOT. Two manifests
+    /// that must never drift apart, hence this test rather than trust.
+    func testRootMarketplaceMirrorsTheBundledOne() throws {
+        let root = try XCTUnwrap(ClaudePluginAssets.rootMarketplaceURL())
+        XCTAssertTrue(
+            ClaudePluginAssets.isMarketplace(root),
+            "the repo root must be a marketplace: a remote host installs from the GitHub repo"
+        )
+        let rootManifest = try json(at: root.appendingPathComponent(".claude-plugin/marketplace.json"))
+        let bundled = try json(at: marketplaceManifest)
+        XCTAssertEqual(
+            rootManifest["name"] as? String,
+            bundled["name"] as? String,
+            "both manifests must name the same marketplace, or the plugin reference differs by machine"
+        )
+        let rootPlugins = try XCTUnwrap(rootManifest["plugins"] as? [[String: Any]])
+        let bundledPlugins = try XCTUnwrap(bundled["plugins"] as? [[String: Any]])
+        XCTAssertEqual(
+            rootPlugins.compactMap { $0["name"] as? String },
+            bundledPlugins.compactMap { $0["name"] as? String }
+        )
+    }
+
+    func testRootMarketplacePluginSourcesResolveFromTheRepoRoot() throws {
+        let root = try XCTUnwrap(ClaudePluginAssets.rootMarketplaceURL())
+        let manifest = try json(at: root.appendingPathComponent(".claude-plugin/marketplace.json"))
+        let plugins = try XCTUnwrap(manifest["plugins"] as? [[String: Any]])
+        XCTAssertFalse(plugins.isEmpty)
+        for plugin in plugins {
+            let source = try XCTUnwrap(plugin["source"] as? String)
+            // The root manifest is one directory tree up from the bundled one,
+            // so its sources must be rewritten for that depth. A copy-paste of
+            // "./plugins/..." would resolve to nothing and only fail on a
+            // remote host, at install time.
+            XCTAssertTrue(
+                source.hasPrefix("./\(ClaudePluginAssets.repositoryRelativePath)/"),
+                "root marketplace source must be repo-root relative: \(source)"
+            )
+            let resolved = root.appendingPathComponent(source).standardizedFileURL
+            XCTAssertTrue(
+                FileManager.default.fileExists(
+                    atPath: resolved.appendingPathComponent(".claude-plugin/plugin.json").path
+                ),
+                "root marketplace source \(source) does not resolve"
+            )
+        }
+    }
+
+    func testNoUserFacingManifestURLPointsAtTheOldOwner() throws {
+        // The repo moved to T0mSIlver; a stale owner in a manifest is a link
+        // users click and a marketplace reference that resolves to nothing.
+        //
+        // Structural, not a raw-text grep: parse each manifest and inspect every
+        // string it actually declares (keys and values, recursively). That both
+        // proves the file is valid JSON and — matching case-insensitively —
+        // catches a `TomVaucourt`/`tomvaucourt` a case-sensitive substring scan
+        // would miss, so it is strictly stronger than the old text search.
+        let root = try XCTUnwrap(ClaudePluginAssets.rootMarketplaceURL())
+        let manifests = [
+            marketplaceManifest,
+            root.appendingPathComponent(".claude-plugin/marketplace.json"),
+            pluginRoot.appendingPathComponent(".claude-plugin/plugin.json"),
+            remotePluginRoot.appendingPathComponent(".claude-plugin/plugin.json"),
+        ]
+        for manifest in manifests {
+            for string in Self.jsonStrings(in: try json(at: manifest)) {
+                XCTAssertFalse(
+                    string.lowercased().contains("tomvaucourt"),
+                    "\(manifest.lastPathComponent) still points at the old repo owner via \"\(string)\""
+                )
+            }
+        }
+    }
+
+    // MARK: Plugin
+
+    func testPluginManifestIsValidAndLeavesTheStandardHooksFileImplicit() throws {
+        let manifest = try json(at: pluginRoot.appendingPathComponent(".claude-plugin/plugin.json"))
+        XCTAssertEqual(manifest["name"] as? String, ClaudePluginAssets.pluginName)
+        XCTAssertNotNil(manifest["description"] as? String)
+        XCTAssertNotNil(manifest["version"] as? String)
+        // Claude Code loads hooks/hooks.json by convention and rejects a
+        // manifest that names it again as a duplicate hooks file — the plugin
+        // installs but lands "failed to load" (field bug, #150 hand test).
+        // manifest.hooks may only reference ADDITIONAL hook files.
+        XCTAssertNil(manifest["hooks"], "naming the standard hooks file makes the CLI refuse to load the plugin")
+    }
+
+    func testPluginDeclaresNoTokenConsumingSurfaces() throws {
+        // The plugin is a data channel, not a Claude feature: a skill, command,
+        // or agent would put tokens (and latency) on the user's turn for
+        // something they never asked Claude to do. `statusLine` is in the list
+        // for the same reason and a sharper one — it runs on EVERY turn — and
+        // because the remote plugin's guard already covers it: the two manifests
+        // make the same promise, so they must be held to the same list.
+        let manifest = try json(at: pluginRoot.appendingPathComponent(".claude-plugin/plugin.json"))
+        for key in ["skills", "commands", "agents", "mcpServers", "statusLine"] {
+            XCTAssertNil(manifest[key], "the plugin must not declare \(key)")
+        }
+        for directory in ["skills", "commands", "agents"] {
+            XCTAssertFalse(
+                FileManager.default.fileExists(atPath: pluginRoot.appendingPathComponent(directory).path),
+                "the plugin must not ship a \(directory)/ directory"
+            )
+        }
+    }
+
+    // MARK: Hooks
+
+    private func hooksByEvent() throws -> [String: [[String: Any]]] {
+        let manifest = try json(at: pluginRoot.appendingPathComponent("hooks/hooks.json"))
+        return try XCTUnwrap(manifest["hooks"] as? [String: [[String: Any]]])
+    }
+
+    /// Every `command` string across every event.
+    private func allCommands() throws -> [String] {
+        try hooksByEvent().values.flatMap { matchers in
+            matchers.flatMap { matcher -> [String] in
+                let entries = matcher["hooks"] as? [[String: Any]] ?? []
+                return entries.compactMap { $0["command"] as? String }
+            }
+        }
+    }
+
+    func testDeclaresEveryRequiredEvent() throws {
+        let events = Set(try hooksByEvent().keys)
+        XCTAssertEqual(
+            events,
+            [
+                "SessionStart", "UserPromptSubmit", "CwdChanged",
+                "PostToolUse", "Stop", "Notification", "SessionEnd",
+            ]
+        )
+    }
+
+    /// Only the waits the app shows (#717); `idle_prompt` and the rest never
+    /// start the publisher.
+    func testTheNotificationHookMatchesOnlyTheWaitsTheWireCarries() throws {
+        let matcher = try XCTUnwrap(try hooksByEvent()["Notification"]?.first?["matcher"] as? String)
+        XCTAssertEqual(
+            Set(matcher.split(separator: "|").map(String.init)),
+            Set(ClaudeNotificationType.allCases.map(\.rawValue))
+        )
+    }
+
+    func testDeclaresNoFileChangedHookWithoutWatchPaths() throws {
+        // Claude Code only fires FileChanged for a hook that declares
+        // watchPaths. We declare none, so the hook would never fire — a dead
+        // entry that reads like working coverage. PostToolUse already reports
+        // every file the model touches.
+        let hooks = try hooksByEvent()
+        XCTAssertNil(hooks["FileChanged"])
+        for (_, matchers) in hooks {
+            for matcher in matchers {
+                XCTAssertNil(matcher["watchPaths"], "no hook declares watchPaths today")
+            }
+        }
+    }
+
+    func testEveryHookCommandUsesPluginRootAndTheShimAndPassesItsOwnEventName() throws {
+        var count = 0
+        for (event, matchers) in try hooksByEvent() {
+            let commands = matchers.flatMap { matcher -> [String] in
+                let entries = matcher["hooks"] as? [[String: Any]] ?? []
+                return entries.compactMap { $0["command"] as? String }
+            }
+            for command in commands {
+                count += 1
+                // QUOTED (F7): hook commands run through a shell, and the plugin
+                // root lives under "~/.claude" today but is an implementation
+                // detail — an unquoted ${CLAUDE_PLUGIN_ROOT} word-splits on any
+                // space in the path (e.g. an "Application Support" install) and
+                // the hook dies silently.
+                XCTAssertTrue(
+                    command.hasPrefix("\"${CLAUDE_PLUGIN_ROOT}/hooks/publish.sh\" "),
+                    "hook command must resolve through a QUOTED ${CLAUDE_PLUGIN_ROOT}: \(command)"
+                )
+                XCTAssertTrue(
+                    command.hasSuffix(" \(event)"),
+                    "\(event) hook must pass its event name, got: \(command)"
+                )
+            }
+        }
+        XCTAssertEqual(count, 7, "one command per event")
+    }
+
+    func testEveryHookIsACommandTypeWithAShortTimeout() throws {
+        for (_, matchers) in try hooksByEvent() {
+            for matcher in matchers {
+                let entries = try XCTUnwrap(matcher["hooks"] as? [[String: Any]])
+                for entry in entries {
+                    XCTAssertEqual(entry["type"] as? String, "command")
+                    let timeout = try XCTUnwrap(entry["timeout"] as? Int)
+                    XCTAssertLessThanOrEqual(timeout, 5, "a hook must never stall a turn")
+                    XCTAssertGreaterThan(timeout, 0)
+                }
+            }
+        }
+    }
+
+    func testPostToolUseMatchesOnlyFileBearingTools() throws {
+        let matchers = try XCTUnwrap(try hooksByEvent()["PostToolUse"])
+        let matcher = try XCTUnwrap(matchers.first?["matcher"] as? String)
+        for tool in ["Read", "Edit", "Write", "NotebookEdit"] {
+            XCTAssertTrue(matcher.contains(tool), "matcher should cover \(tool)")
+        }
+        // Bash carries a command string, not a file path — subscribing to it
+        // would wake the publisher on every shell call for nothing.
+        XCTAssertFalse(matcher.contains("Bash"))
+        // MultiEdit is deprecated in Claude Code; Edit carries batches now.
+        XCTAssertFalse(matcher.contains("MultiEdit"))
+    }
+
+    // MARK: userConfig
+
+    func testPluginDeclaresPublisherPathUserConfig() throws {
+        // This is what lets the shim find a publisher outside the two paths it
+        // hardcodes — an app in ~/Applications, a dev build, a mounted volume.
+        let manifest = try json(at: pluginRoot.appendingPathComponent(".claude-plugin/plugin.json"))
+        let userConfig = try XCTUnwrap(manifest["userConfig"] as? [String: Any])
+        let publisherPath = try XCTUnwrap(
+            userConfig[ClaudePluginInstallService.publisherPathConfigKey] as? [String: Any]
+        )
+        XCTAssertEqual(publisherPath["type"] as? String, "string")
+        XCTAssertNotNil(publisherPath["description"] as? String)
+    }
+
+    func testShimReadsThePublisherPathConfigEnvironmentVariable() throws {
+        // Claude Code exposes userConfig to hooks as CLAUDE_PLUGIN_OPTION_<KEY>.
+        // The declared key and the variable the shim reads must agree, or the
+        // config silently does nothing.
+        let source = try String(
+            contentsOf: pluginRoot.appendingPathComponent("hooks/publish.sh"), encoding: .utf8
+        )
+        let expected = "CLAUDE_PLUGIN_OPTION_"
+            + ClaudePluginInstallService.publisherPathConfigKey.uppercased()
+        XCTAssertTrue(source.contains(expected), "shim must read \(expected)")
+    }
+
+    func testEventsThatCarryNoToolUseDeclareNoMatcher() throws {
+        for event in ["SessionStart", "UserPromptSubmit", "Stop", "SessionEnd"] {
+            let matchers = try XCTUnwrap(try hooksByEvent()[event])
+            XCTAssertNil(matchers.first?["matcher"], "\(event) needs no tool matcher")
+        }
+    }
+
+    // MARK: Shim
+
+    func testShimIsExecutableAndFailsOpen() throws {
+        let shim = pluginRoot.appendingPathComponent("hooks/publish.sh")
+        // Mode bits: Claude Code execs this directly; without +x every hook errors.
+        XCTAssertTrue(
+            FileManager.default.isExecutableFile(atPath: shim.path),
+            "Claude Code executes this directly; without +x every hook errors"
+        )
+        // Shebang anchored to the exact first line, not a loose substring that a
+        // stray `#!/bin/sh` in a later comment could satisfy.
+        let firstLine = try String(contentsOf: shim, encoding: .utf8)
+            .split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
+            .first.map(String.init)
+        XCTAssertEqual(firstLine, "#!/bin/sh", "must be POSIX sh, not bash")
+
+        // Beyond reading the source: RUN the shim and prove the exit contract.
+        // `LOCALVOXTRAL_CLAUDE_HOOK_BIN` is candidate #1 in the shim's search, so
+        // injecting a fake publisher through it both selects our stub before any
+        // host path and proves that documented override actually works — a
+        // stronger check than `source.contains("LOCALVOXTRAL_CLAUDE_HOOK_BIN")`.
+        let temporary = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+
+        // One run carries both contracts: the publisher records the arguments it
+        // received and then FAILS, so the same invocation proves the event
+        // passthrough AND the swallow — the shim runs the publisher as a child
+        // (never exec) precisely so it can exit 0 over a non-zero child. A
+        // publisher that succeeds still gets exit 0 from the shim; both runs of
+        // testShimPrefersTheAppLinkOverAStaleInstallTimePin pin that half.
+        let argumentsFile = temporary.appendingPathComponent("args")
+        XCTAssertEqual(
+            try runShim(
+                shim,
+                hookBin: Self.publisherStub.path,
+                event: "Stop",
+                extraEnvironment: ["LVX_ARGS": argumentsFile.path, "LVX_STATUS": "7"]
+            ).exitCode, 0,
+            "the shim must exit 0 even when the publisher exits non-zero"
+        )
+        XCTAssertEqual(
+            try String(contentsOf: argumentsFile, encoding: .utf8), "--event Stop",
+            "the shim must pass the event through to the publisher as --event <Event>"
+        )
+    }
+
+    // MARK: Shim execution helpers
+
+    /// The publisher stubs, written once for the class: executing a script
+    /// the system has not seen before cost 170–260 ms on the build host
+    /// against 23 ms for one it has (measured in `VibeRemoteShimTests`), and
+    /// each shim test used to write its own. Everything that varies per run
+    /// reaches a stub through the environment, so each test still gets its
+    /// own output files.
+    private static let stubDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("lvx-shim-stub-\(UUID().uuidString)")
+
+    /// The publisher the app's link names. Doubles as the failing recorder
+    /// of `testShimIsExecutableAndFailsOpen`: `LVX_ARGS` names the file that
+    /// receives the arguments it was invoked with, `LVX_MARKER` the file its
+    /// baked mark lands in, `LVX_STATUS` its exit status.
+    private static var publisherStub: URL { stubDirectory.appendingPathComponent("publisher") }
+
+    /// The older copy left at the install-time pin. Its mark is baked, not
+    /// env-driven, so a run that wrongly resolves to it cannot write the
+    /// mark the link's publisher would.
+    private static var stalePublisherStub: URL {
+        stubDirectory.appendingPathComponent("stale-publisher")
+    }
+
+    private static func writePublisherStubsOnce() throws {
+        guard !FileManager.default.fileExists(atPath: publisherStub.path) else { return }
+        try FileManager.default.createDirectory(at: stubDirectory, withIntermediateDirectories: true)
+        try writeExecutable(
+            "#!/bin/sh\n"
+                + "printf '%s' \"$*\" > \"${LVX_ARGS:-/dev/null}\"\n"
+                + "printf 'current' > \"${LVX_MARKER:-/dev/null}\"\n"
+                + "exit \"${LVX_STATUS:-0}\"\n",
+            named: "publisher", in: stubDirectory
+        )
+        try writeExecutable(
+            "#!/bin/sh\nprintf 'stale' > \"${LVX_MARKER:-/dev/null}\"\n",
+            named: "stale-publisher", in: stubDirectory
+        )
+    }
+
+    override class func tearDown() {
+        try? FileManager.default.removeItem(at: stubDirectory)
+        super.tearDown()
+    }
+
+    private func temporaryDirectory() throws -> URL {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("shim-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        return url
+    }
+
+    private static func writeExecutable(_ contents: String, named name: String, in directory: URL) throws -> URL {
+        let url = directory.appendingPathComponent(name)
+        try contents.write(to: url, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+        return url
+    }
+
+    /// Runs the shim under `/bin/sh` with a chosen publisher and event, returning
+    /// its exit code. stdin is /dev/null so the shim's stdin drain never blocks;
+    /// stdout/stderr are captured and discarded (Claude Code parses stdout, so
+    /// the shim's own paths must stay silent — not asserted here, but kept off
+    /// the test's console).
+    private func runShim(
+        _ shim: URL,
+        hookBin: String?,
+        event: String,
+        extraEnvironment: [String: String] = [:]
+    ) throws -> (exitCode: Int32, stdout: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = [shim.path, event]
+        var environment = ProcessInfo.processInfo.environment
+        environment["LOCALVOXTRAL_CLAUDE_HOOK_BIN"] = hookBin
+        environment.merge(extraEnvironment) { _, new in new }
+        process.environment = environment
+        process.standardInput = FileHandle.nullDevice
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        // terminationHandler, not waitUntilExit(): see `Process.runUntilExit()`.
+        let exited = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in exited.signal() }
+        try process.run()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        exited.wait()
+        return (process.terminationStatus, String(decoding: data, as: UTF8.self))
+    }
+
+    func testShimPrefersTheAppLinkOverAStaleInstallTimePin() throws {
+        // The pin records where the app was at install time; an older copy
+        // left there must not win over the link the running app maintains.
+        let temporary = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let home = temporary.appendingPathComponent("home")
+        let marker = temporary.appendingPathComponent("ran")
+        // The link names a symlink to the shared stub, so this test can make
+        // "the app is gone" by removing the symlink without deleting the stub
+        // the other shim test still runs.
+        let current = temporary.appendingPathComponent("current")
+        try FileManager.default.createSymbolicLink(at: current, withDestinationURL: Self.publisherStub)
+        let pin = [
+            "HOME": home.path,
+            "CLAUDE_PLUGIN_OPTION_"
+                + ClaudePluginInstallService.publisherPathConfigKey.uppercased(): Self.stalePublisherStub.path,
+            "LVX_MARKER": marker.path,
+        ]
+        let shim = pluginRoot.appendingPathComponent("hooks/publish.sh")
+        let link = ClaudePublisherPointer.defaultURL(home: home)
+
+        try ClaudePublisherPointer.refresh(publisher: current, linkURL: link)
+        XCTAssertEqual(try runShim(shim, hookBin: nil, event: "Stop", extraEnvironment: pin).exitCode, 0)
+        XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), "current")
+
+        // A link whose app is gone falls through to the pin.
+        try FileManager.default.removeItem(at: current)
+        XCTAssertEqual(try runShim(shim, hookBin: nil, event: "Stop", extraEnvironment: pin).exitCode, 0)
+        XCTAssertEqual(try String(contentsOf: marker, encoding: .utf8), "stale")
+    }
+
+    func testShimLinkPathMatchesTheAppsLink() throws {
+        let source = try String(
+            contentsOf: pluginRoot.appendingPathComponent("hooks/publish.sh"), encoding: .utf8
+        )
+        XCTAssertTrue(
+            source.contains("\"${HOME:-}/\(ClaudePublisherPointer.homeRelativePath)\""),
+            "the shim must read the link where the app writes it"
+        )
+    }
+
+    func testPublisherLinkRefreshIsIdempotentAndRepoints() throws {
+        let temporary = try temporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: temporary) }
+        let link = ClaudePublisherPointer.defaultURL(home: temporary)
+        let first = temporary.appendingPathComponent("a")
+        let second = temporary.appendingPathComponent("b")
+
+        // A staging link a crashed refresh left behind is swept.
+        try FileManager.default.createDirectory(
+            at: link.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        try FileManager.default.createSymbolicLink(
+            at: link.deletingLastPathComponent().appendingPathComponent(".publisher-orphan"),
+            withDestinationURL: first
+        )
+        XCTAssertEqual(try ClaudePublisherPointer.refresh(publisher: first, linkURL: link), .updated(previous: nil))
+        XCTAssertEqual(try ClaudePublisherPointer.refresh(publisher: first, linkURL: link), .unchanged)
+        XCTAssertEqual(
+            try ClaudePublisherPointer.refresh(publisher: second, linkURL: link),
+            .updated(previous: first.path)
+        )
+        XCTAssertEqual(
+            try FileManager.default.destinationOfSymbolicLink(atPath: link.path), second.path
+        )
+        // No staging links left behind.
+        XCTAssertEqual(
+            try FileManager.default.contentsOfDirectory(atPath: link.deletingLastPathComponent().path),
+            ["publisher"]
+        )
+    }
+
+    func testShimRunsPublisherAsAChildSoExecFailureStillFailsOpen() throws {
+        // `exec` replaces the shell, so a publisher that cannot start (Exec
+        // format error, missing dyld dep, quarantine) would surface ITS failure
+        // as the hook's exit code — a visible error on the user's turn. Running
+        // it as a child keeps us alive to swallow that and exit 0.
+        let source = try String(
+            contentsOf: pluginRoot.appendingPathComponent("hooks/publish.sh"), encoding: .utf8
+        )
+        XCTAssertFalse(
+            source.contains("exec \"$BIN\""),
+            "must not exec the publisher — an exec failure would escape as a hook error"
+        )
+        let lines = source.split(separator: "\n").map(String.init)
+        let invocation = try XCTUnwrap(lines.firstIndex { $0.contains("\"$BIN\" --event") })
+        XCTAssertTrue(
+            lines[invocation].hasPrefix("LOCALVOXTRAL_CLAUDE_PPID="),
+            "the child must receive Claude Code's stable parent pid, not the short-lived shim pid"
+        )
+        let remainder = lines[invocation...].joined(separator: "\n")
+        XCTAssertTrue(
+            remainder.contains("exit 0"),
+            "the shim must exit 0 regardless of the publisher's status"
+        )
+    }
+}

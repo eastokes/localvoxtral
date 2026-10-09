@@ -7,6 +7,10 @@ import XCTest
 final class SettingsStoreTests: XCTestCase {
     private var defaults: UserDefaults!
     private var defaultsSuiteName = ""
+    /// Shared across every `makeStore()` in a test, the way one login keychain
+    /// is shared across launches — that is what makes a reload assertion mean
+    /// anything.
+    private var secrets: InMemorySecretStore!
 
     override func setUp() async throws {
         try await super.setUp()
@@ -14,34 +18,140 @@ final class SettingsStoreTests: XCTestCase {
         let defaults = UserDefaults(suiteName: defaultsSuiteName)!
         defaults.removePersistentDomain(forName: defaultsSuiteName)
         self.defaults = defaults
+        secrets = InMemorySecretStore()
     }
 
     override func tearDown() async throws {
         defaults?.removePersistentDomain(forName: defaultsSuiteName)
         defaults = nil
         defaultsSuiteName = ""
+        secrets = nil
         try await super.tearDown()
     }
 
     private func makeStore() -> SettingsStore {
-        SettingsStore(defaults: defaults, environment: [:])
+        SettingsStore(defaults: defaults, environment: [:], secretStore: secrets)
     }
 
-    // MARK: - Claude Code local title fallback
-
-    func testClaudeLocalTitleMarkerFallback_defaultsOff() {
-        XCTAssertFalse(makeStore().claudeLocalTitleMarkerFallbackEnabled)
+    /// A store over emptied defaults and secrets, the state `setUp` gives
+    /// each test, so the rows of a table test never see each other's writes.
+    private func makeFreshStore() -> SettingsStore {
+        defaults.removePersistentDomain(forName: defaultsSuiteName)
+        secrets = InMemorySecretStore()
+        return makeStore()
     }
 
-    func testClaudeLocalTitleMarkerFallback_providerTracksBothSettingStates() {
+    // MARK: - Open the window at launch (#449)
+
+    func testTheWindowDoesNotOpenAtLaunchUntilItIsTurnedOn() {
+        XCTAssertFalse(makeStore().opensWindowAtLaunch)
+    }
+
+    func testOpeningTheWindowAtLaunchSurvivesAReload() {
         let store = makeStore()
-        let provider = store.makeClaudeLocalTitleMarkerFallbackProvider()
+        store.opensWindowAtLaunch = true
 
-        XCTAssertFalse(provider())
-        store.claudeLocalTitleMarkerFallbackEnabled = true
-        XCTAssertTrue(provider())
-        store.claudeLocalTitleMarkerFallbackEnabled = false
-        XCTAssertFalse(provider())
+        XCTAssertTrue(makeStore().opensWindowAtLaunch)
+    }
+
+    // A stored value for the removed "Local Claude title fallback" toggle is
+    // simply IGNORED — there is no migration, because there is no longer any
+    // behaviour for it to select. Pinned so a future reader does not go looking
+    // for the migration that is deliberately absent.
+    func testAStoredTitleFallbackPreferenceIsIgnored() {
+        defaults.set(true, forKey: "settings.claude_local_title_marker_fallback_enabled")
+        XCTAssertNoThrow(makeStore())
+        XCTAssertTrue(
+            defaults.bool(forKey: "settings.claude_local_title_marker_fallback_enabled"),
+            "left where it is: nothing reads it, and rewriting a user's defaults to erase a dead key is not our business"
+        )
+    }
+
+    // MARK: - User-added terminal apps
+
+    /// The Settings → Terminals list persists as JSON in defaults and comes
+    /// back on the next store; a corrupt payload falls back to empty with
+    /// the failure logged. That empty list is NOT re-seeded from
+    /// `terminal_apps.toml`: the migration ledger already knows the ids it
+    /// imported, so they are gone for good and must be re-added in the UI.
+    func testUserTerminalApps_persistAcrossStores() {
+        let store = makeStore()
+        store.userTerminalApps = [
+            UserTerminalApp(bundleID: "dev.some.Editor", displayName: "Editor"),
+        ]
+        XCTAssertEqual(
+            makeStore().userTerminalApps,
+            [UserTerminalApp(bundleID: "dev.some.Editor", displayName: "Editor")]
+        )
+        XCTAssertEqual(
+            makeStore().userTerminalAppBundleIDs, ["dev.some.Editor"]
+        )
+    }
+
+    func testUserTerminalApps_corruptStoredValueFallsBackToEmpty() {
+        defaults.set(Data("not json".utf8), forKey: "settings.user_terminal_apps")
+        XCTAssertEqual(makeStore().userTerminalApps, [])
+    }
+
+    /// A decode failure is LOUD, not a silent `try?` (PR #284 review
+    /// finding): the failure is logged so a user's list going missing is
+    /// diagnosable, while the empty fallback stays. Pinned against the
+    /// source the same way the Settings copy pins are — os_log output has
+    /// no test seam.
+    func testUserTerminalApps_decodeFailureIsLogged() throws {
+        let storeURL = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()  // SettingsStoreTests.swift
+            .deletingLastPathComponent()  // localvoxtralTests
+            .deletingLastPathComponent()  // Tests
+            .appendingPathComponent("Sources/localvoxtral/SettingsStore+TerminalApps.swift")
+        let source = try String(contentsOf: storeURL, encoding: .utf8)
+
+        let loader = try XCTUnwrap(
+            source.range(of: "static func loadUserTerminalApps("),
+            "loadUserTerminalApps moved — update this pin"
+        )
+        let loaderBody = source[loader.upperBound...].prefix(600)
+
+        XCTAssertTrue(
+            loaderBody.contains("Log.persistence.error"),
+            "the decode-failure path must log an error — a silent try? made a lost list undiagnosable"
+        )
+        XCTAssertFalse(
+            loaderBody.contains("String(decoding: data"),
+            "the log line names the failure, never the payload"
+        )
+    }
+
+    func testUserTerminalApps_defaultIsEmpty() {
+        XCTAssertEqual(makeStore().userTerminalApps, [])
+        XCTAssertTrue(makeStore().userTerminalAppBundleIDs.isEmpty)
+    }
+
+    /// Removal is recorded in its own defaults ledger at removal time (not
+    /// inferred from the imported-ids ledger), which is what lets a lost
+    /// imported ledger keep a removed app gone — see
+    /// `TerminalAppsModelTests.testMigrationRemovedAppStaysGoneWhenTheImportedLedgerIsLost`.
+    func testRemoveUserTerminalApp_recordsTheRemovalInTheMigrationLedger() {
+        let store = makeStore()
+        store.userTerminalApps = [
+            UserTerminalApp(bundleID: "dev.some.Editor", displayName: "Editor"),
+            UserTerminalApp(bundleID: "dev.other.Editor", displayName: "Other"),
+        ]
+        store.removeUserTerminalApp(bundleID: "dev.some.Editor")
+        XCTAssertEqual(store.userTerminalApps.map(\.bundleID), ["dev.other.Editor"])
+        XCTAssertEqual(
+            defaults.stringArray(forKey: UserTerminalAppsMigrator.removedBundleIDsKey),
+            ["dev.some.Editor"],
+            "removal writes the id into the removed-ids ledger, once"
+        )
+        // Idempotent: removing an id that is already recorded does not
+        // duplicate the ledger entry.
+        store.addUserTerminalApp(UserTerminalApp(bundleID: "dev.some.Editor", displayName: "Editor"))
+        store.removeUserTerminalApp(bundleID: "dev.some.Editor")
+        XCTAssertEqual(
+            defaults.stringArray(forKey: UserTerminalAppsMigrator.removedBundleIDsKey),
+            ["dev.some.Editor"]
+        )
     }
 
     // MARK: - Overlay Buffer session reachability
@@ -72,57 +182,6 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertTrue(store.isOverlayBufferSessionReachable)
     }
 
-    // MARK: - speechd Metal cache limit
-
-    func testSpeechdCacheLimit_defaultsToAuto() {
-        XCTAssertEqual(makeStore().speechdCacheLimit, .auto)
-        // Auto omits the flag: the helper's built-in default applies.
-        XCTAssertNil(SpeechdCacheLimit.auto.megabytes)
-    }
-
-    func testSpeechdCacheLimit_persistsAcrossStores() {
-        let store = makeStore()
-        store.speechdCacheLimit = .gb6
-        XCTAssertEqual(makeStore().speechdCacheLimit, .gb6)
-    }
-
-    func testSpeechdCacheLimit_unknownStoredValueFallsBackToAuto() {
-        defaults.set("garbage", forKey: "settings.speechd_cache_limit")
-        XCTAssertEqual(makeStore().speechdCacheLimit, .auto)
-    }
-
-    // MARK: - speechd step cadence
-
-    func testSpeechdStepCadence_defaultsToAuto() {
-        XCTAssertEqual(makeStore().speechdStepCadence, .auto)
-        // Auto omits the flag: the helper's built-in default applies.
-        XCTAssertNil(SpeechdStepCadence.auto.milliseconds)
-    }
-
-    func testSpeechdStepCadence_persistsAcrossStores() {
-        let store = makeStore()
-        store.speechdStepCadence = .ms100
-        XCTAssertEqual(makeStore().speechdStepCadence, .ms100)
-    }
-
-    func testSpeechdStepCadence_unknownStoredValueFallsBackToAuto() {
-        defaults.set("garbage", forKey: "settings.speechd_step_cadence")
-        XCTAssertEqual(makeStore().speechdStepCadence, .auto)
-    }
-
-    func testSpeechdStepCadence_millisecondsForEachPreset() {
-        XCTAssertEqual(SpeechdStepCadence.ms100.milliseconds, 100)
-        XCTAssertEqual(SpeechdStepCadence.ms240.milliseconds, 240)
-        XCTAssertEqual(SpeechdStepCadence.ms480.milliseconds, 480)
-    }
-
-    func testSpeechdCacheLimit_megabytesForEachPreset() {
-        XCTAssertEqual(SpeechdCacheLimit.gb2.megabytes, 2048)
-        XCTAssertEqual(SpeechdCacheLimit.gb4.megabytes, 4096)
-        XCTAssertEqual(SpeechdCacheLimit.gb6.megabytes, 6144)
-        XCTAssertEqual(SpeechdCacheLimit.gb8.megabytes, 8192)
-    }
-
     // MARK: - Overlay Buffer font size
 
     func testOverlayBufferFontSize_defaultsTo14() {
@@ -145,91 +204,96 @@ final class SettingsStoreTests: XCTestCase {
             makeStore().overlayBufferFontSize, OverlayLayoutMetrics.minimumBodyFontSize)
     }
 
+    // MARK: - Overlay Buffer visible lines
+
+    func testOverlayBufferVisibleLines_defaultsTo4() {
+        XCTAssertEqual(makeStore().overlayBufferVisibleLines, 4)
+    }
+
+    func testOverlayBufferVisibleLines_persistsAcrossStores() {
+        let store = makeStore()
+        store.overlayBufferVisibleLines = 7
+        XCTAssertEqual(makeStore().overlayBufferVisibleLines, 7)
+    }
+
+    func testOverlayBufferVisibleLines_clampsStoredValueOnLoad() {
+        defaults.set(99, forKey: "settings.overlay_buffer_visible_lines")
+        XCTAssertEqual(
+            makeStore().overlayBufferVisibleLines, OverlayLayoutMetrics.maximumVisibleLines)
+
+        defaults.set(0, forKey: "settings.overlay_buffer_visible_lines")
+        XCTAssertEqual(
+            makeStore().overlayBufferVisibleLines, OverlayLayoutMetrics.minimumVisibleLines)
+    }
+
+    // MARK: - Overlay Buffer word hold
+
+    func testOverlayBufferWordHold_defaultsToOff() {
+        XCTAssertEqual(makeStore().overlayBufferWordHold, .off)
+    }
+
+    func testOverlayBufferWordHold_persistsAcrossStores() {
+        let store = makeStore()
+        store.overlayBufferWordHold = .upTo10Letters
+        XCTAssertEqual(makeStore().overlayBufferWordHold, .upTo10Letters)
+    }
+
+    func testOverlayBufferWordHold_unknownStoredValueFallsBackToOff() {
+        defaults.set(7, forKey: "settings.overlay_buffer_word_hold")
+        XCTAssertEqual(makeStore().overlayBufferWordHold, .off)
+    }
+
+    // MARK: - Overlay Buffer polish color (#1074)
+
+    func testOverlayBufferPolishColor_defaultsToTealAndPersists() {
+        XCTAssertEqual(makeStore().overlayBufferPolishColor, .teal)
+        let store = makeStore()
+        store.overlayBufferPolishColor = .systemAccent
+        XCTAssertEqual(makeStore().overlayBufferPolishColor, .systemAccent)
+        defaults.set("magenta", forKey: "settings.overlay_buffer_polish_color")
+        XCTAssertEqual(makeStore().overlayBufferPolishColor, .teal, "an unknown value falls back to teal")
+    }
+
     // MARK: - resolvedWebSocketURL
 
-    func testResolvedURL_wsPassthrough() {
-        let store = makeStore()
-        store.realtimeAPIEndpointURL = "ws://127.0.0.1:8000/v1/realtime"
-        store.realtimeProvider = .realtimeAPI
-        store.dictationBackendMode = .externalURL
-        XCTAssertEqual(store.resolvedWebSocketURL?.absoluteString, "ws://127.0.0.1:8000/v1/realtime")
-    }
-
-    func testResolvedURL_wssPassthrough() {
-        let store = makeStore()
-        store.realtimeAPIEndpointURL = "wss://example.com/realtime"
-        store.realtimeProvider = .realtimeAPI
-        store.dictationBackendMode = .externalURL
-        XCTAssertEqual(store.resolvedWebSocketURL?.absoluteString, "wss://example.com/realtime")
-    }
-
-    func testResolvedURL_httpToWs() {
-        let store = makeStore()
-        store.realtimeAPIEndpointURL = "http://localhost:8000/v1/realtime"
-        store.realtimeProvider = .realtimeAPI
-        store.dictationBackendMode = .externalURL
-        XCTAssertEqual(store.resolvedWebSocketURL?.absoluteString, "ws://localhost:8000/v1/realtime")
-    }
-
-    func testResolvedURL_httpsToWss() {
-        let store = makeStore()
-        store.realtimeAPIEndpointURL = "https://example.com/realtime"
-        store.realtimeProvider = .realtimeAPI
-        store.dictationBackendMode = .externalURL
-        XCTAssertEqual(store.resolvedWebSocketURL?.absoluteString, "wss://example.com/realtime")
-    }
-
-    func testResolvedURL_bareHost() {
-        let store = makeStore()
-        store.realtimeAPIEndpointURL = "myhost:9000/path"
-        store.realtimeProvider = .realtimeAPI
-        store.dictationBackendMode = .externalURL
-        XCTAssertEqual(store.resolvedWebSocketURL?.absoluteString, "ws://myhost:9000/path")
-    }
-
-    func testResolvedURL_empty() {
-        let store = makeStore()
-        store.realtimeAPIEndpointURL = ""
-        store.realtimeProvider = .realtimeAPI
-        store.dictationBackendMode = .externalURL
-        XCTAssertNil(store.resolvedWebSocketURL)
-    }
-
-    func testResolvedURL_whitespaceOnly() {
-        let store = makeStore()
-        store.realtimeAPIEndpointURL = "   \n  "
-        store.realtimeProvider = .realtimeAPI
-        store.dictationBackendMode = .externalURL
-        XCTAssertNil(store.resolvedWebSocketURL)
-    }
-
-    func testResolvedURL_trimming() {
-        let store = makeStore()
-        store.realtimeAPIEndpointURL = "  ws://example.com  "
-        store.realtimeProvider = .realtimeAPI
-        store.dictationBackendMode = .externalURL
-        XCTAssertEqual(store.resolvedWebSocketURL?.absoluteString, "ws://example.com")
+    func testResolvedURL() {
+        let cases: [(name: String, endpoint: String, expected: String?)] = [
+            ("wsPassthrough", "ws://127.0.0.1:8000/v1/realtime", "ws://127.0.0.1:8000/v1/realtime"),
+            ("wssPassthrough", "wss://example.com/realtime", "wss://example.com/realtime"),
+            ("httpToWs", "http://localhost:8000/v1/realtime", "ws://localhost:8000/v1/realtime"),
+            ("httpsToWss", "https://example.com/realtime", "wss://example.com/realtime"),
+            ("bareHost", "myhost:9000/path", "ws://myhost:9000/path"),
+            ("empty", "", nil),
+            ("whitespaceOnly", "   \n  ", nil),
+            ("trimming", "  ws://example.com  ", "ws://example.com"),
+        ]
+        for (name, endpoint, expected) in cases {
+            let store = makeFreshStore()
+            store.realtimeAPIEndpointURL = endpoint
+            store.realtimeProvider = .realtimeAPI
+            store.dictationBackendMode = .externalURL
+            XCTAssertEqual(store.resolvedWebSocketURL?.absoluteString, expected, name)
+        }
     }
 
     // MARK: - realtimeProvider migration
 
-    func testRealtimeProvider_legacyRawValueFallsBackToDefault() {
-        // A user who previously selected the now-removed deprecated backend has
-        // its raw value persisted in UserDefaults. Decoding must fall back to the
-        // default provider instead of crashing or producing an invalid state.
-        defaults.set("mlx_audio", forKey: "settings.realtime_provider")
+    func testRealtimeProvider_storedRawValueFallsBackToDefault() {
+        let cases: [(name: String, rawValue: String)] = [
+            // A user who previously selected the now-removed deprecated backend has
+            // its raw value persisted in UserDefaults. Decoding must fall back to the
+            // default provider instead of crashing or producing an invalid state.
+            ("legacyRawValue", "mlx_audio"),
+            ("unknownRawValue", "some_future_provider"),
+        ]
+        for (name, rawValue) in cases {
+            _ = makeFreshStore()
+            defaults.set(rawValue, forKey: "settings.realtime_provider")
 
-        let store = makeStore()
+            let store = makeStore()
 
-        XCTAssertEqual(store.realtimeProvider, .realtimeAPI)
-    }
-
-    func testRealtimeProvider_unknownRawValueFallsBackToDefault() {
-        defaults.set("some_future_provider", forKey: "settings.realtime_provider")
-
-        let store = makeStore()
-
-        XCTAssertEqual(store.realtimeProvider, .realtimeAPI)
+            XCTAssertEqual(store.realtimeProvider, .realtimeAPI, name)
+        }
     }
 
     func testRemovedCommitIntervalSettingIsCleanedUp() {
@@ -285,7 +349,8 @@ final class SettingsStoreTests: XCTestCase {
         // external setup (e.g. launched from a wrapper script).
         let store = SettingsStore(
             defaults: defaults,
-            environment: ["REALTIME_ENDPOINT": "ws://example.com/realtime"]
+            environment: ["REALTIME_ENDPOINT": "ws://example.com/realtime"],
+            secretStore: InMemorySecretStore()
         )
 
         XCTAssertEqual(store.dictationBackendMode, .externalURL)
@@ -309,6 +374,20 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertEqual(defaults.string(forKey: "settings.backend_mode"), "managed_local")
         XCTAssertEqual(defaults.string(forKey: "settings.dictation_backend_mode"), "managed_local")
         XCTAssertEqual(defaults.string(forKey: "settings.polishing_backend_mode"), "managed_local")
+    }
+
+    /// A mode this build doesn't know may be one a newer build added (#1040):
+    /// this build runs the migrated mode but leaves the stored one alone.
+    func testBackendModes_unknownStoredModeIsKept() {
+        defaults.set("some_future_mode", forKey: "settings.dictation_backend_mode")
+        defaults.set("external_url", forKey: "settings.polishing_backend_mode")
+
+        let store = makeStore()
+
+        XCTAssertEqual(store.dictationBackendMode, .managedLocal)
+        XCTAssertEqual(store.polishingBackendMode, .externalURL)
+        XCTAssertEqual(defaults.string(forKey: "settings.dictation_backend_mode"), "some_future_mode")
+        XCTAssertEqual(defaults.string(forKey: "settings.polishing_backend_mode"), "external_url")
     }
 
     func testBackendModes_roundTripIndependentlyAcrossReload() {
@@ -508,58 +587,23 @@ final class SettingsStoreTests: XCTestCase {
 
     // MARK: - effectiveModelName
 
-    func testEffectiveModel_plainName() {
-        let store = makeStore()
-        store.realtimeAPIModelName = "my-model"
-        store.realtimeProvider = .realtimeAPI
-        store.dictationBackendMode = .externalURL
-        XCTAssertEqual(store.effectiveModelName, "my-model")
-    }
-
-    func testEffectiveModel_whitespace_trimmed() {
-        let store = makeStore()
-        store.realtimeAPIModelName = "  my-model  "
-        store.realtimeProvider = .realtimeAPI
-        store.dictationBackendMode = .externalURL
-        XCTAssertEqual(store.effectiveModelName, "my-model")
-    }
-
-    func testEffectiveModel_multiline_takesLastNonEmptyLine() {
-        let store = makeStore()
-        store.realtimeAPIModelName = "junk-line\nactual-model"
-        store.realtimeProvider = .realtimeAPI
-        store.dictationBackendMode = .externalURL
-        XCTAssertEqual(store.effectiveModelName, "actual-model")
-    }
-
-    func testEffectiveModel_spacesInLine_takesLastToken() {
-        let store = makeStore()
-        store.realtimeAPIModelName = "some prefix model-name"
-        store.realtimeProvider = .realtimeAPI
-        store.dictationBackendMode = .externalURL
-        XCTAssertEqual(store.effectiveModelName, "model-name")
-    }
-
-    func testEffectiveModel_empty_defaultsToProvider() {
-        let store = makeStore()
-        store.realtimeAPIModelName = ""
-        store.realtimeProvider = .realtimeAPI
-        store.dictationBackendMode = .externalURL
-        XCTAssertEqual(
-            store.effectiveModelName,
-            SettingsStore.RealtimeProvider.realtimeAPI.defaultModelName
-        )
-    }
-
-    func testEffectiveModel_whitespaceOnly_defaultsToProvider() {
-        let store = makeStore()
-        store.realtimeAPIModelName = "   \n  "
-        store.realtimeProvider = .realtimeAPI
-        store.dictationBackendMode = .externalURL
-        XCTAssertEqual(
-            store.effectiveModelName,
-            SettingsStore.RealtimeProvider.realtimeAPI.defaultModelName
-        )
+    func testEffectiveModel() {
+        let providerDefault = SettingsStore.RealtimeProvider.realtimeAPI.defaultModelName
+        let cases: [(name: String, modelName: String, expected: String)] = [
+            ("plainName", "my-model", "my-model"),
+            ("whitespace_trimmed", "  my-model  ", "my-model"),
+            ("multiline_takesLastNonEmptyLine", "junk-line\nactual-model", "actual-model"),
+            ("spacesInLine_takesLastToken", "some prefix model-name", "model-name"),
+            ("empty_defaultsToProvider", "", providerDefault),
+            ("whitespaceOnly_defaultsToProvider", "   \n  ", providerDefault),
+        ]
+        for (name, modelName, expected) in cases {
+            let store = makeFreshStore()
+            store.realtimeAPIModelName = modelName
+            store.realtimeProvider = .realtimeAPI
+            store.dictationBackendMode = .externalURL
+            XCTAssertEqual(store.effectiveModelName, expected, name)
+        }
     }
 
     func testRealtimeProviderDefaultEndpointsMatchToolDefaults() {
@@ -586,6 +630,43 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertFalse(reloadedStore.agentPolishProfileEnabled)
     }
 
+    // MARK: - earlyPolishEnabled (#709)
+
+    func testEarlyPolishEnabled_defaultsOnForTheBundledHelperOnly() {
+        let store = makeStore()
+        store.polishingBackendMode = .managedLocal
+        XCTAssertTrue(store.earlyPolishEnabled)
+        store.polishingBackendMode = .mistralAPI
+        XCTAssertFalse(store.earlyPolishEnabled)
+        store.polishingBackendMode = .externalURL
+        XCTAssertFalse(store.earlyPolishEnabled)
+    }
+
+    func testEarlyPolishEnabled_userChoicePersistsAndOutranksTheBackendDefault() {
+        let store = makeStore()
+        store.polishingBackendMode = .managedLocal
+        store.earlyPolishEnabled = false
+
+        let reloadedStore = makeStore()
+        XCTAssertFalse(reloadedStore.earlyPolishEnabled)
+        reloadedStore.polishingBackendMode = .mistralAPI
+        reloadedStore.earlyPolishEnabled = true
+        XCTAssertTrue(makeStore().earlyPolishEnabled)
+    }
+
+    // MARK: - mistralStopSecondPassEnabled (#1678)
+
+    func testMistralStopSecondPassEnabled_defaultsOnAndPersistsAcrossReload() {
+        let store = makeStore()
+        XCTAssertTrue(store.mistralStopSecondPassEnabled)
+        store.mistralStopSecondPassEnabled = false
+
+        let reloadedStore = makeStore()
+        XCTAssertFalse(reloadedStore.mistralStopSecondPassEnabled)
+        reloadedStore.mistralStopSecondPassEnabled = true
+        XCTAssertTrue(makeStore().mistralStopSecondPassEnabled)
+    }
+
     // MARK: - clipboardPayloadMacroEnabled
 
     func testClipboardPayloadMacroEnabled_defaultsToTrue() {
@@ -602,11 +683,6 @@ final class SettingsStoreTests: XCTestCase {
     }
 
     // MARK: - repoVocabularyEnabled
-
-    func testRepoVocabularyEnabled_defaultsToFalse() {
-        let store = makeStore()
-        XCTAssertFalse(store.repoVocabularyEnabled)
-    }
 
     func testRepoVocabularyEnabled_persistsAcrossReload() {
         let store = makeStore()
@@ -739,62 +815,6 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertNil(reloadedStore.dictationShortcut)
     }
 
-    func testDictationShortcut_resetRestoresDefault() {
-        let store = makeStore()
-        let customShortcut = DictationShortcut(
-            keyCode: UInt32(kVK_ANSI_D),
-            carbonModifierFlags: UInt32(cmdKey | shiftKey)
-        )
-        store.setDictationShortcut(customShortcut)
-
-        store.resetDictationShortcutToDefault()
-
-        XCTAssertTrue(store.dictationShortcutEnabled)
-        XCTAssertEqual(store.dictationShortcut, SettingsStore.defaultDictationShortcut)
-    }
-
-    func testOverlayBufferShortcut_defaultsToEnabledDefault() {
-        let store = makeStore()
-
-        XCTAssertTrue(store.overlayBufferShortcutEnabled)
-        XCTAssertEqual(store.overlayBufferShortcut, SettingsStore.defaultDictationShortcut)
-    }
-
-    func testOverlayBufferShortcut_customPersistsAcrossReload() {
-        let store = makeStore()
-        let customShortcut = DictationShortcut(
-            keyCode: UInt32(kVK_ANSI_O),
-            carbonModifierFlags: UInt32(cmdKey | optionKey)
-        )
-
-        store.setOverlayBufferShortcut(customShortcut)
-
-        let reloadedStore = makeStore()
-        XCTAssertTrue(reloadedStore.overlayBufferShortcutEnabled)
-        XCTAssertEqual(reloadedStore.overlayBufferShortcut, customShortcut)
-    }
-
-    func testLivePasteShortcut_defaultsToDisabled() {
-        let store = makeStore()
-
-        XCTAssertFalse(store.livePasteShortcutEnabled)
-        XCTAssertNil(store.livePasteShortcut)
-    }
-
-    func testLivePasteShortcut_customPersistsAcrossReload() {
-        let store = makeStore()
-        let customShortcut = DictationShortcut(
-            keyCode: UInt32(kVK_ANSI_L),
-            carbonModifierFlags: UInt32(cmdKey | optionKey)
-        )
-
-        store.setLivePasteShortcut(customShortcut)
-
-        let reloadedStore = makeStore()
-        XCTAssertTrue(reloadedStore.livePasteShortcutEnabled)
-        XCTAssertEqual(reloadedStore.livePasteShortcut, customShortcut)
-    }
-
     func testDictationShortcut_invalidStoredValueFallsBackToDefault() {
         defaults.set(true, forKey: "settings.dictation_shortcut_enabled")
         defaults.set(UInt32.max, forKey: "settings.dictation_shortcut_key_code")
@@ -804,6 +824,60 @@ final class SettingsStoreTests: XCTestCase {
 
         XCTAssertTrue(store.dictationShortcutEnabled)
         XCTAssertEqual(store.dictationShortcut, SettingsStore.defaultDictationShortcut)
+    }
+
+    // MARK: - bare function key shortcuts
+
+    func testOverlayBufferShortcut_bareFunctionKeyPersistsAcrossReload() {
+        let bareF13 = DictationShortcut(keyCode: UInt32(kVK_F13), carbonModifierFlags: 0)
+        let store = makeStore()
+
+        store.setOverlayBufferShortcut(bareF13)
+        XCTAssertEqual(store.overlayBufferShortcut, bareF13)
+
+        XCTAssertEqual(makeStore().overlayBufferShortcut, bareF13)
+    }
+
+    func testLivePasteShortcut_bareFunctionKeyPersistsAcrossReload() {
+        let bareF14 = DictationShortcut(keyCode: UInt32(kVK_F14), carbonModifierFlags: 0)
+        let store = makeStore()
+
+        store.setLivePasteShortcut(bareF14)
+        XCTAssertEqual(store.livePasteShortcut, bareF14)
+
+        XCTAssertEqual(makeStore().livePasteShortcut, bareF14)
+    }
+
+    // Clearing the default Overlay Buffer key before ever recording one writes
+    // only the enabled flag; the reload must still honour it, or the key comes
+    // back and, after a move to Live Auto-Paste, binds twice.
+    func testClearingUntouchedDefaultOverlayShortcutPersistsAcrossReload() {
+        let store = makeStore()
+        XCTAssertEqual(store.overlayBufferShortcut, SettingsStore.defaultDictationShortcut)
+
+        store.setOverlayBufferShortcut(nil)
+
+        XCTAssertNil(makeStore().overlayBufferShortcut)
+    }
+
+    func testMovingUntouchedDefaultToLivePasteLeavesOneBindingAfterReload() {
+        let store = makeStore()
+
+        store.setOverlayBufferShortcut(nil)
+        store.setLivePasteShortcut(SettingsStore.defaultDictationShortcut)
+
+        let reloaded = makeStore()
+        XCTAssertNil(reloaded.overlayBufferShortcut)
+        XCTAssertEqual(reloaded.livePasteShortcut, SettingsStore.defaultDictationShortcut)
+    }
+
+    func testOverlayBufferShortcut_bareTypingKeyFallsBackToDefault() {
+        let store = makeStore()
+
+        store.setOverlayBufferShortcut(
+            DictationShortcut(keyCode: UInt32(kVK_ANSI_D), carbonModifierFlags: 0))
+
+        XCTAssertEqual(store.overlayBufferShortcut, SettingsStore.defaultDictationShortcut)
     }
 
     // MARK: - dual shortcut migration
@@ -916,6 +990,49 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertTrue(reloadedStore.replacementDictionaryEnabled)
     }
 
+    // MARK: - Global terms with two running copies (#1575)
+
+    /// Two copies launched on the same terms each add one; neither write
+    /// drops the other's term, and a removal in one survives the other's add.
+    func testTwoRunningCopiesKeepEachOthersTerms() {
+        makeStore().polishSpeakerTerms = ["Qwen", "Claude Code"]
+        let first = makeStore()
+        let second = makeStore()
+
+        first.polishSpeakerTerms.append("Ghostty")
+        second.polishSpeakerTerms.append("Voxtral")
+        XCTAssertEqual(makeStore().polishSpeakerTerms, ["Qwen", "Claude Code", "Voxtral", "Ghostty"])
+
+        first.polishSpeakerTerms.removeAll { $0 == "Claude Code" }
+        second.polishSpeakerTerms.append("MLX")
+        XCTAssertEqual(makeStore().polishSpeakerTerms, ["Qwen", "Voxtral", "Ghostty", "MLX"])
+    }
+
+    /// The merge keeps the cap a launch applies: two copies each adding the
+    /// last term that fits save 80, not 81, and the term the first copy
+    /// already saved stays; the second copy's addition is the one refused.
+    func testStaleAdditionAtCapacityKeepsAlreadySavedTerm() {
+        let start = (1..<SpeakerTerms.maxTerms).map { "Term\($0)" }
+        makeStore().polishSpeakerTerms = start
+        let first = makeStore()
+        let second = makeStore()
+
+        first.polishSpeakerTerms.append("Ghostty")
+        second.polishSpeakerTerms.append("Voxtral")
+
+        XCTAssertEqual(defaults.stringArray(forKey: "settings.polish_speaker_terms"), start + ["Ghostty"])
+        XCTAssertEqual(second.polishSpeakerTerms, start + ["Ghostty"])
+    }
+
+    func testTwoRunningCopiesKeepEachOthersDismissedSuggestions() {
+        let first = makeStore()
+        let second = makeStore()
+
+        first.dismissTermSuggestion("SessionStart")
+        second.dismissTermSuggestion("herdr")
+        XCTAssertEqual(makeStore().polishDismissedTermSuggestions, ["herdr", "SessionStart"])
+    }
+
     // MARK: - debugLogRealtimeDeltas (issue #13 instrumentation)
 
     func testDebugLogRealtimeDeltas_defaultsToFalse() {
@@ -943,4 +1060,235 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertFalse(reloadedStore.debugLogRealtimeDeltas)
     }
 
+
+    // MARK: - Mistral API mode
+
+    func testMistralAPIModeRawValueAndOrder() {
+        XCTAssertEqual(BackendMode.mistralAPI.rawValue, "mistral_api")
+        XCTAssertEqual(BackendMode.mistralAPI.displayName, "Mistral API")
+        // The pickers render `allCases` in order: the local default first, the
+        // two hosted options after it.
+        XCTAssertEqual(BackendMode.allCases, [.managedLocal, .externalURL, .mistralAPI])
+    }
+
+    func testUnknownStoredBackendModeStillFallsBackToManaged() {
+        defaults.set("mistral_api_v2_from_the_future", forKey: "settings.dictation_backend_mode")
+        defaults.set("mistral_api_v2_from_the_future", forKey: "settings.polishing_backend_mode")
+
+        let store = makeStore()
+
+        XCTAssertEqual(store.dictationBackendMode, .managedLocal)
+        XCTAssertEqual(store.polishingBackendMode, .managedLocal)
+    }
+
+    func testMistralSettingsRoundTripUnderDocumentedKeys() {
+        let store = makeStore()
+        store.mistralAPIKey = "  mk-secret  "
+        store.mistralDictationModel = "voxtral-mini-transcribe-realtime-latest"
+        store.mistralPolishingModel = "mistral-medium-latest"
+
+        // The key goes to the secret store, trimmed, and NOWHERE near the plist.
+        XCTAssertNil(defaults.string(forKey: "settings.mistral_api_key"))
+        XCTAssertEqual(secrets.snapshot[.mistralAPIKey], "mk-secret")
+        XCTAssertEqual(
+            defaults.string(forKey: "settings.mistral_dictation_model"),
+            "voxtral-mini-transcribe-realtime-latest"
+        )
+        XCTAssertEqual(
+            defaults.string(forKey: "settings.mistral_polishing_model"),
+            "mistral-medium-latest"
+        )
+
+        let reloaded = makeStore()
+        // A relaunch fetches the key when something needs it — here, the
+        // Settings window showing the field (LazySecretLoadingTests).
+        reloaded.ensureAllSecretsLoaded()
+        XCTAssertEqual(reloaded.mistralAPIKey, "mk-secret")
+        XCTAssertEqual(reloaded.trimmedMistralAPIKey, "mk-secret")
+        XCTAssertEqual(
+            reloaded.resolvedMistralDictationModel,
+            "voxtral-mini-transcribe-realtime-latest"
+        )
+        XCTAssertEqual(reloaded.resolvedMistralPolishingModel, "mistral-medium-latest")
+    }
+
+    func testMistralModelsFallBackToPinnedDefaultsWhenEmpty() {
+        let store = makeStore()
+
+        XCTAssertEqual(store.mistralDictationModel, "")
+        XCTAssertEqual(store.mistralPolishingModel, "")
+        XCTAssertEqual(
+            store.resolvedMistralDictationModel,
+            "voxtral-mini-transcribe-realtime-2602"
+        )
+        XCTAssertEqual(store.resolvedMistralPolishingModel, "mistral-medium-3-5")
+
+        // Whitespace is not a model name either.
+        store.mistralDictationModel = "   "
+        store.mistralPolishingModel = "\n"
+        XCTAssertEqual(
+            store.resolvedMistralDictationModel,
+            MistralRealtimeWebSocketClient.defaultModel
+        )
+        XCTAssertEqual(store.resolvedMistralPolishingModel, MistralPolishDefaults.model)
+    }
+
+    func testResolvedWebSocketURL_mistralAPI_usesThePinnedHostedEndpoint() {
+        let store = makeStore()
+        store.dictationBackendMode = .mistralAPI
+        // A leftover external endpoint must not leak into the hosted mode.
+        store.realtimeAPIEndpointURL = "ws://127.0.0.1:8000/v1/realtime"
+
+        XCTAssertEqual(
+            store.resolvedWebSocketURL(for: store.realtimeProvider),
+            MistralRealtimeWebSocketClient.defaultEndpoint
+        )
+        XCTAssertEqual(
+            store.resolvedWebSocketURL?.absoluteString,
+            "wss://api.mistral.ai/v1/audio/transcriptions/realtime"
+        )
+    }
+
+    func testEffectiveModelName_mistralAPI_usesTheMistralDictationModel() {
+        let store = makeStore()
+        store.dictationBackendMode = .mistralAPI
+        store.realtimeAPIModelName = "some/external-repo"
+
+        XCTAssertEqual(
+            store.effectiveModelName,
+            MistralRealtimeWebSocketClient.defaultModel
+        )
+
+        store.mistralDictationModel = "voxtral-mini-transcribe-realtime-latest"
+        XCTAssertEqual(store.effectiveModelName, "voxtral-mini-transcribe-realtime-latest")
+    }
+
+    func testTrimmedAPIKey_mistralAPI_returnsTheMistralKeyNotTheExternalOne() {
+        let store = makeStore()
+        store.dictationBackendMode = .mistralAPI
+        store.apiKey = "sk-external"
+        store.mistralAPIKey = "  mk-mistral  "
+
+        XCTAssertEqual(store.trimmedAPIKey, "mk-mistral")
+
+        // And the other two modes are untouched by the new key.
+        store.dictationBackendMode = .externalURL
+        XCTAssertEqual(store.trimmedAPIKey, "sk-external")
+        store.dictationBackendMode = .managedLocal
+        XCTAssertEqual(store.trimmedAPIKey, "")
+    }
+
+    func testLLMPolishingConfiguration_mistralAPI_usesHostedEndpointModelAndShape() {
+        let store = makeStore()
+        store.polishingBackendMode = .mistralAPI
+        store.llmPolishingEnabled = true
+        store.mistralAPIKey = "  mk-mistral  "
+        // External-mode fields must never leak into a Mistral configuration.
+        store.llmPolishingEndpointURL = "http://127.0.0.1:8080"
+        store.llmPolishingAPIKey = "sk-ignored"
+        store.llmPolishingModel = "gpt-4o-mini"
+
+        let configuration = store.llmPolishingConfiguration
+        XCTAssertEqual(configuration?.endpointURL, MistralPolishDefaults.endpoint)
+        XCTAssertEqual(configuration?.apiKey, "mk-mistral")
+        XCTAssertEqual(configuration?.model, MistralPolishDefaults.model)
+        XCTAssertEqual(configuration?.requestShape, .mistral)
+        XCTAssertNil(configuration?.samplingDefaults)
+        XCTAssertNil(configuration?.chatTemplateArguments)
+    }
+
+    func testLLMPolishingConfiguration_mistralAPI_usesTheConfiguredPolishingModel() {
+        let store = makeStore()
+        store.polishingBackendMode = .mistralAPI
+        store.llmPolishingEnabled = true
+        store.mistralAPIKey = "mk-mistral"
+        store.mistralPolishingModel = "  mistral-medium-latest  "
+
+        XCTAssertEqual(store.llmPolishingConfiguration?.model, "mistral-medium-latest")
+    }
+
+    func testLLMPolishingConfiguration_mistralAPI_withoutKeyReturnsNil() {
+        let store = makeStore()
+        store.polishingBackendMode = .mistralAPI
+        store.llmPolishingEnabled = true
+        store.mistralAPIKey = "   "
+
+        // A polish request with no key can only come back 401; the commit path
+        // reports a nil configuration as one actionable line instead.
+        XCTAssertNil(store.llmPolishingConfiguration)
+    }
+
+    func testMistralPolishingEndpointIsNotAPermittedContextEndpointWithoutTheOptIn() {
+        // The trust boundary is unchanged by this mode: api.mistral.ai is not
+        // loopback, so every polish-context surface stays behind the explicit
+        // trusted-endpoint opt-in, exactly as for any External URL.
+        XCTAssertFalse(
+            PolishContextClipboardReader.isLoopbackEndpoint(MistralPolishDefaults.endpoint)
+        )
+        XCTAssertFalse(
+            PolishContextClipboardReader.isPermittedContextEndpoint(
+                MistralPolishDefaults.endpoint,
+                trustedEndpointEnabled: false
+            )
+        )
+        XCTAssertTrue(
+            PolishContextClipboardReader.isPermittedContextEndpoint(
+                MistralPolishDefaults.endpoint,
+                trustedEndpointEnabled: true
+            )
+        )
+    }
+
+    func testMistralAPIStatusSummaryNamesTheOnlyThingTheUserCanGetWrong() {
+        let store = makeStore()
+        XCTAssertFalse(store.isMistralAPIConfigured)
+        XCTAssertEqual(store.mistralAPIStatusSummary, "API key missing")
+
+        store.mistralAPIKey = "mk-mistral"
+        XCTAssertTrue(store.isMistralAPIConfigured)
+        XCTAssertEqual(store.mistralAPIStatusSummary, "Ready")
+    }
+
+
+    func testLivePasteShortcut_customPersistsAcrossReload() {
+        let store = makeStore()
+        let customShortcut = DictationShortcut(
+            keyCode: UInt32(kVK_ANSI_L),
+            carbonModifierFlags: UInt32(cmdKey | optionKey)
+        )
+
+        store.setLivePasteShortcut(customShortcut)
+
+        let reloadedStore = makeStore()
+        XCTAssertTrue(reloadedStore.livePasteShortcutEnabled)
+        XCTAssertEqual(reloadedStore.livePasteShortcut, customShortcut)
+    }
+
+    func testLivePasteShortcut_defaultsToDisabled() {
+        let store = makeStore()
+
+        XCTAssertFalse(store.livePasteShortcutEnabled)
+        XCTAssertNil(store.livePasteShortcut)
+    }
+
+    func testOverlayBufferShortcut_customPersistsAcrossReload() {
+        let store = makeStore()
+        let customShortcut = DictationShortcut(
+            keyCode: UInt32(kVK_ANSI_O),
+            carbonModifierFlags: UInt32(cmdKey | optionKey)
+        )
+
+        store.setOverlayBufferShortcut(customShortcut)
+
+        let reloadedStore = makeStore()
+        XCTAssertTrue(reloadedStore.overlayBufferShortcutEnabled)
+        XCTAssertEqual(reloadedStore.overlayBufferShortcut, customShortcut)
+    }
+
+    func testOverlayBufferShortcut_defaultsToEnabledDefault() {
+        let store = makeStore()
+
+        XCTAssertTrue(store.overlayBufferShortcutEnabled)
+        XCTAssertEqual(store.overlayBufferShortcut, SettingsStore.defaultDictationShortcut)
+    }
 }

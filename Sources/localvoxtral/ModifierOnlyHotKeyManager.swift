@@ -6,14 +6,18 @@ import IOKit.hid
 
 /// Captures modifier-only key presses (Fn/Globe, Right Command, Right Option)
 /// with NSEvent monitors. A quick tap starts/stops overlay-buffer dictation;
-/// holding past the configured threshold starts live auto-paste push-to-talk
-/// dictation until the modifier is released.
+/// holding past the configured threshold starts push-to-talk dictation until
+/// the modifier is released.
 @MainActor
 final class ModifierOnlyHotKeyManager {
     enum ModifierKey: String, CaseIterable, Identifiable, Codable {
         case fn = "fn"
         case rightCommand = "right_command"
         case rightOption = "right_option"
+        /// Two modifier keys or more pressed together, stored apart in
+        /// `SettingsStore.modifierOnlyHotKeyChord` (#863). `ModifierChordHotKeyMonitor`
+        /// runs its gesture, not this manager.
+        case chord = "chord"
 
         var id: String { rawValue }
 
@@ -22,6 +26,7 @@ final class ModifierOnlyHotKeyManager {
             case .fn: return "Fn / Globe"
             case .rightCommand: return "Right Command"
             case .rightOption: return "Right Option"
+            case .chord: return "Chord"
             }
         }
     }
@@ -167,10 +172,6 @@ final class ModifierOnlyHotKeyManager {
     }
 
     func stop() {
-        #if DEBUG
-        Self.stopCallCount += 1
-        #endif
-
         removeEventMonitors()
         resetGestureState()
     }
@@ -179,7 +180,7 @@ final class ModifierOnlyHotKeyManager {
         // MainActor deinit - teardown is driven by HotKeyManager via stop().
     }
 
-    private static func defaultHoldScheduler(
+    static func defaultHoldScheduler(
         delay: Double,
         fire: @escaping @MainActor @Sendable () -> Void
     ) {
@@ -266,7 +267,11 @@ final class ModifierOnlyHotKeyManager {
 
         if state.isModifierDown {
             if isTargetKeyEvent || !targetFlagPresent {
-                effect = handleTargetModifierReleaseIfNeeded(targetFlagPresent: targetFlagPresent)
+                // The left twin keeps `.command` / `.option` set after the
+                // right key is up; only the right key's device bit says so (#1270).
+                let targetKeyHeld = targetFlagPresent
+                    && (!isTargetKeyEvent || Self.targetSideStillHeld(target, flags: flags))
+                effect = handleTargetModifierReleaseIfNeeded(targetFlagPresent: targetKeyHeld)
             } else {
                 effect = handleModifierInterruptedByFlagsTimeline()
             }
@@ -368,6 +373,22 @@ final class ModifierOnlyHotKeyManager {
             return flags.contains(.command)
         case .rightOption:
             return flags.contains(.option)
+        case .chord:
+            return false
+        }
+    }
+
+    private static func targetSideStillHeld(
+        _ target: ModifierKey,
+        flags: NSEvent.ModifierFlags
+    ) -> Bool {
+        switch target {
+        case .rightCommand:
+            return flags.rawValue & SidedModifier.rightCommand.deviceFlag != 0
+        case .rightOption:
+            return flags.rawValue & SidedModifier.rightOption.deviceFlag != 0
+        case .fn, .chord:
+            return true
         }
     }
 
@@ -382,19 +403,19 @@ final class ModifierOnlyHotKeyManager {
             return keyCode == UInt16(kVK_RightCommand)
         case .rightOption:
             return keyCode == UInt16(kVK_RightOption)
+        case .chord:
+            return false
         }
     }
 
     #if DEBUG
     static var lastStartOutcome: ModifierOnlyHotKeyStartOutcome = .none
     static var startCallCount = 0
-    static var stopCallCount = 0
     static var forcedStartOutcome: ModifierOnlyHotKeyStartOutcome?
 
     static func resetDebugState() {
         lastStartOutcome = .none
         startCallCount = 0
-        stopCallCount = 0
         forcedStartOutcome = nil
     }
 

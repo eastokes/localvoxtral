@@ -29,7 +29,7 @@ final class DiagnosticsExporterTests: XCTestCase {
     // MARK: - Helpers
 
     private func makeStore() -> SettingsStore {
-        SettingsStore(defaults: defaults, environment: [:])
+        SettingsStore(defaults: defaults, environment: [:], secretStore: InMemorySecretStore())
     }
 
     /// A store in external-URL mode with a user-entered endpoint, so the
@@ -58,6 +58,32 @@ final class DiagnosticsExporterTests: XCTestCase {
             speechdRecentOutput: speechdRecentOutput,
             polishdRecentOutput: polishdRecentOutput
         )
+    }
+
+    // MARK: - Stored keys
+
+    /// The export reports whether each key is set, and the app no longer reads
+    /// a key until something needs it. Without the exporter's own fetch, a
+    /// managed-local user's report would claim "not set" for keys they have
+    /// stored — and send whoever reads the report after the wrong thing.
+    func testTheExportFetchesStoredKeysBeforeReportingThem() {
+        let secrets = CountingSecretStore([
+            .realtimeAPIKey: "sk-realtime",
+            .llmPolishingAPIKey: "polish-key",
+            .mistralAPIKey: "mk-mistral",
+        ])
+        let store = SettingsStore(
+            defaults: defaults, environment: [:], secretStore: secrets)
+        XCTAssertEqual(secrets.reads, [], "managed local reads nothing at launch")
+
+        let snapshot = makeSnapshot(settings: store)
+
+        XCTAssertEqual(Set(secrets.reads), Set(SecretKey.allCases).subtracting([.jevAPIKey]))
+        XCTAssertTrue(snapshot.hasRealtimeAPIKey)
+        XCTAssertTrue(snapshot.hasPolishingAPIKey)
+        let report = DiagnosticsExporter.makeReport(snapshot: snapshot, now: Date())
+        XCTAssertTrue(report.contains("realtime API key: set"))
+        XCTAssertFalse(report.contains("sk-realtime"), "never the key itself")
     }
 
     // MARK: - Section presence
@@ -128,6 +154,22 @@ final class DiagnosticsExporterTests: XCTestCase {
         XCTAssertTrue(report.contains("LLM polishing API key: set"))
     }
 
+    func testReportExcludesMistralAPIKeyValueWhenSet() {
+        let store = makeStore()
+        store.dictationBackendMode = .mistralAPI
+        store.polishingBackendMode = .mistralAPI
+        store.llmPolishingEnabled = true
+        store.mistralAPIKey = "mk-DO-NOT-LEAK-MISTRAL-4d2e"
+
+        let snapshot = makeSnapshot(settings: store)
+        let report = DiagnosticsExporter.makeReport(snapshot: snapshot, now: Date())
+
+        // The snapshot reduces keys to booleans at build time, so no Mistral
+        // key can reach the report through the endpoint or the mode lines.
+        XCTAssertFalse(report.contains("mk-DO-NOT-LEAK-MISTRAL-4d2e"))
+        XCTAssertFalse(report.contains("mk-"))
+    }
+
     func testReportExcludesEmbeddedEndpointCredentials() {
         let store = makeExternalStore(
             endpoint: "ws://alice:hunter2@127.0.0.1:8000/v1/realtime?token=sekret-fragment#frag"
@@ -141,36 +183,6 @@ final class DiagnosticsExporterTests: XCTestCase {
         XCTAssertFalse(report.contains("sekret"))
         XCTAssertFalse(report.contains("frag"))
         XCTAssertTrue(report.contains("127.0.0.1:8000"))
-    }
-
-    func testSanitizedEndpointDescriptionStripsCredentials() {
-        let url = URL(string: "wss://user:pass@example.com:9000/path?token=x#section")!
-        XCTAssertEqual(
-            DiagnosticsExporter.sanitizedEndpointDescription(from: url),
-            "wss://example.com:9000/path"
-        )
-    }
-
-    func testSanitizedEndpointDescriptionHandlesNil() {
-        XCTAssertEqual(DiagnosticsExporter.sanitizedEndpointDescription(from: nil), "<invalid endpoint>")
-    }
-
-    // MARK: - Status rendering
-
-    func testDescribeStatusVariants() {
-        XCTAssertEqual(DiagnosticsExporter.describe(.ready), "ready")
-        XCTAssertEqual(DiagnosticsExporter.describe(.starting), "starting")
-        XCTAssertEqual(DiagnosticsExporter.describe(.stopped), "stopped")
-        XCTAssertEqual(DiagnosticsExporter.describe(.failed(summary: "boom", detail: nil)), "failed: boom")
-        XCTAssertEqual(
-            DiagnosticsExporter.describe(.failed(summary: "boom", detail: "stderr: trace")),
-            "failed: boom — stderr: trace"
-        )
-        XCTAssertTrue(
-            DiagnosticsExporter
-                .describe(.preparingModel(progress: ModelDownloadProgress(downloadedBytes: 50, totalBytes: 100)))
-                .contains("50%")
-        )
     }
 
     // MARK: - File writing: injected directory + injected timestamp

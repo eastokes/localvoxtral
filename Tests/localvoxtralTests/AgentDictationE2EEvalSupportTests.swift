@@ -44,6 +44,8 @@ final class AgentDictationE2EEvalSupportTests: XCTestCase {
         XCTAssertNil(marker.polishEndpoint)
         XCTAssertNil(marker.recordingDirectory)
         XCTAssertNil(marker.recordingSubset)
+        XCTAssertNil(marker.provider)
+        XCTAssertNil(marker.apiKey)
     }
 
     func testEnablementNilWithoutEnvOrMarker() {
@@ -101,23 +103,210 @@ final class AgentDictationE2EEvalSupportTests: XCTestCase {
         XCTAssertEqual(enablement.caseIDs, ["one", "two"])
     }
 
+    // MARK: - Provider arms
+
+    func testParseMarkerReadsProviderAndAPIKey() throws {
+        let marker = try Support.parseMarker(
+            Data(#"{"provider": "mistral", "apiKey": "sk-test"}"#.utf8)
+        )
+        XCTAssertEqual(marker.provider, "mistral")
+        XCTAssertEqual(marker.apiKey, "sk-test")
+    }
+
+    /// The pin that keeps every marker written before the Mistral arm existed
+    /// resolving EXACTLY as it did: local provider, local pins, no key.
+    func testEnablementWithoutProviderStaysTheLocalSpeechdArm() throws {
+        let enablement = try XCTUnwrap(
+            Support.resolveEnablement(
+                environment: [:],
+                marker: Support.MarkerConfig(
+                    helperPath: "PolishHelper/.build/x/localvoxtral-polishd",
+                    asrModel: Support.defaultASRModel
+                )
+            )
+        )
+        XCTAssertEqual(enablement.provider, .speechd)
+        XCTAssertEqual(enablement.apiKey, "")
+        XCTAssertEqual(enablement.voxmlxEndpoint.absoluteString, Support.defaultVoxmlxEndpoint)
+        XCTAssertEqual(enablement.asrModel, Support.defaultASRModel)
+        XCTAssertEqual(enablement.polishModel, PolishModelCatalog.defaultOption.repoID)
+        XCTAssertTrue(enablement.usesBundledPolishHelper)
+    }
+
+    func testMistralMarkerResolvesHostedPinsAndKey() throws {
+        let enablement = try XCTUnwrap(
+            Support.resolveEnablement(
+                environment: [:],
+                marker: Support.MarkerConfig(provider: "mistral", apiKey: "sk-marker")
+            )
+        )
+        XCTAssertEqual(enablement.provider, .mistral)
+        XCTAssertEqual(enablement.apiKey, "sk-marker")
+        // The hosted pins, not the local speechd/catalog ones (which would be
+        // 404s on api.mistral.ai).
+        XCTAssertEqual(enablement.asrModel, MistralRealtimeWebSocketClient.defaultModel)
+        XCTAssertEqual(enablement.polishModel, MistralPolishDefaults.model)
+        // No `package` run is needed when both stages are hosted.
+        XCTAssertFalse(enablement.usesBundledPolishHelper)
+    }
+
+    func testMistralProviderAndKeyResolveFromTheEnvironmentToo() throws {
+        let enablement = try XCTUnwrap(
+            Support.resolveEnablement(
+                environment: [
+                    Support.enableEnvKey: "1",
+                    Support.providerEnvKey: "mistral",
+                    Support.apiKeyEnvKey: "sk-env",
+                    Support.asrModelEnvKey: "voxtral-experimental",
+                ],
+                marker: nil
+            )
+        )
+        XCTAssertEqual(enablement.provider, .mistral)
+        XCTAssertEqual(enablement.apiKey, "sk-env")
+        XCTAssertEqual(enablement.asrModel, "voxtral-experimental")
+    }
+
+    /// The key is only read from the environment through the explicit env
+    /// channel: an exported MISTRAL_API_KEY must not silently attach itself to
+    /// a marker-driven local run.
+    func testMarkerRunIgnoresAnAmbientMistralKey() throws {
+        let enablement = try XCTUnwrap(
+            Support.resolveEnablement(
+                environment: [Support.apiKeyEnvKey: "sk-ambient"],
+                marker: Support.MarkerConfig(helperPath: "custom/polishd")
+            )
+        )
+        XCTAssertEqual(enablement.provider, .speechd)
+        XCTAssertEqual(enablement.apiKey, "")
+    }
+
+    func testUnknownProviderResolvesToNilRatherThanTheWrongArm() {
+        XCTAssertNil(
+            Support.resolveEnablement(
+                environment: [:],
+                marker: Support.MarkerConfig(provider: "mistrall", apiKey: "sk-typo")
+            )
+        )
+    }
+
+    func testASRStageConfigurationPerProvider() throws {
+        let local = try XCTUnwrap(
+            Support.resolveEnablement(
+                environment: [:],
+                marker: Support.MarkerConfig(voxmlxEndpoint: "ws://127.0.0.1:9000/v1/realtime")
+            )
+        )
+        let localStage = Support.asrStageConfiguration(local)
+        XCTAssertEqual(localStage.endpoint.absoluteString, "ws://127.0.0.1:9000/v1/realtime")
+        XCTAssertEqual(localStage.apiKey, "")
+        XCTAssertEqual(localStage.model, Support.defaultASRModel)
+
+        let hosted = try XCTUnwrap(
+            Support.resolveEnablement(
+                environment: [:],
+                marker: Support.MarkerConfig(
+                    // Even a stale local endpoint in the marker cannot redirect
+                    // the hosted arm: the Mistral socket URL is pinned.
+                    voxmlxEndpoint: "ws://127.0.0.1:9000/v1/realtime",
+                    provider: "mistral",
+                    apiKey: "sk-hosted"
+                )
+            )
+        )
+        let hostedStage = Support.asrStageConfiguration(hosted)
+        XCTAssertEqual(hostedStage.endpoint, MistralRealtimeWebSocketClient.defaultEndpoint)
+        XCTAssertEqual(hostedStage.apiKey, "sk-hosted")
+        XCTAssertEqual(hostedStage.model, MistralRealtimeWebSocketClient.defaultModel)
+    }
+
+    func testRealtimeClientSelectionPerProvider() {
+        XCTAssertTrue(
+            Support.makeRealtimeClient(for: .speechd) is RealtimeAPIWebSocketClient
+        )
+        let mistral = Support.makeRealtimeClient(for: .mistral)
+        XCTAssertTrue(mistral is MistralRealtimeWebSocketClient)
+        // The choreography the ASR stage uses relies on this: Mistral has no
+        // partial-commit concept, so the non-final commit is a no-op there.
+        XCTAssertFalse(mistral.supportsPeriodicCommit)
+    }
+
+    // MARK: - Mistral polish configuration (built by the settings store)
+
+    func testMistralPolishConfigurationIsTheSettingsStoresOwn() throws {
+        let settings = makeTestSettings()
+        let configuration = try XCTUnwrap(
+            Support.configureMistralPolishing(
+                settings, apiKey: "sk-polish", model: MistralPolishDefaults.model
+            )
+        )
+        XCTAssertEqual(configuration.requestShape, .mistral)
+        XCTAssertEqual(configuration.endpointURL, MistralPolishDefaults.endpoint)
+        XCTAssertEqual(configuration.apiKey, "sk-polish")
+        XCTAssertEqual(configuration.model, MistralPolishDefaults.model)
+        // The store, not the eval, is the author — no drift is representable.
+        XCTAssertTrue(settings.llmPolishingEnabled)
+        XCTAssertEqual(settings.polishingBackendMode, .mistralAPI)
+        XCTAssertEqual(
+            settings.llmPolishingConfiguration?.endpointURL, configuration.endpointURL
+        )
+        // api.mistral.ai is not loopback: without this opt-in the privacy
+        // gates would withhold every clipboard/repo-vocabulary case's context.
+        XCTAssertTrue(settings.polishContextTrustedEndpointEnabled)
+        XCTAssertFalse(
+            PolishContextClipboardReader.isLoopbackEndpoint(configuration.endpointURL)
+        )
+        XCTAssertTrue(
+            PolishContextClipboardReader.isPermittedContextEndpoint(
+                configuration.endpointURL,
+                trustedEndpointEnabled: settings.polishContextTrustedEndpointEnabled
+            )
+        )
+    }
+
+    func testMistralPolishConfigurationHonoursAnExplicitModel() throws {
+        let settings = makeTestSettings()
+        let configuration = try XCTUnwrap(
+            Support.configureMistralPolishing(
+                settings, apiKey: "sk-polish", model: "mistral-small-latest"
+            )
+        )
+        XCTAssertEqual(configuration.model, "mistral-small-latest")
+    }
+
+    func testMistralPolishConfigurationIsNilWithoutAKey() {
+        XCTAssertNil(
+            Support.configureMistralPolishing(
+                makeTestSettings(), apiKey: "", model: MistralPolishDefaults.model
+            )
+        )
+    }
+
+    private func makeTestSettings() -> SettingsStore {
+        let suiteName = "localvoxtral.AgentDictationE2EEvalSupportTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
+        addTeardownBlock { defaults.removePersistentDomain(forName: suiteName) }
+        return SettingsStore(defaults: defaults, environment: [:], secretStore: InMemorySecretStore())
+    }
+
     // MARK: - WAV cache key
 
     func testWavCacheKeyIsDeterministicHex() {
-        let first = Support.wavCacheKey(text: "open the dot env file", voice: "Samantha")
-        let second = Support.wavCacheKey(text: "open the dot env file", voice: "Samantha")
+        let first = EvalSpeechStage.wavCacheKey(text: "open the dot env file", voice: "Samantha")
+        let second = EvalSpeechStage.wavCacheKey(text: "open the dot env file", voice: "Samantha")
         XCTAssertEqual(first, second)
         XCTAssertEqual(first.count, 64)
         XCTAssertTrue(first.allSatisfy { $0.isHexDigit && !$0.isUppercase })
     }
 
     func testWavCacheKeyChangesWithEachInput() {
-        let base = Support.wavCacheKey(text: "hello", voice: "Samantha")
-        XCTAssertNotEqual(base, Support.wavCacheKey(text: "hello there", voice: "Samantha"))
-        XCTAssertNotEqual(base, Support.wavCacheKey(text: "hello", voice: "Thomas"))
-        XCTAssertNotEqual(base, Support.wavCacheKey(text: "hello", voice: nil))
+        let base = EvalSpeechStage.wavCacheKey(text: "hello", voice: "Samantha")
+        XCTAssertNotEqual(base, EvalSpeechStage.wavCacheKey(text: "hello there", voice: "Samantha"))
+        XCTAssertNotEqual(base, EvalSpeechStage.wavCacheKey(text: "hello", voice: "Thomas"))
+        XCTAssertNotEqual(base, EvalSpeechStage.wavCacheKey(text: "hello", voice: nil))
         XCTAssertNotEqual(
-            base, Support.wavCacheKey(text: "hello", voice: "Samantha", dataFormat: "LEI16@22050")
+            base, EvalSpeechStage.wavCacheKey(text: "hello", voice: "Samantha", dataFormat: "LEI16@22050")
         )
     }
 
@@ -127,15 +316,15 @@ final class AgentDictationE2EEvalSupportTests: XCTestCase {
     /// length-prefixed now.)
     func testWavCacheKeyFieldBoundariesDoNotCollide() {
         XCTAssertNotEqual(
-            Support.wavCacheKey(text: "a|Samantha", voice: nil),
-            Support.wavCacheKey(text: "a", voice: "Samantha|default")
+            EvalSpeechStage.wavCacheKey(text: "a|Samantha", voice: nil),
+            EvalSpeechStage.wavCacheKey(text: "a", voice: "Samantha|default")
         )
     }
 
     // MARK: - Human recording manifests + WAV validation
 
-    private var recordingExpectation: Support.RecordingExpectation {
-        Support.RecordingExpectation(
+    private var recordingExpectation: RecordedAudioSet.Expectation {
+        RecordedAudioSet.Expectation(
             id: "b-en-flag-force", lang: .en,
             spokenForm: "run it with dash dash force"
         )
@@ -146,8 +335,8 @@ final class AgentDictationE2EEvalSupportTests: XCTestCase {
         spokenForm: String = "run it with dash dash force",
         file: String? = nil,
         sha256: String = String(repeating: "a", count: 64)
-    ) -> Support.Recording {
-        Support.Recording(
+    ) -> RecordedAudioSet.Recording {
+        RecordedAudioSet.Recording(
             id: id,
             lang: .en,
             spokenForm: spokenForm,
@@ -157,13 +346,13 @@ final class AgentDictationE2EEvalSupportTests: XCTestCase {
     }
 
     func testRecordingManifestAcceptsExactCompleteCorpusBinding() throws {
-        let manifest = Support.RecordingManifest(
-            schemaVersion: Support.recordingSchemaVersion,
-            dataFormat: Support.recordingDataFormat,
+        let manifest = RecordedAudioSet.Manifest(
+            schemaVersion: RecordedAudioSet.schemaVersion,
+            dataFormat: RecordedAudioSet.dataFormat,
             recordings: [recording()]
         )
         XCTAssertEqual(
-            try Support.validateRecordingManifest(
+            try RecordedAudioSet.validateManifest(
                 manifest, expected: [recordingExpectation]
             )[recordingExpectation.id],
             recording()
@@ -171,22 +360,22 @@ final class AgentDictationE2EEvalSupportTests: XCTestCase {
     }
 
     func testRecordingManifestSubsetIsExplicitAndNeverFallsBackToTTS() throws {
-        let second = Support.RecordingExpectation(
+        let second = RecordedAudioSet.Expectation(
             id: "a-en-websocket-timeout", lang: .en,
             spokenForm: "the websocket client times out"
         )
-        let partial = Support.RecordingManifest(
-            schemaVersion: Support.recordingSchemaVersion,
-            dataFormat: Support.recordingDataFormat,
+        let partial = RecordedAudioSet.Manifest(
+            schemaVersion: RecordedAudioSet.schemaVersion,
+            dataFormat: RecordedAudioSet.dataFormat,
             recordings: [recording()]
         )
         XCTAssertThrowsError(
-            try Support.validateRecordingManifest(
+            try RecordedAudioSet.validateManifest(
                 partial, expected: [recordingExpectation, second]
             )
         ) { XCTAssertTrue($0.localizedDescription.contains("incomplete")) }
         XCTAssertEqual(
-            try Support.validateRecordingManifest(
+            try RecordedAudioSet.validateManifest(
                 partial,
                 expected: [recordingExpectation, second],
                 allowSubset: true
@@ -194,13 +383,13 @@ final class AgentDictationE2EEvalSupportTests: XCTestCase {
             [recordingExpectation.id: recording()]
         )
 
-        let unknown = Support.RecordingManifest(
-            schemaVersion: Support.recordingSchemaVersion,
-            dataFormat: Support.recordingDataFormat,
+        let unknown = RecordedAudioSet.Manifest(
+            schemaVersion: RecordedAudioSet.schemaVersion,
+            dataFormat: RecordedAudioSet.dataFormat,
             recordings: [recording(id: "unknown-case")]
         )
         XCTAssertThrowsError(
-            try Support.validateRecordingManifest(
+            try RecordedAudioSet.validateManifest(
                 unknown,
                 expected: [recordingExpectation, second],
                 allowSubset: true
@@ -209,77 +398,77 @@ final class AgentDictationE2EEvalSupportTests: XCTestCase {
     }
 
     func testRecordingManifestRejectsPartialStaleAndDuplicateSets() {
-        let empty = Support.RecordingManifest(
+        let empty = RecordedAudioSet.Manifest(
             schemaVersion: 1,
-            dataFormat: Support.recordingDataFormat,
+            dataFormat: RecordedAudioSet.dataFormat,
             recordings: []
         )
         XCTAssertThrowsError(
-            try Support.validateRecordingManifest(empty, expected: [recordingExpectation])
+            try RecordedAudioSet.validateManifest(empty, expected: [recordingExpectation])
         ) { XCTAssertTrue($0.localizedDescription.contains("incomplete")) }
 
-        let stale = Support.RecordingManifest(
+        let stale = RecordedAudioSet.Manifest(
             schemaVersion: 1,
-            dataFormat: Support.recordingDataFormat,
+            dataFormat: RecordedAudioSet.dataFormat,
             recordings: [recording(spokenForm: "old phrase")]
         )
         XCTAssertThrowsError(
-            try Support.validateRecordingManifest(stale, expected: [recordingExpectation])
+            try RecordedAudioSet.validateManifest(stale, expected: [recordingExpectation])
         ) { XCTAssertTrue($0.localizedDescription.contains("stale")) }
 
-        let duplicate = Support.RecordingManifest(
+        let duplicate = RecordedAudioSet.Manifest(
             schemaVersion: 1,
-            dataFormat: Support.recordingDataFormat,
+            dataFormat: RecordedAudioSet.dataFormat,
             recordings: [recording(), recording()]
         )
         XCTAssertThrowsError(
-            try Support.validateRecordingManifest(duplicate, expected: [recordingExpectation])
+            try RecordedAudioSet.validateManifest(duplicate, expected: [recordingExpectation])
         ) { XCTAssertTrue($0.localizedDescription.contains("duplicate")) }
     }
 
     func testRecordingManifestRejectsSchemaFormatExtraUnsafeAndMalformedHash() {
         let expected = [recordingExpectation]
-        let wrongSchema = Support.RecordingManifest(
-            schemaVersion: 2, dataFormat: Support.recordingDataFormat,
+        let wrongSchema = RecordedAudioSet.Manifest(
+            schemaVersion: 2, dataFormat: RecordedAudioSet.dataFormat,
             recordings: [recording()]
         )
-        XCTAssertThrowsError(try Support.validateRecordingManifest(wrongSchema, expected: expected)) {
+        XCTAssertThrowsError(try RecordedAudioSet.validateManifest(wrongSchema, expected: expected)) {
             XCTAssertTrue($0.localizedDescription.contains("schemaVersion"))
         }
-        let wrongFormat = Support.RecordingManifest(
+        let wrongFormat = RecordedAudioSet.Manifest(
             schemaVersion: 1, dataFormat: "pcm_s16le@44100Hz-stereo",
             recordings: [recording()]
         )
-        XCTAssertThrowsError(try Support.validateRecordingManifest(wrongFormat, expected: expected)) {
+        XCTAssertThrowsError(try RecordedAudioSet.validateManifest(wrongFormat, expected: expected)) {
             XCTAssertTrue($0.localizedDescription.contains("dataFormat"))
         }
-        let extra = Support.RecordingManifest(
-            schemaVersion: 1, dataFormat: Support.recordingDataFormat,
+        let extra = RecordedAudioSet.Manifest(
+            schemaVersion: 1, dataFormat: RecordedAudioSet.dataFormat,
             recordings: [recording(), recording(id: "unknown-case")]
         )
-        XCTAssertThrowsError(try Support.validateRecordingManifest(extra, expected: expected)) {
+        XCTAssertThrowsError(try RecordedAudioSet.validateManifest(extra, expected: expected)) {
             XCTAssertTrue($0.localizedDescription.contains("stale/unknown"))
         }
-        let unsafe = Support.RecordingManifest(
-            schemaVersion: 1, dataFormat: Support.recordingDataFormat,
+        let unsafe = RecordedAudioSet.Manifest(
+            schemaVersion: 1, dataFormat: RecordedAudioSet.dataFormat,
             recordings: [recording(file: "../take.wav")]
         )
-        XCTAssertThrowsError(try Support.validateRecordingManifest(unsafe, expected: expected)) {
+        XCTAssertThrowsError(try RecordedAudioSet.validateManifest(unsafe, expected: expected)) {
             XCTAssertTrue($0.localizedDescription.contains("unsafe"))
         }
-        let malformedHash = Support.RecordingManifest(
-            schemaVersion: 1, dataFormat: Support.recordingDataFormat,
+        let malformedHash = RecordedAudioSet.Manifest(
+            schemaVersion: 1, dataFormat: RecordedAudioSet.dataFormat,
             recordings: [recording(sha256: "NOT-A-HASH")]
         )
         XCTAssertThrowsError(
-            try Support.validateRecordingManifest(malformedHash, expected: expected)
+            try RecordedAudioSet.validateManifest(malformedHash, expected: expected)
         ) { XCTAssertTrue($0.localizedDescription.contains("SHA-256")) }
     }
 
     func testRecordedWAVValidationAcceptsExactProductionFormat() throws {
         let wav = makeWAV(sampleRate: 16_000, channels: 1, bits: 16, pcmBytes: 8_000)
-        XCTAssertEqual(try Support.recordedPCM16(fromWAVData: wav).count, 8_000)
-        XCTAssertEqual(Support.sha256Hex(wav).count, 64)
+        XCTAssertEqual(try RecordedAudioSet.pcm16(fromWAVData: wav).count, 8_000)
+        XCTAssertEqual(PortableSHA256.hex(of: wav).count, 64)
     }
 
     /// ffmpeg's WAV muxer writes metadata chunks (normally LIST/INFO) that
@@ -291,26 +480,26 @@ final class AgentDictationE2EEvalSupportTests: XCTestCase {
             chunksBeforeData: [("LIST", Data("abc".utf8))],
             chunksAfterData: [("JUNK", Data([1, 2, 3, 4]))]
         )
-        XCTAssertEqual(try Support.recordedPCM16(fromWAVData: wav).count, 8_000)
+        XCTAssertEqual(try RecordedAudioSet.pcm16(fromWAVData: wav).count, 8_000)
     }
 
     func testRecordedWAVValidationRejectsWrongRateAndShortAudio() {
         XCTAssertThrowsError(
-            try Support.recordedPCM16(
+            try RecordedAudioSet.pcm16(
                 fromWAVData: makeWAV(
                     sampleRate: 44_100, channels: 1, bits: 16, pcmBytes: 8_000
                 )
             )
         ) { XCTAssertTrue($0.localizedDescription.contains("16000")) }
         XCTAssertThrowsError(
-            try Support.recordedPCM16(
+            try RecordedAudioSet.pcm16(
                 fromWAVData: makeWAV(
                     sampleRate: 16_000, channels: 1, bits: 16, pcmBytes: 2_000
                 )
             )
         ) { XCTAssertTrue($0.localizedDescription.contains("0.25")) }
         XCTAssertThrowsError(
-            try Support.recordedPCM16(
+            try RecordedAudioSet.pcm16(
                 fromWAVData: makeWAV(
                     sampleRate: 16_000, channels: 1, bits: 16,
                     pcmBytes: 8_000, containsSignal: false
@@ -324,14 +513,10 @@ final class AgentDictationE2EEvalSupportTests: XCTestCase {
     /// drift or corpus-decoding drift cannot leave the operator workflow
     /// broken while app tests pass. This path intentionally needs no ffmpeg.
     func testHumanRecorderScriptCompilesAndListsEverySpeechCase() throws {
-        let outputDirectory = recorderOutputDirectory(label: "smoke")
-        addTeardownBlock { try? FileManager.default.removeItem(at: outputDirectory) }
-        let run = try runRecorder(
-            ["--list", "--output", outputDirectory.path]
-        )
+        let run = try Self.scripts.get().recorderThroughWrapper.result()
         XCTAssertEqual(run.status, 0, run.output)
         let expectedSpeechCases = try AgentDictationEvalCorpus.loadStrata().reduce(0) {
-            $0 + (Support.stagePlan(for: $1.stratum.resolvedPipeline).runsSpeechRecognition
+            $0 + (AgentDictationEvalCorpus.stagePlan(for: $1.stratum.resolvedPipeline).runsSpeechRecognition
                 ? $1.stratum.cases.count : 0)
         }
         XCTAssertTrue(
@@ -344,15 +529,15 @@ final class AgentDictationE2EEvalSupportTests: XCTestCase {
         )
         XCTAssertTrue(
             run.output.contains(
-                "Manifest: schema \(Support.recordingSchemaVersion), "
-                    + "format \(Support.recordingDataFormat)"
+                "Manifest: schema \(RecordedAudioSet.schemaVersion), "
+                    + "format \(RecordedAudioSet.dataFormat)"
             ),
             run.output
         )
     }
 
     func testHumanRecorderAcceptsRepeatedCaseFilters() throws {
-        let outputDirectory = recorderOutputDirectory(label: "focused-batch")
+        let outputDirectory = Self.recorderOutputDirectory(label: "focused-batch")
         addTeardownBlock { try? FileManager.default.removeItem(at: outputDirectory) }
         let selected = ["b-en-equals-assignment", "j-fr-git-dense"]
         let run = try runRecorder([
@@ -371,7 +556,7 @@ final class AgentDictationE2EEvalSupportTests: XCTestCase {
     /// of accepted human speech. Older manifests are journaled on first run;
     /// subsequent runs reconstruct the manifest from that durable journal.
     func testHumanRecorderRecoveryJournalRebuildsCorruptManifest() throws {
-        let outputDirectory = recorderOutputDirectory(label: "recovery")
+        let outputDirectory = Self.recorderOutputDirectory(label: "recovery")
         try FileManager.default.createDirectory(
             at: outputDirectory, withIntermediateDirectories: true
         )
@@ -383,14 +568,14 @@ final class AgentDictationE2EEvalSupportTests: XCTestCase {
             + "and add a regression test before changing anything else."
         let wav = makeWAV(sampleRate: 16_000, channels: 1, bits: 16, pcmBytes: 8_000)
         try wav.write(to: outputDirectory.appendingPathComponent("\(id).wav"))
-        let recording = Support.Recording(
+        let recording = RecordedAudioSet.Recording(
             id: id, lang: .en, spokenForm: spokenForm,
-            file: "\(id).wav", sha256: Support.sha256Hex(wav)
+            file: "\(id).wav", sha256: PortableSHA256.hex(of: wav)
         )
         let manifestURL = outputDirectory.appendingPathComponent("manifest.json")
-        let manifest = Support.RecordingManifest(
-            schemaVersion: Support.recordingSchemaVersion,
-            dataFormat: Support.recordingDataFormat,
+        let manifest = RecordedAudioSet.Manifest(
+            schemaVersion: RecordedAudioSet.schemaVersion,
+            dataFormat: RecordedAudioSet.dataFormat,
             recordings: [recording]
         )
         try JSONEncoder().encode(manifest).write(to: manifestURL)
@@ -412,7 +597,7 @@ final class AgentDictationE2EEvalSupportTests: XCTestCase {
         XCTAssertTrue(recovered.output.contains("DONE \(id)"), recovered.output)
         XCTAssertTrue(recovered.output.contains("1 accepted take(s) protected"), recovered.output)
         XCTAssertEqual(
-            try Support.parseRecordingManifest(Data(contentsOf: manifestURL)).recordings,
+            try RecordedAudioSet.parseManifest(Data(contentsOf: manifestURL)).recordings,
             [recording]
         )
 
@@ -420,9 +605,9 @@ final class AgentDictationE2EEvalSupportTests: XCTestCase {
         // normalized WAV was written, but before the atomic rename occurred.
         var replacementWAV = wav
         replacementWAV[44] = 2
-        let replacement = Support.Recording(
+        let replacement = RecordedAudioSet.Recording(
             id: id, lang: .en, spokenForm: spokenForm,
-            file: "\(id).wav", sha256: Support.sha256Hex(replacementWAV)
+            file: "\(id).wav", sha256: PortableSHA256.hex(of: replacementWAV)
         )
         var journal = try Data(contentsOf: journalURL)
         journal.append(try JSONEncoder().encode(replacement))
@@ -446,7 +631,7 @@ final class AgentDictationE2EEvalSupportTests: XCTestCase {
             replacementWAV
         )
         XCTAssertEqual(
-            try Support.parseRecordingManifest(Data(contentsOf: manifestURL)).recordings,
+            try RecordedAudioSet.parseManifest(Data(contentsOf: manifestURL)).recordings,
             [replacement]
         )
     }
@@ -483,7 +668,7 @@ final class AgentDictationE2EEvalSupportTests: XCTestCase {
         let strata = try AgentDictationEvalCorpus.loadStrata()
         let speechCase = try XCTUnwrap(
             strata.first {
-                Support.stagePlan(for: $0.stratum.resolvedPipeline).runsSpeechRecognition
+                AgentDictationEvalCorpus.stagePlan(for: $0.stratum.resolvedPipeline).runsSpeechRecognition
             }?.stratum.cases.first
         )
         let selected = try XCTUnwrap(
@@ -493,7 +678,7 @@ final class AgentDictationE2EEvalSupportTests: XCTestCase {
         )
         XCTAssertTrue(selected.contains(speechCase.id))
         for loaded in strata
-        where !Support.stagePlan(for: loaded.stratum.resolvedPipeline).runsSpeechRecognition
+        where !AgentDictationEvalCorpus.stagePlan(for: loaded.stratum.resolvedPipeline).runsSpeechRecognition
         {
             XCTAssertTrue(Set(loaded.stratum.cases.map(\.id)).isSubset(of: selected))
         }
@@ -587,7 +772,7 @@ final class AgentDictationE2EEvalSupportTests: XCTestCase {
             to: directory.appendingPathComponent("manifest.json"),
             atomically: true, encoding: .utf8
         )
-        let duplicateRun = try runReportRenderer([logURL.path, directory.path])
+        let duplicateRun = try runCompiledReportRenderer([logURL.path, directory.path])
         XCTAssertNotEqual(duplicateRun.status, 0)
         XCTAssertTrue(duplicateRun.output.contains("duplicate id: r-en-report"))
     }
@@ -608,6 +793,28 @@ final class AgentDictationE2EEvalSupportTests: XCTestCase {
         assert payload["temperature"] == 0.0
         assert payload["top_k"] == 0
         assert payload["chat_template_kwargs"] == {"enable_thinking": False}
+        mistral = module.RequestOptions(shape="mistral", temperature=0.3, reasoning_effort="low")
+        payload = module.request_payload("model", messages, mistral)
+        assert payload["reasoning_effort"] == "low" and payload["temperature"] == 0.3
+        assert not {"top_k", "min_p", "chat_template_kwargs"} & set(payload)
+        assert module.experiment_hash("case", "http://one/v1", "model", "variant", messages, mistral) != left
+        assert module.response_text([
+            {"type": "thinking", "thinking": [{"type": "text", "text": "trace"}]},
+            {"type": "text", "text": "answer"},
+        ]) == "answer"
+        score = {"tokensPass": True, "matchedTokens": [], "accuracy": 1.0, "surfaceExact": True}
+        rows = [
+            dict(score, stage=f"25 model current-production@{arm}", caseID="case", output="x")
+            for arm in ("main", "main-repeat")
+        ]
+        deltas = module.paired_variant_deltas(rows, "main")
+        assert [item["variant"] for item in deltas] == ["current-production@main-repeat"]
+        added = {case["caseID"]: case for case in module.polish_only_cases_missing_from([])}
+        assert added["k-en-pr-glued"]["polishInputText"] == "Rebase this branch on PR349 before you push."
+        assert added["k-en-pr-glued"]["forbiddenSubstrings"] == ["PR349"]
+        assert "b-en-flag-force" not in added
+        logged = module.polish_only_cases_missing_from([{"caseID": "k-en-pr-glued"}])
+        assert "k-en-pr-glued" not in {case["caseID"] for case in logged}
         experiment = module.Experiment("case", "model", "variant", messages, left)
         filtered = module.current_results(
             {left: {"output": "current"}, right: {"output": "stale"}}, [experiment]
@@ -656,6 +863,36 @@ final class AgentDictationE2EEvalSupportTests: XCTestCase {
             assert "warning: skipped 1 malformed/interleaved result value(s)" in warnings.getvalue()
         """#
         let run = try runPython(["-c", snippet, script.path])
+        XCTAssertEqual(run.status, 0, run.output)
+    }
+
+    /// The ablation's "current production" arms send the reference guide the
+    /// app appends to every system prompt (#490). The script renders it from
+    /// the Swift sources; this pins that rendering to the constant.
+    func testAblationRendersTheReferenceGuideExactlyAsTheApp() throws {
+        let script = repoRoot.appendingPathComponent("scripts/ablate-agent-eval.py")
+        let expected = FileManager.default.temporaryDirectory
+            .appendingPathComponent("reference-guide-\(UUID().uuidString).txt")
+        try PolishReferenceGuide.systemSection.write(to: expected, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: expected) }
+        let snippet = #"""
+        import importlib.util, sys
+        spec = importlib.util.spec_from_file_location("agent_ablation", sys.argv[1])
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        expected = open(sys.argv[2], encoding="utf-8").read()
+        assert module.reference_guide() == expected, module.reference_guide()
+        system = module.production_system_prompt("llm_system_prompt.toml")
+        assert system == module.bundled_prompt_content("llm_system_prompt.toml") + "\n\n" + expected + "\n"
+        record = {"userPrompts": ["p",
+            "[Repository vocabulary]\n- A.swift: a swift\n\n"
+            + "[Candidate terms: maybe said, use one only where it fits better]\n- Foo\n\n"
+            + "Working text:\nx"]}
+        assert module.has_recorded_context_mapping(record)
+        assert module.recorded_context_mappings(record) == [("A.swift", "a swift")]
+        """#
+        let run = try runPython(["-c", snippet, script.path, expected.path])
         XCTAssertEqual(run.status, 0, run.output)
     }
 
@@ -916,31 +1153,127 @@ final class AgentDictationE2EEvalSupportTests: XCTestCase {
         XCTAssertEqual(run.status, 0, run.output)
     }
 
-    private func runRecorder(_ arguments: [String]) throws -> (status: Int32, output: String) {
-        let repoRoot = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        let script = repoRoot.appendingPathComponent("scripts/record-agent-eval.sh")
-        let output = Pipe()
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/bash")
-        process.arguments = [script.path] + arguments
-        process.standardOutput = output
-        process.standardError = output
-        try process.run()
-        process.waitUntilExit()
-        return (
-            process.terminationStatus,
-            String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-        )
+    /// The two Swift scripts cost seconds per run: the wrapper hands the
+    /// script to the interpreter, which compiles it on every run, and one
+    /// `swiftc` build costs as much. Class setUp starts the three runs the
+    /// tests need at once, so they overlap each other and the fast tests
+    /// instead of queueing: the recorder through its operator wrapper (the one
+    /// interpreted recorder run, which keeps the wrapper covered), and a
+    /// `swiftc` build of each script for every other run.
+    private struct ScriptRuns: Sendable {
+        let buildDirectory: URL
+        let recorderOutputDirectory: URL
+        let recorderThroughWrapper: BackgroundProcess
+        let recorderBuild: BackgroundProcess
+        let rendererBuild: BackgroundProcess
+
+        var recorderBinary: URL { buildDirectory.appendingPathComponent("record-agent-eval") }
+        var rendererBinary: URL {
+            buildDirectory.appendingPathComponent("render-agent-eval-report")
+        }
+
+        init() throws {
+            let root = AgentDictationE2EEvalSupportTests.repositoryRoot
+            buildDirectory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("lv-recorder-build-\(UUID().uuidString)", isDirectory: true)
+            try FileManager.default.createDirectory(
+                at: buildDirectory, withIntermediateDirectories: true
+            )
+            recorderOutputDirectory = AgentDictationE2EEvalSupportTests
+                .recorderOutputDirectory(label: "smoke")
+            recorderThroughWrapper = try BackgroundProcess(
+                URL(fileURLWithPath: "/bin/bash"),
+                [
+                    root.appendingPathComponent("scripts/record-agent-eval.sh").path,
+                    "--list", "--output", recorderOutputDirectory.path,
+                ]
+            )
+            // Compiled from its real path, so the recorder's `#filePath`
+            // still resolves the repository root.
+            recorderBuild = try BackgroundProcess(
+                URL(fileURLWithPath: "/usr/bin/xcrun"),
+                [
+                    "swiftc", root.appendingPathComponent("scripts/record-agent-eval.swift").path,
+                    "-o", buildDirectory.appendingPathComponent("record-agent-eval").path,
+                ]
+            )
+            rendererBuild = try BackgroundProcess(
+                URL(fileURLWithPath: "/usr/bin/xcrun"),
+                [
+                    "swiftc",
+                    root.appendingPathComponent("scripts/render-agent-eval-report.swift").path,
+                    "-o", buildDirectory.appendingPathComponent("render-agent-eval-report").path,
+                ]
+            )
+        }
+
+        func waitForAll() {
+            _ = recorderThroughWrapper.result()
+            _ = recorderBuild.result()
+            _ = rendererBuild.result()
+        }
     }
 
-    private func recorderOutputDirectory(label: String) -> URL {
+    private nonisolated static let scripts = Result { try ScriptRuns() }
+
+    override nonisolated class func setUp() {
+        super.setUp()
+        _ = scripts
+    }
+
+    override nonisolated class func tearDown() {
+        if case .success(let runs) = scripts {
+            runs.waitForAll()
+            try? FileManager.default.removeItem(at: runs.buildDirectory)
+            try? FileManager.default.removeItem(at: runs.recorderOutputDirectory)
+        }
+        super.tearDown()
+    }
+
+    private static func compiled(
+        _ binary: URL, by build: BackgroundProcess, script: String
+    ) throws -> URL {
+        let result = build.result()
+        guard result.status == 0 else {
+            throw NSError(
+                domain: "AgentDictationE2EEvalSupportTests", code: Int(result.status),
+                userInfo: [NSLocalizedDescriptionKey: "\(script) did not compile:\n\(result.output)"]
+            )
+        }
+        return binary
+    }
+
+    private func runRecorder(_ arguments: [String]) throws -> (status: Int32, output: String) {
+        let runs = try Self.scripts.get()
+        let binary = try Self.compiled(
+            runs.recorderBinary, by: runs.recorderBuild, script: "record-agent-eval.swift"
+        )
+        return try BackgroundProcess(binary, arguments).result()
+    }
+
+    /// The first renderer run in a test goes through the operator's wrapper
+    /// (`runReportRenderer`), so the wrapper stays covered; later runs use the
+    /// same source compiled once for the class.
+    private func runCompiledReportRenderer(
+        _ arguments: [String]
+    ) throws -> (status: Int32, output: String) {
+        let runs = try Self.scripts.get()
+        let binary = try Self.compiled(
+            runs.rendererBinary, by: runs.rendererBuild,
+            script: "render-agent-eval-report.swift"
+        )
+        return try BackgroundProcess(binary, arguments).result()
+    }
+
+    private nonisolated static var repositoryRoot: URL {
         URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
+    }
+
+    private nonisolated static func recorderOutputDirectory(label: String) -> URL {
+        repositoryRoot
             .appendingPathComponent("EvalRecordings/agent-dictation", isDirectory: true)
             .appendingPathComponent(
                 ".tests-\(label)-\(UUID().uuidString)", isDirectory: true
@@ -959,8 +1292,7 @@ final class AgentDictationE2EEvalSupportTests: XCTestCase {
         process.arguments = [script.path] + arguments
         process.standardOutput = output
         process.standardError = output
-        try process.run()
-        process.waitUntilExit()
+        try process.runUntilExit()
         return (
             process.terminationStatus,
             String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
@@ -979,8 +1311,7 @@ final class AgentDictationE2EEvalSupportTests: XCTestCase {
         process.arguments = ["python3", script.path] + arguments
         process.standardOutput = output
         process.standardError = output
-        try process.run()
-        process.waitUntilExit()
+        try process.runUntilExit()
         return (
             process.terminationStatus,
             String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
@@ -1004,8 +1335,7 @@ final class AgentDictationE2EEvalSupportTests: XCTestCase {
         )
         process.standardOutput = output
         process.standardError = output
-        try process.run()
-        process.waitUntilExit()
+        try process.runUntilExit()
         return (
             process.terminationStatus,
             String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
@@ -1068,16 +1398,16 @@ final class AgentDictationE2EEvalSupportTests: XCTestCase {
 
     func testStagePlanPerPipeline() {
         XCTAssertEqual(
-            Support.stagePlan(for: .full),
-            Support.StagePlan(runsSpeechRecognition: true, runsPolish: true)
+            AgentDictationEvalCorpus.stagePlan(for: .full),
+            AgentDictationEvalCorpus.StagePlan(runsSpeechRecognition: true, runsPolish: true)
         )
         XCTAssertEqual(
-            Support.stagePlan(for: .asrOnly),
-            Support.StagePlan(runsSpeechRecognition: true, runsPolish: false)
+            AgentDictationEvalCorpus.stagePlan(for: .asrOnly),
+            AgentDictationEvalCorpus.StagePlan(runsSpeechRecognition: true, runsPolish: false)
         )
         XCTAssertEqual(
-            Support.stagePlan(for: .polishOnly),
-            Support.StagePlan(runsSpeechRecognition: false, runsPolish: true)
+            AgentDictationEvalCorpus.stagePlan(for: .polishOnly),
+            AgentDictationEvalCorpus.StagePlan(runsSpeechRecognition: false, runsPolish: true)
         )
     }
 
@@ -1102,72 +1432,6 @@ final class AgentDictationE2EEvalSupportTests: XCTestCase {
         }
         XCTAssertTrue(
             TerminalTargetDetector.isTerminalLikeBundleID(Support.terminalTargetBundleID)
-        )
-    }
-
-    // MARK: - Voice picking
-
-    private let sampleVoices = """
-        Alex                en_US    # Most people recognize me by my voice.
-        Amélie              fr_CA    # Bonjour! Je m'appelle Amélie.
-        Bad News            en_US    # The light you see at the end of the tunnel...
-        Samantha            en_US    # Hello! My name is Samantha.
-        Thomas              fr_FR    # Bonjour! Je m'appelle Thomas.
-        """
-
-    func testPickVoicePrefersNamedVoice() {
-        XCTAssertEqual(
-            Support.pickVoice(
-                fromSayVoicesOutput: sampleVoices, languagePrefix: "fr",
-                preferred: ["Thomas", "Amélie"]
-            ),
-            "Thomas"
-        )
-        XCTAssertEqual(
-            Support.pickVoice(
-                fromSayVoicesOutput: sampleVoices, languagePrefix: "en",
-                preferred: ["Samantha"]
-            ),
-            "Samantha"
-        )
-    }
-
-    func testPickVoiceFallsBackToFirstLanguageMatch() {
-        XCTAssertEqual(
-            Support.pickVoice(
-                fromSayVoicesOutput: sampleVoices, languagePrefix: "fr",
-                preferred: ["Nonexistent"]
-            ),
-            "Amélie"
-        )
-    }
-
-    func testPickVoiceReturnsNilWhenLanguageAbsent() {
-        XCTAssertNil(
-            Support.pickVoice(
-                fromSayVoicesOutput: sampleVoices, languagePrefix: "de", preferred: ["Anna"]
-            )
-        )
-    }
-
-    /// Multi-word names ("Bad News") parse whole, and hyphenated locales
-    /// (fr-FR, seen on newer macOS) still match the language prefix.
-    func testPickVoiceParsesMultiWordNamesAndHyphenLocales() {
-        let output = """
-            Bad News            en_US    # ...
-            Jacques             fr-FR    # ...
-            """
-        XCTAssertEqual(
-            Support.pickVoice(
-                fromSayVoicesOutput: output, languagePrefix: "en", preferred: ["Bad News"]
-            ),
-            "Bad News"
-        )
-        XCTAssertEqual(
-            Support.pickVoice(
-                fromSayVoicesOutput: output, languagePrefix: "fr", preferred: []
-            ),
-            "Jacques"
         )
     }
 
@@ -1225,13 +1489,13 @@ final class AgentDictationE2EEvalSupportTests: XCTestCase {
     func testTokensRequiredAreCaseSensitiveByDefault() throws {
         let evalCase = try makeCase(requiredTokens: ["UserSessionManager.swift"])
         XCTAssertEqual(
-            Support.tokensFailures(
+            AgentDictationEvalCorpus.tokensFailures(
                 output: "Open UserSessionManager.swift now.", evalCase: evalCase
             ),
             []
         )
         XCTAssertEqual(
-            Support.tokensFailures(
+            AgentDictationEvalCorpus.tokensFailures(
                 output: "open usersessionmanager.swift now.", evalCase: evalCase
             ),
             ["missing \"UserSessionManager.swift\""]
@@ -1241,7 +1505,7 @@ final class AgentDictationE2EEvalSupportTests: XCTestCase {
     func testTokensRequiredHonorCaseInsensitiveFlag() throws {
         let evalCase = try makeCase(requiredTokens: ["tomorrow?"], caseInsensitive: true)
         XCTAssertEqual(
-            Support.tokensFailures(output: "TOMORROW?", evalCase: evalCase),
+            AgentDictationEvalCorpus.tokensFailures(output: "TOMORROW?", evalCase: evalCase),
             []
         )
     }
@@ -1252,7 +1516,7 @@ final class AgentDictationE2EEvalSupportTests: XCTestCase {
             forbiddenSubstrings: ["dash dash"]
         )
         XCTAssertEqual(
-            Support.tokensFailures(output: "retry with DASH DASH force", evalCase: evalCase),
+            AgentDictationEvalCorpus.tokensFailures(output: "retry with DASH DASH force", evalCase: evalCase),
             ["contains forbidden \"dash dash\""]
         )
     }
@@ -1262,7 +1526,7 @@ final class AgentDictationE2EEvalSupportTests: XCTestCase {
     func testTokensMatchAfterSpacingNormalization() throws {
         let evalCase = try makeCase(requiredTokens: ["plan :"])
         XCTAssertEqual(
-            Support.tokensFailures(output: "Voici le plan\u{202F}: demain.", evalCase: evalCase),
+            AgentDictationEvalCorpus.tokensFailures(output: "Voici le plan\u{202F}: demain.", evalCase: evalCase),
             []
         )
     }
@@ -1537,5 +1801,38 @@ final class AgentDictationE2EEvalSupportTests: XCTestCase {
         XCTAssertEqual(decoded.rewriteFailure, result.rewriteFailure)
         XCTAssertEqual(decoded.rewriteIsFatal, false)
         XCTAssertEqual(decoded.wordAccuracyVsIntended, 1.0)
+    }
+}
+
+/// A child process whose output is read on its own thread, so a caller can
+/// start several and collect each result when it needs it. Output is read to
+/// EOF before the exit is awaited, so a child that fills the pipe cannot block
+/// on a reader that is waiting for it to exit.
+private final class BackgroundProcess: @unchecked Sendable {
+    private let process = Process()
+    private let finished = DispatchSemaphore(value: 0)
+    private var output = Data()
+
+    init(_ executable: URL, _ arguments: [String]) throws {
+        let pipe = Pipe()
+        process.executableURL = executable
+        process.arguments = arguments
+        process.standardOutput = pipe
+        process.standardError = pipe
+        let exited = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in exited.signal() }
+        try process.run()
+        Thread.detachNewThread { [self] in
+            output = pipe.fileHandleForReading.readDataToEndOfFile()
+            exited.wait()
+            finished.signal()
+        }
+    }
+
+    /// Blocks until the child has exited; callable any number of times.
+    func result() -> (status: Int32, output: String) {
+        finished.wait()
+        defer { finished.signal() }
+        return (process.terminationStatus, String(decoding: output, as: UTF8.self))
     }
 }

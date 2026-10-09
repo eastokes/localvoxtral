@@ -3,17 +3,10 @@ import Foundation
 import Synchronization
 import XCTest
 @testable import localvoxtral
+import localvoxtralTestSupport
 
 #if canImport(Darwin)
 import Darwin
-
-/// `XCTUnwrap` takes an autoclosure, which cannot contain `await`. This
-/// evaluates the value first and then unwraps it.
-private func unwrapAsync<T>(
-    _ value: T?, _ message: String = "", file: StaticString = #filePath, line: UInt = #line
-) throws -> T {
-    try XCTUnwrap(value, message, file: file, line: line)
-}
 
 /// Test clock whose SLEEP is what advances it — the OverlayBufferSessionCoordinator
 /// pattern (AGENTS: no wall clock in tests). A readiness poll driven by a real
@@ -36,6 +29,91 @@ private final class ForwardTestClock: @unchecked Sendable {
     var sleepCount: Int { sleeps.withLock { $0.count } }
 }
 
+/// A readiness clock whose sleeps park until the test releases the matching
+/// duration. That makes the cold-open replacement window orderable without a
+/// wall clock or scheduler guesses.
+private final class HeldForwardTestClock: @unchecked Sendable {
+    private struct PendingSleep {
+        let seconds: TimeInterval
+        let continuation: CheckedContinuation<Void, Never>
+    }
+
+    private struct State {
+        var now = Date(timeIntervalSince1970: 1_700_000_000)
+        var pending: [PendingSleep] = []
+    }
+
+    private let state = Mutex(State())
+    private let parked = EventCount()
+
+    var now: @Sendable () -> Date {
+        { [self] in state.withLock { $0.now } }
+    }
+
+    var sleepFor: @Sendable (TimeInterval) async -> Void {
+        { [self] seconds in
+            await withCheckedContinuation { continuation in
+                state.withLock { $0.pending.append(PendingSleep(
+                    seconds: seconds, continuation: continuation
+                )) }
+                parked.increment()
+            }
+        }
+    }
+
+    /// Returns once `count` sleeps of `seconds` are parked.
+    func waitForPending(
+        _ count: Int, for seconds: TimeInterval, file: StaticString = #filePath, line: UInt = #line
+    ) async {
+        while true {
+            let seen = parked.value
+            if pendingCount(for: seconds) >= count { return }
+            await parked.waitFor(seen + 1, file: file, line: line)
+            if parked.value == seen { return }
+        }
+    }
+
+    /// Counts an event the test drives the clock towards, such as a task
+    /// finishing, so `drive` wakes for it as it does for a parked sleep.
+    func note() { parked.increment() }
+
+    var events: Int { parked.value }
+
+    /// Returns once a sleep parks or `note()` runs after `seen` events.
+    func waitForEvent(after seen: Int, file: StaticString = #filePath, line: UInt = #line) async {
+        await parked.waitFor(seen + 1, file: file, line: line)
+    }
+
+    func advance(by seconds: TimeInterval) {
+        state.withLock { $0.now = $0.now.addingTimeInterval(seconds) }
+    }
+
+    func pendingCount(for seconds: TimeInterval) -> Int {
+        state.withLock { current in
+            current.pending.count { abs($0.seconds - seconds) < 0.000_001 }
+        }
+    }
+
+    func releaseOldestSleep(for seconds: TimeInterval) {
+        let continuation = state.withLock { current -> CheckedContinuation<Void, Never>? in
+            guard let index = current.pending.firstIndex(where: {
+                abs($0.seconds - seconds) < 0.000_001
+            }) else { return nil }
+            return current.pending.remove(at: index).continuation
+        }
+        continuation?.resume()
+    }
+
+    func releaseAllSleeps() {
+        let continuations = state.withLock { current -> [CheckedContinuation<Void, Never>] in
+            let continuations = current.pending.map(\.continuation)
+            current.pending = []
+            return continuations
+        }
+        for continuation in continuations { continuation.resume() }
+    }
+}
+
 /// Counts injected `waitpid` calls across threads (the reap runs on whichever
 /// thread called teardown).
 private final class ReapCallCounter: @unchecked Sendable {
@@ -51,32 +129,135 @@ private final class ReapCallCounter: @unchecked Sendable {
     var value: Int { count.withLock { $0 } }
 }
 
-private final class ForwardTestProcess: ClaudeRemoteHerdrForwardProcess, @unchecked Sendable {
-    private let running = Mutex(true)
-    let terminations = Mutex(0)
+/// The supervisor's SIGTERM and SIGKILL grace sleeps, parked until the test
+/// releases them: with an ssh that ignores both signals, a teardown then lasts
+/// exactly as long as the test wants, with no wall clock.
+private final class ParkedSupervisorSleeps: @unchecked Sendable {
+    private let parked = Mutex<[CheckedContinuation<Void, Never>]>([])
 
-    var isRunning: Bool { running.withLock { $0 } }
-    func exit() { running.withLock { $0 = false } }
+    var sleep: ClaudeRemoteForwardSupervisor.SleepClosure {
+        { [self] _ in
+            await withCheckedContinuation { continuation in
+                parked.withLock { $0.append(continuation) }
+            }
+        }
+    }
+
+    func releaseAll() {
+        let continuations = parked.withLock { current in
+            defer { current = [] }
+            return current
+        }
+        for continuation in continuations { continuation.resume() }
+    }
+}
+
+private final class HerdrForwardMemoryLedgerStore: ClaudeRemoteHostStoreIO {
+    private let contents = Mutex<[String: Data]>([:])
+    func read(from url: URL) throws -> Data? { contents.withLock { $0[url.path] } }
+    func write(_ data: Data, to url: URL) throws { contents.withLock { $0[url.path] = data } }
+}
+
+private final class ForwardTestProcess: ClaudeRemoteHerdrForwardProcess, @unchecked Sendable {
+    private struct State {
+        var reportsRunning: Bool
+        var ignoresSignals: Bool
+        var hasExited = false
+        var exitWaiters: [CheckedContinuation<ClaudeRemoteForwardExitStatus, Never>] = []
+    }
+
+    private let state: Mutex<State>
+    private let stderrContinuation: AsyncStream<String>.Continuation
+    let standardErrorLines: AsyncStream<String>
+    let terminations = Mutex(0)
+    /// Every `terminate()`, for a test that waits on a teardown a task starts.
+    let terminated = EventCount()
+
+    init(reportsRunning: Bool = true, ignoresSignals: Bool = false) {
+        state = Mutex(State(reportsRunning: reportsRunning, ignoresSignals: ignoresSignals))
+        let (stream, continuation) = AsyncStream<String>.makeStream(of: String.self)
+        standardErrorLines = stream
+        stderrContinuation = continuation
+    }
+
+    var isRunning: Bool { state.withLock { $0.reportsRunning && !$0.hasExited } }
+    var processIdentifier: pid_t { 4_242 }
+    func exit() {
+        let waiters = state.withLock {
+            current -> [CheckedContinuation<ClaudeRemoteForwardExitStatus, Never>]? in
+            guard !current.hasExited else { return nil }
+            current.hasExited = true
+            defer { current.exitWaiters = [] }
+            return current.exitWaiters
+        }
+        guard let waiters else { return }
+        stderrContinuation.finish()
+        for waiter in waiters { waiter.resume(returning: .code(0)) }
+    }
+
+    func waitUntilExit() async -> ClaudeRemoteForwardExitStatus {
+        await withCheckedContinuation { continuation in
+            let alreadyExited = state.withLock { current -> Bool in
+                guard !current.hasExited else { return true }
+                current.exitWaiters.append(continuation)
+                return false
+            }
+            if alreadyExited { continuation.resume(returning: .code(0)) }
+        }
+    }
 
     func terminate() {
         terminations.withLock { $0 += 1 }
-        running.withLock { $0 = false }
+        terminated.increment()
+        guard !state.withLock({ $0.ignoresSignals }) else { return }
+        exit()
     }
+
+    func forceTerminate() { terminate() }
 }
 
 private final class ForwardTestSpawner: ClaudeRemoteHerdrForwardSpawning, @unchecked Sendable {
     struct Failure: Error {}
 
     let argv = Mutex<[[String]]>([])
-    let process = ForwardTestProcess()
+    /// Every spawn, for a test that waits on one a task makes.
+    let spawns = EventCount()
+    private let currentProcess: Mutex<ForwardTestProcess>
+    let processes = Mutex<[ForwardTestProcess]>([])
     private let fails: Bool
+    private let freshProcessPerSpawn: Bool
+    private let reportsRunning: Bool
+    private let ignoresSignals: Bool
 
-    init(fails: Bool = false) { self.fails = fails }
+    init(
+        fails: Bool = false,
+        freshProcessPerSpawn: Bool = false,
+        reportsRunning: Bool = true,
+        ignoresSignals: Bool = false
+    ) {
+        self.fails = fails
+        self.freshProcessPerSpawn = freshProcessPerSpawn
+        self.reportsRunning = reportsRunning
+        self.ignoresSignals = ignoresSignals
+        currentProcess = Mutex(ForwardTestProcess(
+            reportsRunning: reportsRunning, ignoresSignals: ignoresSignals
+        ))
+    }
+
+    var process: ForwardTestProcess { currentProcess.withLock { $0 } }
 
     func spawn(argv: [String]) throws -> any ClaudeRemoteHerdrForwardProcess {
         self.argv.withLock { $0.append(argv) }
         if fails { throw Failure() }
-        return process
+        if freshProcessPerSpawn, spawnCount > 1 {
+            currentProcess.withLock {
+                $0 = ForwardTestProcess(reportsRunning: reportsRunning, ignoresSignals: ignoresSignals)
+            }
+        }
+        let spawned = process
+        processes.withLock { $0.append(spawned) }
+        spawns.increment()
+        return spawned
     }
 
     var spawnCount: Int { argv.withLock { $0.count } }
@@ -87,6 +268,8 @@ private final class ForwardTestWorkspaces: ClaudeRemoteHerdrWorkspaceProviding, 
 
     let made = Mutex(0)
     let removed = Mutex<[ClaudeRemoteHerdrForwardWorkspace]>([])
+    /// Every removal, for a test that waits on a teardown a task runs.
+    let removals = EventCount()
     private let socketPath: String
     private let fails: Bool
 
@@ -106,12 +289,14 @@ private final class ForwardTestWorkspaces: ClaudeRemoteHerdrWorkspaceProviding, 
 
     func remove(_ workspace: ClaudeRemoteHerdrForwardWorkspace) {
         removed.withLock { $0.append(workspace) }
+        removals.increment()
     }
 
     var removeCount: Int { removed.withLock { $0.count } }
 }
 
 /// The app-managed `ssh -L` to a remote herdr socket.
+@MainActor
 final class ClaudeRemoteHerdrForwardTests: XCTestCase {
     private let remoteSocketPath = "/run/user/1000/herdr/default.sock"
     private let localSocketPath = "/tmp/lvx-herdr-fwd-abcd1234/h.sock"
@@ -120,7 +305,12 @@ final class ClaudeRemoteHerdrForwardTests: XCTestCase {
         spawner: ForwardTestSpawner,
         workspaces: ForwardTestWorkspaces,
         clock: ForwardTestClock,
-        dialable: @escaping @Sendable (String) -> Bool
+        dialable: @escaping @Sendable (String) -> Bool,
+        idleTimeout: TimeInterval = 5 * 60,
+        pidLedger: ClaudeRemoteForwardPidLedger? = nil,
+        orphanReapInitiallyComplete: Bool = true,
+        hostIDForAlias: @escaping @MainActor (String) -> String? = { _ in "host" },
+        processIdentity: @escaping @Sendable (pid_t) -> ClaudeRemoteForwardPidRecord? = { _ in nil }
     ) -> ClaudeRemoteHerdrForwardService {
         ClaudeRemoteHerdrForwardService(
             spawner: spawner,
@@ -129,7 +319,50 @@ final class ClaudeRemoteHerdrForwardTests: XCTestCase {
             now: clock.now,
             sleepFor: clock.sleepFor,
             readinessTimeout: 2.0,
-            pollInterval: 0.025
+            pollInterval: 0.025,
+            idleTimeout: idleTimeout,
+            pidLedger: pidLedger,
+            orphanReapInitiallyComplete: orphanReapInitiallyComplete,
+            hostIDForAlias: hostIDForAlias,
+            processIdentity: processIdentity
+        )
+    }
+
+    private func service(
+        spawner: ForwardTestSpawner,
+        workspaces: ForwardTestWorkspaces,
+        clock: HeldForwardTestClock,
+        dialable: @escaping @Sendable (String) -> Bool,
+        orphanReapInitiallyComplete: Bool = true
+    ) -> ClaudeRemoteHerdrForwardService {
+        ClaudeRemoteHerdrForwardService(
+            spawner: spawner,
+            workspaces: workspaces,
+            isSocketDialable: dialable,
+            now: clock.now,
+            sleepFor: clock.sleepFor,
+            readinessTimeout: 2.0,
+            pollInterval: 0.025,
+            idleTimeout: 5 * 60,
+            orphanReapInitiallyComplete: orphanReapInitiallyComplete,
+            hostIDForAlias: { _ in "host" }
+        )
+    }
+
+    /// Blocks until the live child's exit event lands. The bound only turns
+    /// a child that never exits into a failure instead of a hang. Detached:
+    /// the caller blocks the main thread.
+    private func waitForExit(
+        of process: LiveHerdrForwardProcess, file: StaticString = #filePath, line: UInt = #line
+    ) {
+        let exited = DispatchSemaphore(value: 0)
+        Task.detached {
+            _ = await process.waitUntilExit()
+            exited.signal()
+        }
+        XCTAssertEqual(
+            exited.wait(timeout: .now() + 10), .success, "the child never exited",
+            file: file, line: line
         )
     }
 
@@ -229,12 +462,392 @@ final class ClaudeRemoteHerdrForwardTests: XCTestCase {
         handle.close()
         handle.close()
 
-        // `terminate()` is deliberately re-invoked by every close (it is the
-        // retry path for a failed collection) and is idempotent in EFFECT, so
-        // the contract is about what happened once: the workspace was removed
-        // exactly once, and the child was terminated at all.
+        // A lease release retains the healthy process; the injected idle clock
+        // advances without wall time and performs the bounded teardown, which
+        // signals the child before it removes the workspace.
+        await workspaces.removals.waitFor(1)
+
         XCTAssertGreaterThanOrEqual(spawner.process.terminations.withLock { $0 }, 1)
         XCTAssertEqual(workspaces.removed.withLock { $0.map(\.socketPath) }, [localSocketPath])
+        XCTAssertTrue(clock.sleeps.withLock { $0.contains(5 * 60) })
+    }
+
+    func testAHealthyForwardIsReusedAcrossDictations() async throws {
+        let spawner = ForwardTestSpawner()
+        let workspaces = ForwardTestWorkspaces()
+        let clock = ForwardTestClock()
+        let service = service(
+            spawner: spawner, workspaces: workspaces, clock: clock, dialable: { _ in true }
+        )
+
+        let first = try unwrapAsync(
+            await service.open(alias: "builder", remoteSocketPath: remoteSocketPath)
+        )
+        first.close()
+        let second = try unwrapAsync(
+            await service.open(alias: "builder", remoteSocketPath: remoteSocketPath)
+        )
+
+        XCTAssertEqual(
+            spawner.spawnCount, 1,
+            "the next dictation should reuse the healthy app-held forward"
+        )
+        second.close()
+    }
+
+    func testAnUnhealthyRetainedForwardIsTornDownBeforeColdFallback() async throws {
+        let spawner = ForwardTestSpawner(freshProcessPerSpawn: true)
+        let workspaces = ForwardTestWorkspaces()
+        let clock = ForwardTestClock()
+        let probes = Mutex(0)
+        let service = service(
+            spawner: spawner,
+            workspaces: workspaces,
+            clock: clock,
+            dialable: { _ in
+                probes.withLock { count in
+                    count += 1
+                    return count != 2
+                }
+            }
+        )
+
+        let first = try unwrapAsync(
+            await service.open(alias: "builder", remoteSocketPath: remoteSocketPath)
+        )
+        let firstProcess = spawner.process
+        first.close()
+        let replacement = try unwrapAsync(
+            await service.open(alias: "builder", remoteSocketPath: remoteSocketPath)
+        )
+
+        XCTAssertEqual(spawner.spawnCount, 2)
+        XCTAssertGreaterThanOrEqual(firstProcess.terminations.withLock { $0 }, 1)
+        XCTAssertEqual(workspaces.removeCount, 1, "the unhealthy workspace is retired first")
+        replacement.close()
+    }
+
+    func testAReplacedEntryIgnoresItsOldLeaseRelease() async throws {
+        let spawner = ForwardTestSpawner(freshProcessPerSpawn: true)
+        let workspaces = ForwardTestWorkspaces()
+        let clock = ForwardTestClock()
+        let probes = Mutex(0)
+        let service = service(
+            spawner: spawner,
+            workspaces: workspaces,
+            clock: clock,
+            dialable: { _ in
+                probes.withLock { count in
+                    count += 1
+                    return count != 2
+                }
+            }
+        )
+
+        let oldLease = try unwrapAsync(
+            await service.open(alias: "builder", remoteSocketPath: remoteSocketPath)
+        )
+        let replacementLease = try unwrapAsync(
+            await service.open(alias: "builder", remoteSocketPath: remoteSocketPath)
+        )
+        let replacementProcess = spawner.process
+
+        oldLease.close()
+        // The release runs on a main-actor task queued by `close()`, ahead of
+        // the first barrier. An idle teardown it armed by mistake would queue
+        // behind it and finish before the second: the test clock's sleep
+        // returns without suspending.
+        await Task { @MainActor in }.value
+        await Task { @MainActor in }.value
+
+        XCTAssertEqual(
+            replacementProcess.terminations.withLock { $0 },
+            0,
+            "a lease from the retired entry must not release the replacement"
+        )
+        XCTAssertEqual(workspaces.removeCount, 1)
+
+        replacementLease.close()
+    }
+
+    func testAuthenticatedHostActivityStartsTheForwardOffTheDictationPath() async {
+        let spawner = ForwardTestSpawner()
+        let service = service(
+            spawner: spawner,
+            workspaces: ForwardTestWorkspaces(),
+            clock: ForwardTestClock(),
+            dialable: { _ in true }
+        )
+
+        await service.prepare(
+            hostID: "host", alias: "builder", remoteSocketPath: remoteSocketPath
+        )
+        // The supervisor spawns from its own launch task.
+        await spawner.spawns.waitFor(1)
+
+        XCTAssertEqual(spawner.spawnCount, 1)
+    }
+
+    func testColdOpenFailureDoesNotTearDownAReplacementEntry() async throws {
+        let spawner = ForwardTestSpawner(freshProcessPerSpawn: true)
+        let workspaces = ForwardTestWorkspaces()
+        let clock = HeldForwardTestClock()
+        let socketAnswers = Mutex(false)
+        let service = service(
+            spawner: spawner,
+            workspaces: workspaces,
+            clock: clock,
+            dialable: { _ in socketAnswers.withLock { $0 } }
+        )
+
+        let coldOpen = Task { @MainActor in
+            await service.open(alias: "builder", remoteSocketPath: remoteSocketPath)
+        }
+        await spawner.spawns.waitFor(1)
+        await clock.waitForPending(1, for: 0.025)
+        let firstProcess = try XCTUnwrap(spawner.processes.withLock { $0.first })
+
+        let replacementPath = "/run/user/1000/herdr/replacement.sock"
+        await service.prepare(
+            hostID: "host", alias: "builder", remoteSocketPath: replacementPath
+        )
+        await spawner.spawns.waitFor(2)
+        let replacement = spawner.process
+        XCTAssertGreaterThanOrEqual(firstProcess.terminations.withLock { $0 }, 1)
+
+        clock.advance(by: 2.0)
+        clock.releaseOldestSleep(for: 0.025)
+        let coldResult = await coldOpen.value
+        XCTAssertNil(coldResult)
+
+        XCTAssertEqual(
+            replacement.terminations.withLock { $0 }, 0,
+            "the failed cold open no longer owns this host entry"
+        )
+        socketAnswers.withLock { $0 = true }
+        let lease = try unwrapAsync(
+            await service.open(alias: "builder", remoteSocketPath: replacementPath)
+        )
+        XCTAssertEqual(spawner.spawnCount, 2, "the replacement must remain registered")
+        service.stopAllForQuit()
+        lease.close()
+        clock.releaseAllSleeps()
+    }
+
+    func testPrepareRefreshesAColdStartingForwardWithoutReplacingIt() async {
+        let spawner = ForwardTestSpawner(
+            freshProcessPerSpawn: true, reportsRunning: false
+        )
+        let clock = HeldForwardTestClock()
+        let service = service(
+            spawner: spawner,
+            workspaces: ForwardTestWorkspaces(),
+            clock: clock,
+            dialable: { _ in false }
+        )
+
+        let coldOpen = Task { @MainActor in
+            await service.open(alias: "builder", remoteSocketPath: remoteSocketPath)
+        }
+        await spawner.spawns.waitFor(1)
+        await clock.waitForPending(1, for: 0.025)
+        let startingProcess = spawner.process
+
+        await service.prepare(
+            hostID: "host", alias: "builder", remoteSocketPath: remoteSocketPath
+        )
+        // A refresh arms the idle teardown of the entry it kept; a replacement
+        // would have torn that entry down instead.
+        await clock.waitForPending(1, for: 5 * 60)
+
+        XCTAssertEqual(spawner.spawnCount, 1, "the supervisor owns completing its handshake")
+        XCTAssertEqual(startingProcess.terminations.withLock { $0 }, 0)
+
+        clock.advance(by: 2.0)
+        clock.releaseOldestSleep(for: 0.025)
+        let coldResult = await coldOpen.value
+        XCTAssertNil(coldResult)
+        clock.releaseAllSleeps()
+    }
+
+    func testOpenParksUntilTheLaunchOrphanReapCompletes() async throws {
+        let spawner = ForwardTestSpawner()
+        let clock = HeldForwardTestClock()
+        let service = service(
+            spawner: spawner,
+            workspaces: ForwardTestWorkspaces(),
+            clock: clock,
+            dialable: { _ in true },
+            orphanReapInitiallyComplete: false
+        )
+        let open = Task { @MainActor in
+            await service.open(alias: "builder", remoteSocketPath: remoteSocketPath)
+        }
+
+        // The open parks at the orphan-reap gate.
+        await clock.waitForPending(1, for: 0.025)
+        XCTAssertEqual(spawner.spawnCount, 0, "no ssh may launch ahead of orphan cleanup")
+
+        service.markOrphanReapComplete()
+        clock.releaseOldestSleep(for: 0.025)
+        let handle = try unwrapAsync(await open.value)
+        XCTAssertEqual(spawner.spawnCount, 1)
+        handle.close()
+    }
+
+    /// Another running copy holds the listener port, so this copy's forward
+    /// coordinator never runs the launch reap and never marks it complete.
+    /// A dictation into a remote herdr pane must still start: open() gives
+    /// up within its readiness budget and spawns nothing.
+    func testListenerConflictDoesNotHangOpen() async {
+        let spawner = ForwardTestSpawner()
+        let clock = ForwardTestClock()
+        let service = service(
+            spawner: spawner,
+            workspaces: ForwardTestWorkspaces(),
+            clock: clock,
+            dialable: { _ in true },
+            orphanReapInitiallyComplete: false
+        )
+        let handle = await service.open(alias: "builder", remoteSocketPath: remoteSocketPath)
+
+        XCTAssertNil(handle, "open gives up on a reap that never runs")
+        XCTAssertEqual(spawner.spawnCount, 0, "no ssh may launch ahead of orphan cleanup")
+        XCTAssertEqual(clock.sleeps.withLock { $0.reduce(0, +) }, 2.0, accuracy: 0.05)
+    }
+
+    /// The copy that lost the listener port still runs the launch reap
+    /// (#1368), wired as the app wires it, so a dictation into a remote herdr
+    /// pane spawns its forward without spending the readiness budget at the
+    /// reap gate.
+    func testAnUnboundListenerStillLetsAHerdrForwardOpenAfterTheReap() async throws {
+        let spawner = ForwardTestSpawner()
+        let clock = ForwardTestClock()
+        let service = service(
+            spawner: spawner,
+            workspaces: ForwardTestWorkspaces(),
+            clock: clock,
+            dialable: { _ in true },
+            orphanReapInitiallyComplete: false
+        )
+        let registry = try ClaudeRemoteHostRegistry(
+            fileURL: URL(fileURLWithPath: "/lvx-tests/\(UUID().uuidString).json"),
+            io: MemoryHostStore(),
+            now: { Date(timeIntervalSince1970: 1_700_000_000) }
+        )
+        let spawnsAtReap = Mutex<Int?>(nil)
+        let reaped = EventCount()
+        let forwards = ClaudeRemoteForwardCoordinator(
+            hosts: registry,
+            remoteForwardPort: 28511,
+            isListenerBound: { false },
+            reapOrphans: {
+                spawnsAtReap.withLock { $0 = spawner.spawnCount }
+                await MainActor.run { service.markOrphanReapComplete() }
+                reaped.increment()
+            }
+        )
+
+        forwards.reconcile()
+        await reaped.waitFor(1)
+
+        let handle = try unwrapAsync(
+            await service.open(alias: "builder", remoteSocketPath: remoteSocketPath)
+        )
+        XCTAssertEqual(spawnsAtReap.withLock { $0 }, 0, "no ssh may launch ahead of orphan cleanup")
+        XCTAssertEqual(spawner.spawnCount, 1)
+        XCTAssertEqual(clock.sleepCount, 0, "nothing waited at the reap gate")
+        handle.close()
+    }
+
+    func testPrepareRefusesAnAliasThatDoesNotUniquelyNameItsHostID() async {
+        let spawner = ForwardTestSpawner()
+        let workspaces = ForwardTestWorkspaces()
+        let service = service(
+            spawner: spawner,
+            workspaces: workspaces,
+            clock: ForwardTestClock(),
+            dialable: { _ in true },
+            hostIDForAlias: { _ in "a-different-host" }
+        )
+
+        await service.prepare(
+            hostID: "host", alias: "builder", remoteSocketPath: remoteSocketPath
+        )
+
+        // A forward is spawned only for an entry, and an entry gets its
+        // workspace before prepare returns.
+        XCTAssertEqual(workspaces.made.withLock { $0 }, 0, "no forward entry")
+        XCTAssertEqual(spawner.spawnCount, 0)
+    }
+
+    func testEnrollmentRevocationTearsDownThePersistentForward() async throws {
+        let spawner = ForwardTestSpawner()
+        let workspaces = ForwardTestWorkspaces()
+        let service = service(
+            spawner: spawner,
+            workspaces: workspaces,
+            clock: ForwardTestClock(),
+            dialable: { _ in true }
+        )
+        _ = try unwrapAsync(
+            await service.open(alias: "builder", remoteSocketPath: remoteSocketPath)
+        )
+
+        service.reconcileEnrollment(activeHostIDs: [])
+
+        XCTAssertGreaterThanOrEqual(spawner.process.terminations.withLock { $0 }, 1)
+        XCTAssertEqual(workspaces.removeCount, 1)
+    }
+
+    func testAppQuitTearsDownThePersistentForward() async throws {
+        let spawner = ForwardTestSpawner()
+        let workspaces = ForwardTestWorkspaces()
+        let service = service(
+            spawner: spawner,
+            workspaces: workspaces,
+            clock: ForwardTestClock(),
+            dialable: { _ in true }
+        )
+        _ = try unwrapAsync(
+            await service.open(alias: "builder", remoteSocketPath: remoteSocketPath)
+        )
+
+        service.stopAllForQuit()
+
+        XCTAssertGreaterThanOrEqual(spawner.process.terminations.withLock { $0 }, 1)
+        XCTAssertEqual(workspaces.removeCount, 1)
+    }
+
+    func testPersistentSpawnIsRecordedAsAnOwnedProcessGroup() async throws {
+        let ledger = ClaudeRemoteForwardPidLedger(
+            fileURL: URL(fileURLWithPath: "/tmp/herdr-forward-ledger.json"),
+            io: HerdrForwardMemoryLedgerStore()
+        )
+        let service = service(
+            spawner: ForwardTestSpawner(),
+            workspaces: ForwardTestWorkspaces(),
+            clock: ForwardTestClock(),
+            dialable: { _ in true },
+            pidLedger: ledger,
+            processIdentity: { pid in
+                ClaudeRemoteForwardPidRecord(
+                    pid: pid,
+                    startSeconds: 111,
+                    startMicroseconds: 7,
+                    executablePath: "/usr/bin/ssh"
+                )
+            }
+        )
+
+        _ = try unwrapAsync(
+            await service.open(alias: "builder", remoteSocketPath: remoteSocketPath)
+        )
+
+        let record = try XCTUnwrap(ledger.records()["herdr-local:host"])
+        XCTAssertEqual(record.pid, 4_242)
+        XCTAssertEqual(record.processGroupID, 4_242)
+        XCTAssertEqual(record.owner, .current, "the reaper tells this copy's forwards from another's by it")
     }
 
     func testReadinessTimeoutTearsEverythingDown() async throws {
@@ -520,7 +1133,7 @@ final class ClaudeRemoteHerdrForwardTests: XCTestCase {
 
         // SIGTERM the leader ONLY (positive pid), and wait for it to go.
         _ = kill(process.leaderPID, SIGTERM)
-        for _ in 0..<300 where process.isRunning { usleep(10_000) }
+        waitForExit(of: process)
         XCTAssertFalse(process.isRunning, "the leader should have exited on its own")
         XCTAssertEqual(kill(descendant, 0), 0, "the descendant ignores SIGTERM and survives")
 
@@ -588,6 +1201,41 @@ final class ClaudeRemoteHerdrForwardTests: XCTestCase {
         XCTAssertFalse(process.isRunning)
     }
 
+    /// `LOCALVOXTRAL_SSH_CONFIG` in the spawner's environment reaches the
+    /// herdr `ssh -L` as `-F` (#1029); the other launchers are covered in
+    /// `SSHConfigOverrideTests`.
+    func testSpawnerPassesTheSSHConfigOverride() throws {
+        let directory = NSTemporaryDirectory()
+            .appending("lvx-forward-ssh-config-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(
+            atPath: directory, withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(atPath: directory) }
+        let argumentsFile = (directory as NSString).appendingPathComponent("arguments")
+        let fakeSSH = (directory as NSString).appendingPathComponent("ssh")
+        try Data("#!/bin/sh\nprintf '%s\\n' \"$@\" > '\(argumentsFile).tmp'; mv '\(argumentsFile).tmp' '\(argumentsFile)'\n".utf8)
+            .write(to: URL(fileURLWithPath: fakeSSH))
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fakeSSH)
+        let configPath = (directory as NSString).appendingPathComponent("ssh_config")
+
+        let spawner = ClaudeRemoteHerdrForwardSpawner(
+            executablePath: fakeSSH,
+            environment: ["PATH": "/usr/bin:/bin", SSHConfigOverride.environmentKey: configPath]
+        )
+        let process = try spawner.spawn(argv: ["ssh", "-N", "--", "builder"])
+        defer { process.terminate() }
+
+        // Bounded wait for the child to record its argv; the kernel's clock
+        // cannot be injected.
+        var recorded: String?
+        for _ in 0..<300 {
+            recorded = try? String(contentsOfFile: argumentsFile, encoding: .utf8)
+            if recorded != nil { break }
+            usleep(10_000)
+        }
+        XCTAssertEqual(recorded, "-F\n\(configPath)\n-N\n--\nbuilder\n")
+    }
+
     // MARK: - Never signal a group after reaping it (review round 4)
 
     func testAForwardThatExitsOnItsOwnIsNotReapedUntilTeardown() throws {
@@ -603,8 +1251,7 @@ final class ClaudeRemoteHerdrForwardTests: XCTestCase {
             try spawner.spawn(argv: ["sh", "-c", "exit 0"]) as? LiveHerdrForwardProcess
         )
 
-        // Wait for the exit event, bounded.
-        for _ in 0..<300 where process.isRunning { usleep(10_000) }
+        waitForExit(of: process)
         XCTAssertFalse(process.isRunning, "the leader should have exited on its own")
 
         // Un-reaped: the zombie still holds the pid, which is what keeps
@@ -636,7 +1283,7 @@ final class ClaudeRemoteHerdrForwardTests: XCTestCase {
         let process = try unwrapAsync(
             try spawner.spawn(argv: ["sh", "-c", "exit 0"]) as? LiveHerdrForwardProcess
         )
-        for _ in 0..<300 where process.isRunning { usleep(10_000) }
+        waitForExit(of: process)
 
         process.terminate()
         let afterFirstTeardown = process.groupSignalsSent
@@ -660,22 +1307,35 @@ final class ClaudeRemoteHerdrForwardTests: XCTestCase {
     /// injected `waitpid`. Real child, real group, scripted collection.
     private func spawnExitingChild(
         waitForChild: @escaping @Sendable (pid_t, UnsafeMutablePointer<Int32>?, Int32) -> pid_t,
+        reapEffortDidFinish: @escaping @Sendable () -> Void = {},
         file: StaticString = #filePath,
         line: UInt = #line
     ) throws -> LiveHerdrForwardProcess {
         let spawner = ClaudeRemoteHerdrForwardSpawner(
             executablePath: "/bin/sh",
             environment: ["PATH": "/usr/bin:/bin"],
-            waitForChild: waitForChild
+            waitForChild: waitForChild,
+            reapEffortDidFinish: reapEffortDidFinish
         )
         let process = try XCTUnwrap(
             try spawner.spawn(argv: ["sh", "-c", "exit 0"]) as? LiveHerdrForwardProcess,
             "the live spawner returns a LiveHerdrForwardProcess", file: file, line: line
         )
-        // Bounded wait for the exit event.
-        for _ in 0..<300 where process.isRunning { usleep(10_000) }
+        waitForExit(of: process, file: file, line: line)
         XCTAssertFalse(process.isRunning, "the child should have exited", file: file, line: line)
         return process
+    }
+
+    func testLiveChildReportsUnavailableStatusInsteadOfFabricatingCleanExit() async throws {
+        let process = try spawnExitingChild(waitForChild: { pid, status, options in
+            waitpid(pid, status, options)
+        })
+
+        let status = await process.waitUntilExit()
+
+        XCTAssertEqual(status, .unavailable)
+        process.terminate()
+        XCTAssertTrue(process.hasBeenReaped)
     }
 
     func testAnInterruptedReapIsRetriedRatherThanClaimedAsDone() throws {
@@ -684,27 +1344,24 @@ final class ClaudeRemoteHerdrForwardTests: XCTestCase {
         // caught signal left a zombie while the state insisted it was gone —
         // one leaked per dictation, forever.
         let calls = ReapCallCounter()
-        let process = try spawnExitingChild(waitForChild: { pid, status, options in
-            if calls.next() <= 2 {
-                errno = EINTR
-                return -1
-            }
-            return waitpid(pid, status, options)
-        })
+        let effortFinished = DispatchSemaphore(value: 0)
+        let process = try spawnExitingChild(
+            waitForChild: { pid, status, options in
+                if calls.next() <= 2 {
+                    errno = EINTR
+                    return -1
+                }
+                return waitpid(pid, status, options)
+            },
+            reapEffortDidFinish: { effortFinished.signal() }
+        )
 
         process.terminate()
 
         // The retry happens on the handle's own queue — nothing blocks — so the
         // collection lands asynchronously.
-        var collected = false
-        for _ in 0..<300 {
-            if process.hasBeenReaped {
-                collected = true
-                break
-            }
-            usleep(10_000)
-        }
-        XCTAssertTrue(collected)
+        XCTAssertEqual(effortFinished.wait(timeout: .now() + 10), .success)
+        XCTAssertTrue(process.hasBeenReaped)
         XCTAssertGreaterThanOrEqual(calls.value, 3, "EINTR must be retried, not swallowed")
         var isCollected = false
         for _ in 0..<300 {
@@ -800,27 +1457,30 @@ final class ClaudeRemoteHerdrForwardTests: XCTestCase {
         let releaseWaitpid = DispatchSemaphore(value: 0)
         let calls = ReapCallCounter()
         let signalAttempts = ReapCallCounter()
+        let attempted = DispatchSemaphore(value: 0)
         let spawner = ClaudeRemoteHerdrForwardSpawner(
             executablePath: "/bin/sh",
             environment: ["PATH": "/usr/bin:/bin"],
             waitForChild: { pid, status, options in
                 if calls.next() == 1 {
                     insideWaitpid.signal()
-                    // Held long enough that "B is still blocked" cannot be
-                    // confused with "B is merely slow": a teardown that DOES
-                    // get through costs at most two 0.25 s grace waits, well
-                    // under the window sampled below. Bounded so a failure
-                    // cannot hang the suite.
-                    _ = releaseWaitpid.wait(timeout: .now() + 3)
+                    // Held until the test releases it. A hold that expired on
+                    // its own let a slow runner's B through before the window
+                    // below closed, failing correct locking. The bound is only
+                    // there so a failure cannot hang the suite.
+                    _ = releaseWaitpid.wait(timeout: .now() + 60)
                 }
                 return waitpid(pid, status, options)
             },
-            willAttemptTeardownLock: { _ = signalAttempts.next() }
+            willAttemptTeardownLock: {
+                _ = signalAttempts.next()
+                attempted.signal()
+            }
         )
         let process = try XCTUnwrap(
             try spawner.spawn(argv: ["sh", "-c", "exit 0"]) as? LiveHerdrForwardProcess
         )
-        for _ in 0..<300 where process.isRunning { usleep(10_000) }
+        waitForExit(of: process)
 
         // A: drives the collection and parks inside `waitpid`.
         let firstTeardownReturned = DispatchSemaphore(value: 0)
@@ -851,18 +1511,15 @@ final class ClaudeRemoteHerdrForwardTests: XCTestCase {
         // with the reap moved back outside the mutex. The seam fires on
         // `terminate()` entry — the guard immediately after it IS a lock
         // acquisition — so an increment means B is at the door.
-        var reachedTheLock = false
-        for _ in 0..<500 {
-            if signalAttempts.value > attemptsBeforeB {
-                reachedTheLock = true
-                break
-            }
-            usleep(10_000)
-        }
-        XCTAssertTrue(reachedTheLock, "the second teardown never reached the group signal")
+        for _ in 0..<attemptsBeforeB { attempted.wait() }
+        XCTAssertEqual(
+            attempted.wait(timeout: .now() + 10), .success,
+            "the second teardown never reached the group signal"
+        )
 
         // 1.2 s: longer than a teardown that gets through needs (≤0.5 s of
-        // grace waits), shorter than the 3 s the collection is parked for.
+        // grace waits). The collection stays parked until the release below,
+        // so a slow runner can only make this pass, never fail.
         XCTAssertEqual(
             secondTeardownReturned.wait(timeout: .now() + 1.2), .timedOut,
             "a teardown must not proceed while a collection holds the lock"
@@ -872,6 +1529,43 @@ final class ClaudeRemoteHerdrForwardTests: XCTestCase {
         XCTAssertEqual(firstTeardownReturned.wait(timeout: .now() + 5), .success)
         XCTAssertEqual(secondTeardownReturned.wait(timeout: .now() + 5), .success)
         XCTAssertTrue(process.hasBeenReaped)
+    }
+
+    func testAReapThatBeatsTheExitEventStillCompletesTheWaiters() async throws {
+        // Collecting the child cancels the exit source, and the cancel drops
+        // an exit event still queued. That event was the only thing that
+        // completed the waiters: a stop that reaped first left the supervisor's
+        // exit wait parked forever and the forward reporting itself running.
+        let exitEvents = DispatchQueue(label: "test.herdr-exit-events.\(UUID().uuidString)")
+        exitEvents.suspend()
+        // A suspended queue must not be released.
+        defer { exitEvents.resume() }
+        let effortFinished = DispatchSemaphore(value: 0)
+        let spawner = ClaudeRemoteHerdrForwardSpawner(
+            executablePath: "/bin/sh",
+            environment: ["PATH": "/usr/bin:/bin"],
+            reapEffortDidFinish: { effortFinished.signal() },
+            exitEventQueue: exitEvents
+        )
+        let process = try XCTUnwrap(
+            try spawner.spawn(argv: ["sh", "-c", "exit 0"]) as? LiveHerdrForwardProcess
+        )
+        let earlyWaiter = Task { await process.waitUntilExit() }
+
+        process.terminate()
+        XCTAssertEqual(effortFinished.wait(timeout: .now() + 5), .success)
+        XCTAssertTrue(process.hasBeenReaped)
+
+        // Checked before awaiting anything: without the fix the waiters never
+        // resume, and awaiting them would hang the suite instead of failing.
+        guard !process.isRunning else {
+            return XCTFail("a reaped forward must not report itself running")
+        }
+        let early = await earlyWaiter.value
+        let late = await process.waitUntilExit()
+        XCTAssertEqual(early, .unavailable)
+        XCTAssertEqual(late, .unavailable)
+        for await _ in process.standardErrorLines {}
     }
 
     func testTheCollectionBudgetIsExhaustedAndThenReleased() throws {
@@ -900,7 +1594,7 @@ final class ClaudeRemoteHerdrForwardTests: XCTestCase {
         let process = try XCTUnwrap(
             try spawner.spawn(argv: ["sh", "-c", "exit 0"]) as? LiveHerdrForwardProcess
         )
-        for _ in 0..<300 where process.isRunning { usleep(10_000) }
+        waitForExit(of: process)
 
         process.terminate()
 
@@ -947,22 +1641,19 @@ final class ClaudeRemoteHerdrForwardTests: XCTestCase {
         // this handle's OWN queue. Nothing here is allowed to block, so the
         // collection lands asynchronously.
         let calls = ReapCallCounter()
-        let process = try spawnExitingChild(waitForChild: { pid, status, options in
-            if calls.next() <= 3 { return 0 }
-            return waitpid(pid, status, options)
-        })
+        let effortFinished = DispatchSemaphore(value: 0)
+        let process = try spawnExitingChild(
+            waitForChild: { pid, status, options in
+                if calls.next() <= 3 { return 0 }
+                return waitpid(pid, status, options)
+            },
+            reapEffortDidFinish: { effortFinished.signal() }
+        )
 
         process.terminate()
 
-        var collected = false
-        for _ in 0..<300 {
-            if process.hasBeenReaped {
-                collected = true
-                break
-            }
-            usleep(10_000)
-        }
-        XCTAssertTrue(collected, "the background poll must finish the collection")
+        XCTAssertEqual(effortFinished.wait(timeout: .now() + 10), .success)
+        XCTAssertTrue(process.hasBeenReaped, "the background poll must finish the collection")
         XCTAssertGreaterThan(calls.value, 3)
     }
 
@@ -1030,6 +1721,276 @@ final class ClaudeRemoteHerdrForwardTests: XCTestCase {
 }
 
 // MARK: - Alias → enrolled host
+
+/// A host revoked, or the app quitting, while `open()` or `prepare()` waits
+/// for the previous forward's teardown (#1104). The teardown removes the entry
+/// before it waits, so the reconciliation finds nothing to stop; the waiter
+/// has to see the change itself when it resumes.
+@MainActor
+final class ClaudeRemoteHerdrForwardEnrollmentRaceTests: XCTestCase, RemoteHerdrJoinFixture {
+    private final class Switches: Sendable {
+        let enrolledHostID: Mutex<String?>
+        let socketAnswers = Mutex(true)
+
+        init(enrolledHostID: String) {
+            self.enrolledHostID = Mutex(enrolledHostID)
+        }
+    }
+
+    private struct World {
+        let service: ClaudeRemoteHerdrForwardService
+        let spawner: ForwardTestSpawner
+        let workspaces: ForwardTestWorkspaces
+        let switches: Switches
+        let supervisorSleeps: ParkedSupervisorSleeps
+    }
+
+    /// `heldClock` drives readiness and idle teardown; pass one when the
+    /// forward is unleased, or its idle teardown fires before the test's own.
+    private func makeWorld(heldClock: HeldForwardTestClock? = nil) -> World {
+        let clock = ForwardTestClock()
+        let now = heldClock?.now ?? clock.now
+        let sleepFor = heldClock?.sleepFor ?? clock.sleepFor
+        // Every ssh ignores SIGTERM and SIGKILL, and the grace sleeps park, so
+        // a teardown ends only when the test makes its process exit.
+        let spawner = ForwardTestSpawner(freshProcessPerSpawn: true, ignoresSignals: true)
+        let switches = Switches(enrolledHostID: hostID)
+        let supervisorSleeps = ParkedSupervisorSleeps()
+        let workspaces = ForwardTestWorkspaces()
+        let service = ClaudeRemoteHerdrForwardService(
+            spawner: spawner,
+            workspaces: workspaces,
+            isSocketDialable: { _ in switches.socketAnswers.withLock { $0 } },
+            now: now,
+            sleepFor: sleepFor,
+            hostIDForAlias: { _ in switches.enrolledHostID.withLock { $0 } },
+            supervisorSleep: supervisorSleeps.sleep,
+            processIdentity: { _ in nil }
+        )
+        return World(
+            service: service,
+            spawner: spawner,
+            workspaces: workspaces,
+            switches: switches,
+            supervisorSleeps: supervisorSleeps
+        )
+    }
+
+    private func finish(_ world: World) {
+        world.service.stopAllForQuit()
+        for process in world.spawner.processes.withLock({ $0 }) { process.exit() }
+        world.supervisorSleeps.releaseAll()
+    }
+
+    func testARevokeDuringReplacementTeardownOpensNoForwardAndJoinsNothing() async throws {
+        let world = makeWorld()
+        let registry = makeRegistry()
+        ingestRemoteHerdrSession(into: registry)
+        let panes = RemoteJoinHerdrPanes(focused: focusedPane())
+        let resolver = resolver(registry: registry, panes: panes, forwards: world.service)
+
+        let firstJoin = try unwrapAsync(await resolver.resolve(target: ghostty))
+        XCTAssertEqual(world.spawner.spawnCount, 1)
+        let firstProcess = world.spawner.process
+
+        // The retained forward fails its health check, so the next join tears
+        // it down and parks on that teardown.
+        world.switches.socketAnswers.withLock { $0 = false }
+        let secondJoin = Task { @MainActor in await resolver.resolve(target: ghostty) }
+        // The replacement waits on the old teardown.
+        await firstProcess.terminated.waitFor(1)
+        world.switches.socketAnswers.withLock { $0 = true }
+        let paneRequestsBeforeRelease = panes.requests.withLock { $0 }
+
+        // Revoke: the host store stops naming the host, then enrollment
+        // reconciles. Nothing is registered for it, so nothing is stopped.
+        world.switches.enrolledHostID.withLock { $0 = nil }
+        world.service.reconcileEnrollment(activeHostIDs: [])
+        firstProcess.exit()
+
+        let replacementJoin = await secondJoin.value
+
+        XCTAssertNil(replacementJoin, "no join, so no route writes into the revoked host's pane")
+        XCTAssertEqual(world.workspaces.made.withLock { $0 }, 1, "no replacement entry")
+        XCTAssertEqual(world.spawner.spawnCount, 1, "no replacement ssh for a revoked host")
+        XCTAssertEqual(
+            panes.requests.withLock { $0 }, paneRequestsBeforeRelease,
+            "nothing is asked of the revoked host's herdr"
+        )
+        firstJoin.remoteHerdrForward?.close()
+        finish(world)
+    }
+
+    func testAReconcileDuringPrepareTeardownStartsNoForward() async {
+        // Only the reconciliation says the host is gone: the alias lookup
+        // still answers, as it would for a store read that lags the revoke.
+        // The prepared forward has no lease, so its idle sleep is held: the
+        // only teardown here is the one the replacement waits on.
+        let clock = HeldForwardTestClock()
+        let world = makeWorld(heldClock: clock)
+        await world.service.prepare(
+            hostID: hostID, alias: "builder", remoteSocketPath: remoteSocketPath
+        )
+        await world.spawner.spawns.waitFor(1)
+        let firstProcess = world.spawner.process
+
+        let replacement = Task { @MainActor in
+            await world.service.prepare(
+                hostID: hostID, alias: "builder",
+                remoteSocketPath: "/run/user/1000/herdr/replacement.sock"
+            )
+        }
+        // The replacement waits on the old teardown.
+        await firstProcess.terminated.waitFor(1)
+        world.service.reconcileEnrollment(activeHostIDs: [])
+        firstProcess.exit()
+        await replacement.value
+
+        XCTAssertEqual(world.workspaces.made.withLock { $0 }, 1, "no replacement entry")
+        XCTAssertEqual(world.spawner.spawnCount, 1, "no replacement ssh for a revoked host")
+        finish(world)
+        clock.releaseAllSleeps()
+    }
+
+    func testQuitDuringReplacementTeardownOpensNoForward() async throws {
+        let world = makeWorld()
+        let lease = try unwrapAsync(
+            await world.service.open(alias: "builder", remoteSocketPath: remoteSocketPath)
+        )
+        let firstProcess = world.spawner.process
+
+        world.switches.socketAnswers.withLock { $0 = false }
+        let replacement = Task { @MainActor in
+            await world.service.open(alias: "builder", remoteSocketPath: remoteSocketPath)
+        }
+        // The replacement waits on the old teardown.
+        await firstProcess.terminated.waitFor(1)
+        world.switches.socketAnswers.withLock { $0 = true }
+        world.service.stopAllForQuit()
+        firstProcess.exit()
+        let replacementLease = await replacement.value
+
+        XCTAssertNil(replacementLease)
+        XCTAssertEqual(world.workspaces.made.withLock { $0 }, 1, "no replacement entry")
+        XCTAssertEqual(world.spawner.spawnCount, 1, "no ssh may outlive the quit")
+        lease.close()
+        finish(world)
+    }
+
+    /// Lets a parked readiness poll run until `isDone` holds, releasing each
+    /// poll sleep it takes. The driven task calls `clock.note()` when it
+    /// finishes, so each pass waits on a parked sleep or on that.
+    private func drive(
+        _ clock: HeldForwardTestClock,
+        until description: String,
+        _ isDone: @escaping @MainActor () -> Bool
+    ) async {
+        while !isDone() {
+            let seen = clock.events
+            if clock.pendingCount(for: 0.025) > 0 {
+                clock.releaseOldestSleep(for: 0.025)
+                continue
+            }
+            await clock.waitForEvent(after: seen)
+            if clock.events == seen { return XCTFail("timed out waiting for \(description)") }
+        }
+    }
+
+    /// Asserts that quitting signals every ssh the service ever spawned: one
+    /// left out of `entries` survives the quit and the next launch's reap.
+    private func assertQuitStopsEverySpawn(_ world: World, line: UInt = #line) {
+        world.service.stopAllForQuit()
+        for (index, process) in world.spawner.processes.withLock({ $0 }).enumerated() {
+            XCTAssertGreaterThanOrEqual(
+                process.terminations.withLock { $0 }, 1,
+                "ssh #\(index + 1) was never stopped", line: line
+            )
+        }
+    }
+
+    func testAPrepareDuringOpenReplacementTeardownIsReusedNotOrphaned() async throws {
+        let clock = HeldForwardTestClock()
+        let world = makeWorld(heldClock: clock)
+        let lease = try unwrapAsync(
+            await world.service.open(alias: "builder", remoteSocketPath: remoteSocketPath)
+        )
+        let firstProcess = world.spawner.process
+
+        world.switches.socketAnswers.withLock { $0 = false }
+        let finished = Mutex(false)
+        let replacement = Task { @MainActor in
+            defer {
+                finished.withLock { $0 = true }
+                clock.note()
+            }
+            return await world.service.open(alias: "builder", remoteSocketPath: remoteSocketPath)
+        }
+        // The replacement waits on the old teardown.
+        await firstProcess.terminated.waitFor(1)
+        world.switches.socketAnswers.withLock { $0 = true }
+
+        // Host activity for the same target lands while the slot is empty.
+        await world.service.prepare(
+            hostID: hostID, alias: "builder", remoteSocketPath: remoteSocketPath
+        )
+        await world.spawner.spawns.waitFor(2)
+        firstProcess.exit()
+        await drive(clock, until: "the replacement open to return") {
+            finished.withLock { $0 }
+        }
+        let replacementLease = await replacement.value
+
+        XCTAssertNotNil(replacementLease, "the prepared forward serves the dictation")
+        XCTAssertEqual(world.spawner.spawnCount, 2, "the open reuses the prepared ssh")
+        assertQuitStopsEverySpawn(world)
+        lease.close()
+        replacementLease?.close()
+        finish(world)
+        clock.releaseAllSleeps()
+    }
+
+    func testAnOpenDuringPrepareReplacementTeardownIsNotOrphaned() async throws {
+        let clock = HeldForwardTestClock()
+        let world = makeWorld(heldClock: clock)
+        await world.service.prepare(
+            hostID: hostID, alias: "builder", remoteSocketPath: remoteSocketPath
+        )
+        await world.spawner.spawns.waitFor(1)
+        let firstProcess = world.spawner.process
+
+        let replacement = Task { @MainActor in
+            await world.service.prepare(
+                hostID: hostID, alias: "builder",
+                remoteSocketPath: "/run/user/1000/herdr/replacement.sock"
+            )
+        }
+        // The replacement waits on the old teardown.
+        await firstProcess.terminated.waitFor(1)
+
+        // A dictation cold-opens into the empty slot and takes a lease.
+        let finished = Mutex(false)
+        let open = Task { @MainActor in
+            defer {
+                finished.withLock { $0 = true }
+                clock.note()
+            }
+            return await world.service.open(alias: "builder", remoteSocketPath: remoteSocketPath)
+        }
+        await drive(clock, until: "the cold open to return") { finished.withLock { $0 } }
+        let lease = try unwrapAsync(await open.value)
+        XCTAssertEqual(world.spawner.spawnCount, 2)
+
+        firstProcess.exit()
+        await replacement.value
+
+        XCTAssertEqual(world.workspaces.made.withLock { $0 }, 2, "the stale activity makes no third entry")
+        XCTAssertEqual(world.spawner.spawnCount, 2, "the stale activity starts no third ssh")
+        assertQuitStopsEverySpawn(world)
+        lease.close()
+        finish(world)
+        clock.releaseAllSleeps()
+    }
+}
 
 private final class MemoryHostStore: ClaudeRemoteHostStoreIO, @unchecked Sendable {
     private let files = Mutex<[String: Data]>([:])

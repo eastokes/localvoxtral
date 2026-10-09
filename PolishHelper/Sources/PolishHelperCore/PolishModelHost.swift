@@ -10,7 +10,11 @@ public protocol ChatResponding: Sendable {
         to messages: [ChatCompletionMessage],
         chatTemplateArguments: [String: ChatTemplateArgumentValue]?,
         sampling: ChatSamplingParameters
-    ) async throws -> String
+    ) async throws -> ChatReply
+
+    /// The tokens `text` encodes to with the model's tokenizer, without
+    /// special tokens or a chat template: what one part of a prompt adds.
+    func tokenCount(of text: String) async throws -> Int
 }
 
 public enum ChatRespondingError: Error, CustomStringConvertible {
@@ -39,9 +43,17 @@ public enum ChatRespondingError: Error, CustomStringConvertible {
 /// default 2 slots) so two alternating prompt profiles (standard vs agent
 /// dictation) both stay warm instead of invalidating each other on every
 /// switch — with one slot, each alternation re-prefilled the full prefix.
+///
+/// With a multi-token-prediction drafter loaded, temperature-0 requests decode
+/// speculatively: the drafter proposes the next token, the model verifies it
+/// in the same forward pass, and the output stays identical to plain greedy
+/// decoding. Sampled requests decode one token at a time, because mlx-swift-lm
+/// only speculates for Qwen MTP at temperature 0.
 public final class MLXPolishModel: ChatResponding, @unchecked Sendable {
     private let container: ModelContainer
     private let defaultMaxTokens: Int
+    /// Only touched inside `container.perform`, like the prefix slots.
+    private let drafter: (any MTPDrafterModel)?
 
     /// KV states for the templated stable prefixes, keyed by exact prefix
     /// tokens + chat-template kwargs. Stored caches are never mutated after
@@ -49,25 +61,44 @@ public final class MLXPolishModel: ChatResponding, @unchecked Sendable {
     /// `container.perform`, which serializes all access.
     private var prefixSlots: PromptPrefixSlotStore<[KVCache]>
 
-    private init(container: ModelContainer, defaultMaxTokens: Int, promptCacheSlots: Int) {
+    private init(
+        container: ModelContainer,
+        defaultMaxTokens: Int,
+        promptCacheSlots: Int,
+        drafter: (any MTPDrafterModel)?
+    ) {
         self.container = container
         self.defaultMaxTokens = defaultMaxTokens
+        self.drafter = drafter
         self.prefixSlots = PromptPrefixSlotStore(capacity: promptCacheSlots)
     }
 
     public static func load(
         directory: URL,
         defaultMaxTokens: Int,
-        promptCacheSlots: Int = 2
+        promptCacheSlots: Int = 2,
+        speculativeDecoding: SpeculativeDecodingMode = .off
     ) async throws -> MLXPolishModel {
         let container = try await LLMModelFactory.shared.loadContainer(
             from: directory,
             using: TransformersTokenizerLoader()
         )
+        var drafter: (any MTPDrafterModel)?
+        if speculativeDecoding == .mtp {
+            // A checkpoint without the head, or one downloaded before the
+            // app fetched it, still polishes; it just decodes token by token.
+            do {
+                drafter = try await MTPDrafterLoader.load(modelDirectory: directory)
+                PolishdLog.info("speculative decoding: MTP head loaded")
+            } catch {
+                PolishdLog.error("speculative decoding off: \(error)")
+            }
+        }
         return MLXPolishModel(
             container: container,
             defaultMaxTokens: defaultMaxTokens,
-            promptCacheSlots: promptCacheSlots
+            promptCacheSlots: promptCacheSlots,
+            drafter: drafter
         )
     }
 
@@ -75,7 +106,8 @@ public final class MLXPolishModel: ChatResponding, @unchecked Sendable {
         to messages: [ChatCompletionMessage],
         chatTemplateArguments: [String: ChatTemplateArgumentValue]? = nil,
         sampling: ChatSamplingParameters
-    ) async throws -> String {
+    ) async throws -> ChatReply {
+        let start = ContinuousClock.now
         var parameters = GenerateParameters()
         if let temperature = sampling.temperature {
             parameters.temperature = temperature
@@ -128,16 +160,66 @@ public final class MLXPolishModel: ChatResponding, @unchecked Sendable {
             )
 
             let input = LMInput(tokens: MLXArray(promptTokens))
-            let stream = try MLXLMCommon.generate(
-                input: input, cache: cache, parameters: generateParameters, context: context)
+            let stream: AsyncStream<Generation>
+            if let drafter = self.drafter, generateParameters.temperature == 0 {
+                stream = try MLXLMCommon.generate(
+                    input: input, cache: cache, parameters: generateParameters,
+                    context: context, mtpDrafter: drafter)
+            } else {
+                stream = try MLXLMCommon.generate(
+                    input: input, cache: cache, parameters: generateParameters, context: context)
+            }
             var output = ""
+            var firstChunk: ContinuousClock.Instant?
+            var info: GenerateCompletionInfo?
             for await generation in stream {
-                if let chunk = generation.chunk {
+                switch generation {
+                case .chunk(let chunk):
+                    if firstChunk == nil { firstChunk = .now }
                     output += chunk
+                case .info(let completion):
+                    info = completion
+                default:
+                    break
                 }
             }
-            return output
+            if let reason = info?.passthroughReason {
+                PolishdLog.info("speculative decoding stood down: \(reason)")
+            }
+            let end = ContinuousClock.now
+            let timings = PolishTimings(
+                firstTokenMilliseconds: Self.milliseconds(start.duration(to: firstChunk ?? end)),
+                totalMilliseconds: Self.milliseconds(start.duration(to: end)),
+                promptTokens: fullTokens.count,
+                cachedPromptTokens: fullTokens.count - promptTokens.count,
+                completionTokens: info?.generationTokenCount ?? 0,
+                draftTokens: info?.proposedDraftTokens,
+                acceptedDraftTokens: info?.acceptedDraftTokens
+            )
+            let finishReason: String
+            switch info?.stopReason {
+            case .length:
+                finishReason = "length"
+            case .stop:
+                finishReason = "stop"
+            case .cancelled, nil:
+                // A stream that ended without finishing its answer has no
+                // honest completion to return: the router answers 500.
+                throw CancellationError()
+            }
+            return ChatReply(content: output, timings: timings, finishReason: finishReason)
         }
+    }
+
+    public func tokenCount(of text: String) async throws -> Int {
+        await container.perform { context in
+            context.tokenizer.encode(text: text, addSpecialTokens: false).count
+        }
+    }
+
+    private static func milliseconds(_ duration: Duration) -> Double {
+        let (seconds, attoseconds) = duration.components
+        return Double(seconds) * 1000 + Double(attoseconds) / 1e15
     }
 
     /// The KV cache to generate on (nil for a fresh one) and the prompt
@@ -215,10 +297,10 @@ public final class MLXPolishModel: ChatResponding, @unchecked Sendable {
         context: ModelContext,
         parameters: GenerateParameters
     ) throws -> [KVCache] {
-        let caches = context.model.newCache(parameters: parameters)
+        let caches = try context.model.newCache(parameters: parameters)
         let input = LMInput(tokens: MLXArray(tokens))
         switch try context.model.prepare(
-            input, cache: caches, windowSize: parameters.prefillStepSize)
+            input, cache: caches, state: nil, prefill: parameters.prefill)
         {
         case .tokens(let remaining):
             withPreparedCache(caches, lengths: remaining.sequenceLengths) {

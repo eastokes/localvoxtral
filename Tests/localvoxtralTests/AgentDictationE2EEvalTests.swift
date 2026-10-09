@@ -9,10 +9,21 @@ import XCTest
 /// corpus and its contract are Phase 1, `EvalCorpus/agent-dictation/`):
 ///
 ///   recorded human WAV OR TTS(spokenForm, /usr/bin/say)
-///     -> production websocket ASR (speechd STT service)
-///     -> production polish stop-commit path (bundled polishd helper or an
-///        explicitly selected OpenAI-compatible endpoint)
+///     -> production websocket ASR (speechd STT service, or Mistral's hosted
+///        transcription socket in the Mistral arm)
+///     -> production polish stop-commit path (bundled polishd helper, an
+///        explicitly selected OpenAI-compatible endpoint, or Mistral's hosted
+///        chat/completions in the Mistral arm)
 ///     -> corpus-contract scoring -> scoreboard
+///
+/// Provider arms (`Enablement.provider`): the default `speechd` arm is the
+/// nightly baseline and runs entirely on the build host. The `mistral` arm
+/// moves BOTH live stages to Mistral's hosted API, driven exactly as the app's
+/// `Mistral API` backend mode drives them — the hosted realtime client for
+/// ASR, and a polish configuration built by `SettingsStore` itself in
+/// `.mistralAPI` mode. It bills the owner's account, so it is by-hand only
+/// (`MISTRAL_API_KEY=… ./scripts/remote-build.sh eval-e2e --provider mistral`)
+/// and never scheduled.
 ///
 /// What each stage exercises (documented per the Phase-2 contract):
 /// - ASR: the production `RealtimeAPIWebSocketClient` against a live speechd STT
@@ -20,7 +31,7 @@ import XCTest
 ///   suite). The live-session transcript MERGE (DictationViewModel+
 ///   RealtimeEvents overlap merge) is NOT in the loop — finals are joined
 ///   directly; a Phase-3 candidate.
-/// - Polish: the REAL `DictationViewModel.finishStoppedSession` stop-commit
+/// - Polish: the REAL `DictationSessionController.finishStoppedSession` stop-commit
 ///   path on a view model built with `startRuntimeServices: false` —
 ///   replacement dictionary -> clipboard-paste macro -> profile selection ->
 ///   clipboard context -> repo vocabulary -> `LLMPolishingRequest` ->
@@ -54,10 +65,14 @@ import XCTest
 ///   LV_AGENT_EVAL_E2E_RECORDING_SUBSET=1 explicitly selects an exploratory
 ///   partial-set run. LV_AGENT_EVAL_E2E_POLISH_ENDPOINT bypasses the bundled
 ///   helper while preserving the production Qwen 4B sampling/template shape.
+///   LV_AGENT_EVAL_E2E_PROVIDER=mistral selects the hosted arm and reads its
+///   bearer token from MISTRAL_API_KEY (the same variable every other Mistral
+///   lane reads).
 /// - marker file `.agent-eval-e2e-enable.json` at the repo root, written by
 ///   `./scripts/remote-build.sh eval-e2e` (the SSH gate can't pass env, so
 ///   enablement rides the rsynced tree — the PolishHelperIntegrationTests
-///   pattern)
+///   pattern); the Mistral arm's marker carries `provider` and `apiKey`, is
+///   written 0600 and removed on exit
 ///
 /// Synthesized WAVs are cached under
 /// `~/Library/Caches/localvoxtral-eval/wav/<sha256(text|voice|format)>.wav`
@@ -65,21 +80,14 @@ import XCTest
 /// `say` entirely.
 @MainActor
 final class AgentDictationE2EEvalTests: XCTestCase {
-    private typealias Support = AgentDictationE2EEvalSupport
-
-    // DictationViewModel owns app-lifetime services; retain instances for the
-    // process lifetime (the token-guard suite pattern).
-    private static var retainedViewModels: [DictationViewModel] = []
+    typealias Support = AgentDictationE2EEvalSupport
 
     /// Generous: the first request after a cold Metal JIT cache can pay
     /// kernel-compilation time on top of model load.
     private static let helperReadyTimeout: TimeInterval = 300
     private static let asrTimeout: TimeInterval = 90
-    /// Per-case stop-commit deadline: live 4B inference, possibly behind a
-    /// profile-prefix prefill.
-    private static let polishCommitDeadline: Duration = .seconds(240)
 
-    private var repoRoot: URL {
+    var repoRoot: URL {
         URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()  // localvoxtralTests
             .deletingLastPathComponent()  // Tests
@@ -90,8 +98,12 @@ final class AgentDictationE2EEvalTests: XCTestCase {
 
     func testAgentDictationE2EEvalScoreboard() async throws {
         let enablement = try resolveEnablementOrSkip()
+        if enablement.replayDirectory != nil {
+            throw XCTSkip("a replay run scores stored dictations, not the corpus")
+        }
+        let asrConfiguration = Support.asrStageConfiguration(enablement)
         let binary: URL?
-        if enablement.polishEndpoint == nil {
+        if enablement.usesBundledPolishHelper {
             binary = try resolveHelperBinary(enablement.helperPath)
         } else {
             binary = nil
@@ -106,6 +118,41 @@ final class AgentDictationE2EEvalTests: XCTestCase {
             strata: strata,
             allowSubset: enablement.recordingSubset
         )
+
+        let allCaseIDs = Set(strata.flatMap { $0.stratum.cases.map(\.id) })
+        if let requested = enablement.caseIDs {
+            let unknown = requested.subtracting(allCaseIDs).sorted()
+            guard unknown.isEmpty else {
+                throw EvalInfraError(
+                    "unknown focused eval case id(s): \(unknown.joined(separator: ", "))"
+                )
+            }
+        }
+        let selectedCaseIDs = enablement.caseIDs ?? Support.selectedCaseIDs(
+            strata: strata,
+            recordedCaseIDs: Set(recordedAudio?.pcmByCaseID.keys.map { $0 } ?? []),
+            isSubset: recordedAudio?.isSubset == true
+        )
+
+        // Voices and every case's TTS audio before anything loads a model, so
+        // no `say` runs beside the polish helper (#960). Synthesis lands in
+        // the wav cache, which the cases then read.
+        let enVoice = try recordedAudio == nil
+            ? Self.resolveVoice(
+                languagePrefix: "en", preferred: EvalSpeechStage.englishVoicePreference
+            )
+            : nil
+        let frVoice = try recordedAudio == nil
+            ? Self.resolveVoice(
+                languagePrefix: "fr", preferred: EvalSpeechStage.frenchVoicePreference
+            )
+            : nil
+        if recordedAudio == nil {
+            try synthesizeCorpusAudio(
+                strata: strata, selectedCaseIDs: selectedCaseIDs,
+                enVoice: enVoice, frVoice: frVoice
+            )
+        }
 
         // Fixture repos: git-inited at runtime from the corpus specs (paths
         // are the vocabulary; the branch is part of it too).
@@ -124,77 +171,86 @@ final class AgentDictationE2EEvalTests: XCTestCase {
 
         let polishConfiguration: LLMPolishingConfiguration
         let polishBackend: String
-        if let endpoint = enablement.polishEndpoint {
-            // The external alias may not be a catalog repo ID (llama.cpp uses
-            // aliases such as qwen35-4b), but this experiment must still send
-            // the shipped 4B request shape: greedy sampling and thinking off.
-            polishConfiguration = LLMPolishEvalSupport.configuration(
-                endpointURL: endpoint,
-                apiKey: "",
-                model: enablement.polishModel,
-                requestShapeModel: PolishModelCatalog.defaultOption.repoID
-            )
-            polishBackend = "external \(endpoint.absoluteString)"
+        switch enablement.provider {
+        case .mistral:
+            // Built BY a settings store in the app's own Mistral mode, never
+            // hand-rolled beside it: what this eval scores has to be the
+            // request the app sends, and the store is the only thing that
+            // knows what that is.
+            let settings = makeSettings(outputMode: .overlayBuffer)
+            guard let configuration = Support.configureMistralPolishing(
+                settings, apiKey: enablement.apiKey, model: enablement.polishModel
+            ) else {
+                throw EvalInfraError(
+                    "the Mistral arm needs a non-empty API key "
+                        + "(marker \"apiKey\" or \(Support.apiKeyEnvKey))"
+                )
+            }
+            polishConfiguration = configuration
+            polishBackend = "mistral \(configuration.endpointURL.absoluteString)"
             print(
-                "agent-e2e: polish=external model=\(enablement.polishModel) "
-                    + "temperature=0 top_p=1 top_k=0 min_p=0 presence_penalty=0 "
-                    + "enable_thinking=false"
+                "agent-e2e: polish=mistral model=\(configuration.model) reasoning_effort=none"
             )
-        } else {
-            guard let binary else { throw EvalInfraError("missing bundled helper path") }
-            try await ensureModelCached(enablement.polishModel)
-            let helper = try await launchHelper(binary: binary, model: enablement.polishModel)
-            addTeardownBlock { await Self.reap(helper.process) }
-            polishConfiguration = LLMPolishEvalSupport.configuration(
-                endpointURL: URL(
-                    string: "http://127.0.0.1:\(helper.port)/v1/chat/completions"
-                )!,
-                apiKey: "",
-                model: enablement.polishModel
+            print(
+                "agent-e2e: asr=mistral model=\(asrConfiguration.model) "
+                    + "@ \(asrConfiguration.endpoint)"
             )
-            polishBackend = "helper \(binary.path)"
+            print(
+                "agent-e2e: polishContextTrustedEndpointEnabled=true — api.mistral.ai is not "
+                    + "loopback, so without this opt-in every clipboard and repo-vocabulary "
+                    + "case would run ungrounded"
+            )
+        case .speechd:
+            if let endpoint = enablement.polishEndpoint {
+                // The external alias may not be a catalog repo ID (llama.cpp uses
+                // aliases such as qwen35-4b), but this experiment must still send
+                // the shipped 4B request shape: greedy sampling and thinking off.
+                polishConfiguration = LLMPolishEvalSupport.configuration(
+                    endpointURL: endpoint,
+                    apiKey: "",
+                    model: enablement.polishModel,
+                    requestShapeModel: PolishModelCatalog.defaultOption.repoID
+                )
+                polishBackend = "external \(endpoint.absoluteString)"
+                print(
+                    "agent-e2e: polish=external model=\(enablement.polishModel) "
+                        + "temperature=0 top_p=1 top_k=0 min_p=0 presence_penalty=0 "
+                        + "enable_thinking=false"
+                )
+            } else {
+                guard let binary else { throw EvalInfraError("missing bundled helper path") }
+                try await ensureModelCached(enablement.polishModel)
+                let helper = try await launchHelper(binary: binary, model: enablement.polishModel)
+                addTeardownBlock { await Self.reap(helper.process) }
+                polishConfiguration = LLMPolishEvalSupport.configuration(
+                    endpointURL: URL(
+                        string: "http://127.0.0.1:\(helper.port)/v1/chat/completions"
+                    )!,
+                    apiKey: "",
+                    model: enablement.polishModel
+                )
+                polishBackend = "helper \(binary.path)"
+            }
         }
         // Pay each profile's prompt-prefix prefill up front (two cache slots,
         // one per profile) so no case's polish request times out behind a cold
         // prefill — the CI failure mode of 2026-07-11.
         await warmPromptPrefixes(configStore: configStore, configuration: polishConfiguration)
 
-        let enVoice = recordedAudio == nil
-            ? Self.resolveVoice(languagePrefix: "en", preferred: ["Samantha", "Alex"])
-            : nil
-        let frVoice = recordedAudio == nil
-            ? Self.resolveVoice(
-                languagePrefix: "fr", preferred: ["Thomas", "Amélie", "Aurélie", "Audrey"]
-            )
-            : nil
         if let recordedAudio {
             print(
-                "agent-e2e: audio=human-recorded set=\(recordedAudio.name) "
+                "agent-e2e: audio=\(recordedAudio.audioLabel) "
                     + "cases=\(recordedAudio.pcmByCaseID.count)"
                     + (recordedAudio.isSubset ? " subset=true" : "")
             )
         } else {
             print(
-                "agent-e2e: audio=tts voices en=\(enVoice ?? "<system default>") "
-                    + "fr=\(frVoice ?? "<none — fr TTS cases skip>")"
+                "agent-e2e: audio=tts voices en=\(enVoice ?? "-") "
+                    + "fr=\(frVoice ?? "-")"
             )
         }
 
         let vocabularyCache = RepoVocabularyCache()
-        let allCaseIDs = Set(strata.flatMap { $0.stratum.cases.map(\.id) })
-        if let requested = enablement.caseIDs {
-            let unknown = requested.subtracting(allCaseIDs).sorted()
-            guard unknown.isEmpty else {
-                throw EvalInfraError(
-                    "unknown focused eval case id(s): \(unknown.joined(separator: ", "))"
-                )
-            }
-        }
-        let selectedCaseIDs = enablement.caseIDs ?? Support.selectedCaseIDs(
-            strata: strata,
-            recordedCaseIDs: Set(recordedAudio?.pcmByCaseID.keys.map { $0 } ?? []),
-            isSubset: recordedAudio?.isSubset == true
-        )
         let totalCases = strata.reduce(0) { total, loaded in
             total + loaded.stratum.cases.filter {
                 selectedCaseIDs?.contains($0.id) ?? true
@@ -204,14 +260,18 @@ final class AgentDictationE2EEvalTests: XCTestCase {
         var reports: [Support.CaseReportRecord] = []
         var reportSystemPrompts: [String] = []
         var caseIndex = 0
+        var sttWatch = EvalSpeechStage.ServiceWatch(endpoint: asrConfiguration.endpoint)
 
         for loaded in strata {
             let stratum = loaded.stratum
-            let plan = Support.stagePlan(for: stratum.resolvedPipeline)
+            let plan = AgentDictationEvalCorpus.stagePlan(for: stratum.resolvedPipeline)
             for evalCase in stratum.cases {
                 if let selectedCaseIDs, !selectedCaseIDs.contains(evalCase.id) { continue }
                 caseIndex += 1
                 print("agent-e2e [\(caseIndex)/\(totalCases)] \(evalCase.id)")
+                // stdout is a pipe under CI: unflushed, the whole run's output
+                // reached the log only at exit, and a hung run showed nothing.
+                fflush(nil)
                 let run = await runCase(
                     evalCase,
                     stratumName: stratum.stratum,
@@ -227,6 +287,11 @@ final class AgentDictationE2EEvalTests: XCTestCase {
                     frVoice: frVoice
                 )
                 results.append(run.result)
+                if let speechError = run.capture.speechError {
+                    try sttWatch.record(speechError)
+                } else if run.capture.transcript != nil {
+                    sttWatch.recordAnswer()
+                }
 
                 var systemPromptIndex: Int?
                 if let prompt = run.capture.polishSystemPrompt {
@@ -250,9 +315,9 @@ final class AgentDictationE2EEvalTests: XCTestCase {
 
         let board = Support.renderScoreboard(
             results: results,
-            header: "polish model: \(enablement.polishModel), "
-                + "asr: \(enablement.asrModel) @ \(enablement.voxmlxEndpoint), "
-                + "audio: \(recordedAudio.map { "human-recorded/\($0.name)" } ?? "macOS say"), "
+            header: "polish model: \(polishConfiguration.model), "
+                + "asr: \(asrConfiguration.model) @ \(asrConfiguration.endpoint), "
+                + "audio: \(recordedAudio.map(\.audioLabel) ?? "macOS say en=\(enVoice ?? "-") fr=\(frVoice ?? "-")"), "
                 + "polish backend: \(polishBackend)"
         )
         print(board.text)
@@ -265,7 +330,7 @@ final class AgentDictationE2EEvalTests: XCTestCase {
                 header: Support.ReportHeader(
                     polishModel: enablement.polishModel,
                     asrModel: enablement.asrModel,
-                    audioSource: recordedAudio.map { "human-recorded/\($0.name)" } ?? "macOS say",
+                    audioSource: recordedAudio.map(\.audioLabel) ?? "macOS say",
                     systemPrompts: reportSystemPrompts
                 ),
                 records: reports
@@ -297,13 +362,13 @@ final class AgentDictationE2EEvalTests: XCTestCase {
         _ evalCase: AgentDictationEvalCorpus.Case,
         stratumName: String,
         pipeline: AgentDictationEvalCorpus.Pipeline,
-        plan: Support.StagePlan,
+        plan: AgentDictationEvalCorpus.StagePlan,
         enablement: Support.Enablement,
         polishConfiguration: LLMPolishingConfiguration,
         configStore: AppConfigStore,
         fixtureRepos: [String: URL],
         vocabularyCache: RepoVocabularyCache,
-        recordedAudio: RecordedAudioSet?,
+        recordedAudio: LoadedRecordings?,
         enVoice: String?,
         frVoice: String?
     ) async -> (result: Support.CaseResult, capture: Support.CaseCapture) {
@@ -336,7 +401,12 @@ final class AgentDictationE2EEvalTests: XCTestCase {
                     }
                     pcm = try synthesizedPCM16(text: evalCase.spokenForm, voice: voice)
                 }
-                polishInput = try await transcribe(pcm: pcm, enablement: enablement)
+                do {
+                    polishInput = try await transcribe(pcm: pcm, enablement: enablement)
+                } catch {
+                    capture.speechError = error
+                    throw error
+                }
                 capture.transcript = polishInput
             }
 
@@ -346,6 +416,7 @@ final class AgentDictationE2EEvalTests: XCTestCase {
                     input: polishInput,
                     evalCase: evalCase,
                     stratumName: stratumName,
+                    enablement: enablement,
                     polishConfiguration: polishConfiguration,
                     configStore: configStore,
                     fixtureRepos: fixtureRepos,
@@ -374,7 +445,7 @@ final class AgentDictationE2EEvalTests: XCTestCase {
                         )
                     }
                     capture.guardOffOutput = guardOffOutput
-                    result.guardOffTokensFailures = Support.tokensFailures(
+                    result.guardOffTokensFailures = AgentDictationEvalCorpus.tokensFailures(
                         output: guardOffOutput.trimmingCharacters(in: .whitespacesAndNewlines),
                         evalCase: evalCase
                     )
@@ -383,7 +454,7 @@ final class AgentDictationE2EEvalTests: XCTestCase {
 
             let trimmed = finalOutput.trimmingCharacters(in: .whitespacesAndNewlines)
             result.output = trimmed
-            result.tokensFailures = Support.tokensFailures(output: trimmed, evalCase: evalCase)
+            result.tokensFailures = AgentDictationEvalCorpus.tokensFailures(output: trimmed, evalCase: evalCase)
             if plan.runsPolish,
                 let rewrite = Support.antiRewriteFailure(
                     polishInput: polishInput, output: trimmed, evalCase: evalCase
@@ -424,35 +495,46 @@ final class AgentDictationE2EEvalTests: XCTestCase {
         input: String,
         evalCase: AgentDictationEvalCorpus.Case,
         stratumName: String,
+        enablement: Support.Enablement,
         polishConfiguration: LLMPolishingConfiguration,
         configStore: AppConfigStore,
         fixtureRepos: [String: URL],
         vocabularyCache: RepoVocabularyCache
     ) async throws -> PolishStageOutcome {
-        let settings = makeSettings()
+        let settings = makeSettings(outputMode: .overlayBuffer)
         settings.llmPolishingEnabled = true
-        // External-URL mode carries the ephemeral helper port through the
-        // loopback privacy gates (clipboard context / repo vocabulary); the
-        // request itself uses the catalog-aware configuration below.
-        settings.polishingBackendMode = .externalURL
-        settings.llmPolishingEndpointURL = polishConfiguration.endpointURL.absoluteString
+        switch enablement.provider {
+        case .speechd:
+            // External-URL mode carries the ephemeral helper port through the
+            // loopback privacy gates (clipboard context / repo vocabulary); the
+            // request itself uses the catalog-aware configuration below.
+            settings.polishingBackendMode = .externalURL
+            settings.llmPolishingEndpointURL = polishConfiguration.endpointURL.absoluteString
+        case .mistral:
+            // The app's own Mistral mode, so the privacy gates see exactly the
+            // hosted endpoint a real user's polish would reach — plus the
+            // trusted-endpoint opt-in that arm requires.
+            Support.configureMistralPolishing(
+                settings, apiKey: enablement.apiKey, model: enablement.polishModel
+            )
+        }
         settings.agentPolishProfileEnabled = true
 
         let service = EvalRecordingPolishingService(configuration: polishConfiguration)
         let viewModel = DictationViewModel(
             settings: settings,
-            overlayBufferCoordinator: EvalOverlayCoordinator(),
+            overlayBufferCoordinator: MockOverlayCoordinator(),
             startRuntimeServices: false
         )
         viewModel.appConfigStore = configStore
         viewModel.llmPolishingService = service
-        viewModel.debugResolveTargetAppBundleIDOverride = {
+        viewModel.stubCommitTarget {
             Support.polishTargetBundleID(forStratum: stratumName)
         }
         // Never the runner's real pasteboard: the polish-failure alert is also
         // pre-latched (presentConnectionFailureAlert would otherwise run a
         // REAL modal NSAlert — the suite-hang class AGENTS.md warns about).
-        viewModel.isShowingConnectionFailureAlert = true
+        viewModel.session.isShowingConnectionFailureAlert = true
 
         if let features = evalCase.features {
             if features.macro != nil {
@@ -461,12 +543,12 @@ final class AgentDictationE2EEvalTests: XCTestCase {
                 // fires is exactly what the case scores.
                 settings.clipboardPayloadMacroEnabled = true
                 let payload = features.clipboard
-                viewModel.debugClipboardPayloadPasteboardReaderOverride = {
+                viewModel.dependencies.pasteboardReader = {
                     PasteboardStub(string: payload)
                 }
             } else if let clipboard = features.clipboard {
                 settings.polishClipboardContextEnabled = true
-                viewModel.debugPolishContextPasteboardReaderOverride = {
+                viewModel.dependencies.pasteboardReader = {
                     PasteboardStub(string: clipboard)
                 }
             }
@@ -479,7 +561,7 @@ final class AgentDictationE2EEvalTests: XCTestCase {
                 // production title -> cwd -> git-index -> match pipeline runs
                 // for real against the git-inited fixture.
                 let title = "eval@mac: \(repoURL.path) — zsh"
-                viewModel.debugRepoVocabularyPipelineOverride = { transcript in
+                viewModel.session.repoVocabularyPipeline.pipeline = { transcript in
                     await RepoVocabularyService.entries(
                         forWindowTitle: title, transcript: transcript, cache: vocabularyCache
                     )
@@ -488,20 +570,23 @@ final class AgentDictationE2EEvalTests: XCTestCase {
         }
 
         var savedRecord: DictationSessionRecord?
-        viewModel.debugSavedSessionRecordSink = { savedRecord = $0 }
-        Self.retainedViewModels.append(viewModel)
+        viewModel.dependencies.onSessionRecord = { savedRecord = $0 }
+        retainForTestProcessLifetime(viewModel)
 
-        viewModel.sessionOutputMode = .overlayBuffer
+        viewModel.session.sessionOutputMode = .overlayBuffer
         viewModel.isFinalizingStop = true
-        viewModel.currentDictationEventText = input
+        viewModel.transcript.currentDictationEventText = input
 
-        viewModel.finishStoppedSession(promotePendingSegment: false)
-        let deadline = ContinuousClock.now + Self.polishCommitDeadline
-        while viewModel.isCompletingStoppedSession, ContinuousClock.now < deadline {
-            try? await Task.sleep(for: .milliseconds(50))
-        }
-        guard !viewModel.isCompletingStoppedSession else {
-            throw EvalInfraError("polish stop-commit did not complete within \(Self.polishCommitDeadline)")
+        viewModel.session.finishStoppedSession(promotePendingSegment: false)
+        // Read before the first suspension, while the value
+        // `finishStoppedSession` just stored is still there; the task clears
+        // it on its own way out. Live inference sets no bound worth guessing
+        // at — the polish client's own timeout is what ends a wedged
+        // request, and it reports itself below.
+        let commitTask = viewModel.session.polishAndCommitTask
+        await commitTask?.value
+        guard !viewModel.session.isCompletingStoppedSession else {
+            throw EvalInfraError("polish stop-commit did not complete")
         }
         if savedRecord?.status == DictationSessionStatus.llmFailed.rawValue {
             throw EvalInfraError(
@@ -511,7 +596,7 @@ final class AgentDictationE2EEvalTests: XCTestCase {
         let raw = await service.lastRawPolishedText
         let request = await service.lastRequest
         return PolishStageOutcome(
-            committedText: viewModel.currentDictationEventText,
+            committedText: viewModel.transcript.currentDictationEventText,
             rawModelOutput: raw,
             request: request
         )
@@ -519,8 +604,9 @@ final class AgentDictationE2EEvalTests: XCTestCase {
 
     // MARK: - TTS (cached)
 
-    private struct RecordedAudioSet {
-        let name: String
+    private struct LoadedRecordings {
+        /// `human-recorded/<set>`, or `<source>/<set>` for a TTS set.
+        let audioLabel: String
         let isSubset: Bool
         /// Exact manifest-verified bytes retained after preflight. Keeping
         /// them in memory prevents a long eval from observing a take changed
@@ -532,7 +618,7 @@ final class AgentDictationE2EEvalTests: XCTestCase {
         _ requestedPath: String?,
         strata: [AgentDictationEvalCorpus.LoadedStratum],
         allowSubset: Bool
-    ) throws -> RecordedAudioSet? {
+    ) throws -> LoadedRecordings? {
         guard let requestedPath else { return nil }
         let directory: URL
         if requestedPath.hasPrefix("/") {
@@ -541,24 +627,24 @@ final class AgentDictationE2EEvalTests: XCTestCase {
             directory = repoRoot.appendingPathComponent(requestedPath, isDirectory: true)
         }
         let standardized = directory.standardizedFileURL
-        let manifestURL = standardized.appendingPathComponent(Support.recordingManifestFileName)
-        let manifest: Support.RecordingManifest
+        let manifestURL = standardized.appendingPathComponent(RecordedAudioSet.manifestFileName)
+        let manifest: RecordedAudioSet.Manifest
         do {
-            manifest = try Support.parseRecordingManifest(Data(contentsOf: manifestURL))
+            manifest = try RecordedAudioSet.parseManifest(Data(contentsOf: manifestURL))
         } catch {
-            throw Support.RecordingSetError(
+            throw RecordedAudioSet.SetError(
                 message: "cannot read human recording manifest at \(manifestURL.path): \(error)"
             )
         }
 
-        let allExpected = strata.flatMap { loaded -> [Support.RecordingExpectation] in
-            guard Support.stagePlan(for: loaded.stratum.resolvedPipeline).runsSpeechRecognition
+        let allExpected = strata.flatMap { loaded -> [RecordedAudioSet.Expectation] in
+            guard AgentDictationEvalCorpus.stagePlan(for: loaded.stratum.resolvedPipeline).runsSpeechRecognition
             else { return [] }
             return loaded.stratum.cases.map {
-                Support.RecordingExpectation(id: $0.id, lang: $0.lang, spokenForm: $0.spokenForm)
+                RecordedAudioSet.Expectation(id: $0.id, lang: $0.lang, spokenForm: $0.spokenForm)
             }
         }
-        let recordings = try Support.validateRecordingManifest(
+        let recordings = try RecordedAudioSet.validateManifest(
             manifest, expected: allExpected, allowSubset: allowSubset
         )
         let expected = allExpected.filter { recordings[$0.id] != nil }
@@ -572,25 +658,25 @@ final class AgentDictationE2EEvalTests: XCTestCase {
             do {
                 wav = try Data(contentsOf: wavURL)
             } catch {
-                throw Support.RecordingSetError(
+                throw RecordedAudioSet.SetError(
                     message: "cannot read recording \(recording.id): \(error)"
                 )
             }
-            guard Support.sha256Hex(wav) == recording.sha256 else {
-                throw Support.RecordingSetError(
+            guard PortableSHA256.hex(of: wav) == recording.sha256 else {
+                throw RecordedAudioSet.SetError(
                     message: "recording \(recording.id) does not match its manifest SHA-256"
                 )
             }
             do {
-                pcmByCaseID[item.id] = try Support.recordedPCM16(fromWAVData: wav)
+                pcmByCaseID[item.id] = try RecordedAudioSet.pcm16(fromWAVData: wav)
             } catch {
-                throw Support.RecordingSetError(
+                throw RecordedAudioSet.SetError(
                     message: "recording \(recording.id) is invalid: \(error.localizedDescription)"
                 )
             }
         }
-        return RecordedAudioSet(
-            name: standardized.lastPathComponent,
+        return LoadedRecordings(
+            audioLabel: manifest.audioLabel(setName: standardized.lastPathComponent, human: "human-recorded"),
             isSubset: allowSubset,
             pcmByCaseID: pcmByCaseID
         )
@@ -598,153 +684,71 @@ final class AgentDictationE2EEvalTests: XCTestCase {
 
     private func recordedPCM16(
         for evalCase: AgentDictationEvalCorpus.Case,
-        in set: RecordedAudioSet
+        in set: LoadedRecordings
     ) throws -> Data {
         guard let pcm = set.pcmByCaseID[evalCase.id] else {
-            throw Support.RecordingSetError(message: "missing recording: \(evalCase.id)")
+            throw RecordedAudioSet.SetError(message: "missing recording: \(evalCase.id)")
         }
         return pcm
     }
 
     private func synthesizedPCM16(text: String, voice: String?) throws -> Data {
-        let cacheDirectory = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Caches/localvoxtral-eval/wav", isDirectory: true)
-        try FileManager.default.createDirectory(
-            at: cacheDirectory, withIntermediateDirectories: true
-        )
-        let key = Support.wavCacheKey(text: text, voice: voice)
-        let wavURL = cacheDirectory.appendingPathComponent("\(key).wav")
-
-        if FileManager.default.fileExists(atPath: wavURL.path) {
-            // A corrupt cached file (crash mid-write on an old run) must not
-            // poison the cache: fall through to re-synthesis.
-            if let pcm = try? IntegrationTestSupport.extractPCMDataFromWAV(at: wavURL),
-                !pcm.isEmpty
-            {
-                return pcm
-            }
-            try? FileManager.default.removeItem(at: wavURL)
-        }
-
-        // Synthesize to a temp name, then move into place, so a crash
-        // mid-`say` never leaves a half-written file under the final key.
-        let temporary = cacheDirectory.appendingPathComponent("tmp-\(UUID().uuidString).wav")
-        defer { try? FileManager.default.removeItem(at: temporary) }
-        var arguments = [
-            "-o", temporary.path,
-            "--file-format=WAVE",
-            "--data-format=\(Support.ttsDataFormat)",
-        ]
-        if let voice {
-            arguments += ["-v", voice]
-        }
-        arguments.append(text)
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/say")
-        process.arguments = arguments
-        try process.run()
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else {
-            throw EvalInfraError(
-                "say failed (status \(process.terminationStatus)) for voice \(voice ?? "default")"
-            )
-        }
-        try FileManager.default.moveItem(at: temporary, to: wavURL)
-        return try IntegrationTestSupport.extractPCMDataFromWAV(at: wavURL)
+        try EvalSpeechStage.synthesizedPCM16(text: text, voice: voice)
     }
 
-    /// `say -v ?` through a temp file (no pipes — descriptor-safe by
-    /// construction), parsed by the unit-tested picker.
-    private static func resolveVoice(languagePrefix: String, preferred: [String]) -> String? {
-        let outputURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("lv-agent-e2e-voices-\(UUID().uuidString).txt")
-        defer { try? FileManager.default.removeItem(at: outputURL) }
-        _ = FileManager.default.createFile(atPath: outputURL.path, contents: nil)
-        guard let handle = try? FileHandle(forWritingTo: outputURL) else { return nil }
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/say")
-        process.arguments = ["-v", "?"]
-        process.standardOutput = handle
-        process.standardError = FileHandle.nullDevice
-        do {
-            try process.run()
-        } catch {
-            return nil
+    /// Fills the wav cache for every selected case that runs speech
+    /// recognition, so no case calls `say` once models are loaded (#960).
+    private func synthesizeCorpusAudio(
+        strata: [AgentDictationEvalCorpus.LoadedStratum],
+        selectedCaseIDs: Set<String>?,
+        enVoice: String?,
+        frVoice: String?
+    ) throws {
+        let clock = ContinuousClock()
+        let start = clock.now
+        var count = 0
+        for loaded in strata
+        where AgentDictationEvalCorpus.stagePlan(for: loaded.stratum.resolvedPipeline).runsSpeechRecognition {
+            for evalCase in loaded.stratum.cases {
+                if let selectedCaseIDs, !selectedCaseIDs.contains(evalCase.id) { continue }
+                let voice: String?
+                switch evalCase.lang {
+                case .en: voice = enVoice
+                case .fr:
+                    guard let frVoice else { continue }
+                    voice = frVoice
+                }
+                _ = try synthesizedPCM16(text: evalCase.spokenForm, voice: voice)
+                count += 1
+            }
         }
-        process.waitUntilExit()
-        try? handle.close()
-        guard process.terminationStatus == 0,
-            let output = try? String(contentsOf: outputURL, encoding: .utf8)
-        else { return nil }
-        return Support.pickVoice(
-            fromSayVoicesOutput: output, languagePrefix: languagePrefix, preferred: preferred
-        )
+        print("agent-e2e: TTS audio for \(count) cases ready in \(clock.now - start)")
+        fflush(nil)
+    }
+
+    private static func resolveVoice(languagePrefix: String, preferred: [String]) throws -> String {
+        try EvalSpeechStage.resolveVoice(languagePrefix: languagePrefix, preferred: preferred)
     }
 
     // MARK: - ASR (production websocket client vs live speechd STT service)
 
-    private func transcribe(
+    func transcribe(
         pcm: Data,
         enablement: Support.Enablement
     ) async throws -> String {
-        let chunks = IntegrationTestSupport.splitPCM16IntoChunks(pcm, chunkSizeBytes: 3_200)
-        let client = RealtimeAPIWebSocketClient()
-        let finals = LockedStrings()
-        let socketErrors = LockedStrings()
-        let firstFinal = XCTestExpectation(description: "final transcript")
-        firstFinal.assertForOverFulfill = false
-
-        client.setEventHandler { event in
-            switch event {
-            case .connected:
-                // Safe to enqueue before session.created; the client gates
-                // outbound sends until session readiness (tier-1 pattern).
-                for chunk in chunks {
-                    client.sendAudioChunk(chunk)
-                }
-                client.sendCommit(final: false)
-                client.sendCommit(final: true)
-            case .finalTranscript(let text):
-                let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !trimmed.isEmpty else { return }
-                finals.append(trimmed)
-                firstFinal.fulfill()
-            case .error(let message):
-                socketErrors.append(message)
-                firstFinal.fulfill()  // fail fast, don't wait the full timeout
-            default:
-                break
-            }
-        }
-
-        try client.connect(
-            configuration: .init(
-                endpoint: enablement.voxmlxEndpoint,
-                apiKey: "",
-                model: enablement.asrModel
-            )
+        // The provider decides the client, endpoint, key and model; the event
+        // choreography is EvalSpeechStage's, shared with the term-recall eval.
+        let configuration = Support.asrStageConfiguration(enablement)
+        return try await EvalSpeechStage.transcribe(
+            pcm: pcm,
+            client: Support.makeRealtimeClient(for: enablement.provider),
+            endpoint: .init(
+                url: configuration.endpoint,
+                apiKey: configuration.apiKey,
+                model: configuration.model
+            ),
+            timeout: Self.asrTimeout
         )
-        let outcome = await XCTWaiter.fulfillment(of: [firstFinal], timeout: Self.asrTimeout)
-        // Short grace so trailing final segments of a longer utterance land.
-        try? await Task.sleep(for: .seconds(1))
-        client.disconnect()
-
-        let transcript = finals.snapshot().joined(separator: " ")
-        if !transcript.isEmpty {
-            return transcript
-        }
-        let errors = socketErrors.snapshot()
-        if !errors.isEmpty {
-            throw EvalInfraError("realtime socket error: \(errors.joined(separator: " | "))")
-        }
-        if outcome != .completed {
-            throw EvalInfraError(
-                "no final transcript within \(Int(Self.asrTimeout))s from \(enablement.voxmlxEndpoint)"
-            )
-        }
-        throw EvalInfraError("empty final transcript from \(enablement.voxmlxEndpoint)")
     }
 
     // MARK: - Fixture repos (real git, env-isolated)
@@ -809,7 +813,7 @@ final class AgentDictationE2EEvalTests: XCTestCase {
 
     // MARK: - Enablement
 
-    private func resolveEnablementOrSkip() throws -> Support.Enablement {
+    func resolveEnablementOrSkip() throws -> Support.Enablement {
         let markerURL = repoRoot.appendingPathComponent(Support.markerFileName)
         var marker: Support.MarkerConfig?
         if FileManager.default.fileExists(atPath: markerURL.path) {
@@ -828,13 +832,16 @@ final class AgentDictationE2EEvalTests: XCTestCase {
                 ./scripts/remote-build.sh eval-e2e from the dev box \
                 (after a `package` run has built the polishing helper). \
                 Expect many minutes: ~150 TTS+ASR cases plus live 4B polish inference.
+                A marker that IS present also lands here when it cannot be resolved — \
+                an unparseable endpoint URL, or a `provider` other than \
+                \(Support.Provider.speechd.rawValue)/\(Support.Provider.mistral.rawValue).
                 """
             )
         }
         return enablement
     }
 
-    private func resolveHelperBinary(_ helperPath: String) throws -> URL {
+    func resolveHelperBinary(_ helperPath: String) throws -> URL {
         let binary =
             helperPath.hasPrefix("/")
             ? URL(fileURLWithPath: helperPath)
@@ -857,9 +864,9 @@ final class AgentDictationE2EEvalTests: XCTestCase {
     /// the suite provisions the shared HF cache itself when the model is
     /// absent — same cache layout + include patterns as the app's
     /// HFModelDownloader, idempotent. Mirrors
-    /// `PolishHelperIntegrationTests.ensureModelCached` (kept private there;
+    /// `ensurePolishModelCached` (TestSupport/PolishHelperProcess.swift;
     /// the two suites wait on different plumbing, so the copy is deliberate).
-    private func ensureModelCached(_ repoID: String) async throws {
+    func ensureModelCached(_ repoID: String) async throws {
         let cacheRoot = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent(".cache/huggingface/hub")
         let repoDir = cacheRoot.appendingPathComponent(
@@ -876,7 +883,7 @@ final class AgentDictationE2EEvalTests: XCTestCase {
         // rewriting the SHARED cache's main ref would lie to other tools on
         // the host). Same scheme as PolishHelperIntegrationTests.
         if let pinnedRevision {
-            if PolishHelperIntegrationTests.snapshotIsProvisioned(
+            if PolishModelSnapshot.isProvisioned(
                 snapshotsDir.appendingPathComponent(pinnedRevision)
             ) {
                 return
@@ -887,7 +894,7 @@ final class AgentDictationE2EEvalTests: XCTestCase {
         )
         .trimmingCharacters(in: .whitespacesAndNewlines),
             !revision.isEmpty,
-            PolishHelperIntegrationTests.snapshotIsProvisioned(
+            PolishModelSnapshot.isProvisioned(
                 snapshotsDir.appendingPathComponent(revision)
             )
         {
@@ -944,7 +951,7 @@ final class AgentDictationE2EEvalTests: XCTestCase {
             guard (response as? HTTPURLResponse)?.statusCode == 200 else {
                 throw EvalInfraError("download failed for \(name): \(response)")
             }
-            try FileManager.default.moveItem(at: temporary, to: destination)
+            try SharedCacheFile.publish(temporary, at: destination)
         }
 
         if pinnedRevision == nil {
@@ -953,7 +960,7 @@ final class AgentDictationE2EEvalTests: XCTestCase {
             try Data("\(info.sha)\n".utf8).write(to: repoDir.appendingPathComponent("refs/main"))
         }
         try Data().write(
-            to: snapshotDir.appendingPathComponent(PolishHelperIntegrationTests.provisionedSentinel)
+            to: snapshotDir.appendingPathComponent(PolishModelSnapshot.provisionedSentinel)
         )
         print("agent-e2e: model provisioned (\(wanted.count) files)")
     }
@@ -961,7 +968,7 @@ final class AgentDictationE2EEvalTests: XCTestCase {
     /// Spawns the helper on an ephemeral port (--port 0) and waits for its
     /// stderr readiness line. Event-driven via the descriptor-safe
     /// PipeLineReader (never FileHandle.availableData — PR #60).
-    private func launchHelper(
+    func launchHelper(
         binary: URL,
         model: String
     ) async throws -> (process: Process, port: UInt16) {
@@ -1014,7 +1021,7 @@ final class AgentDictationE2EEvalTests: XCTestCase {
 
     /// Reap, don't just signal (#111): bounded wait for the exit, escalate to
     /// SIGKILL, idempotent for an already-exited process.
-    private static func reap(_ process: Process) async {
+    static func reap(_ process: Process) async {
         if process.isRunning {
             process.terminate()
         }
@@ -1034,13 +1041,14 @@ final class AgentDictationE2EEvalTests: XCTestCase {
     /// slots): bounded retries — a client-side timeout still leaves the
     /// helper prefilling, so the next attempt (and the eval) hits the warm
     /// checkpoint. Mirrors testHelperAgentProfileScoreboard's warmup.
-    private func warmPromptPrefixes(
+    func warmPromptPrefixes(
         configStore: AppConfigStore,
         configuration: LLMPolishingConfiguration
     ) async {
         let service = LLMPolishingService()
         for profile in [PolishPromptProfile.standard, PolishPromptProfile.agent] {
             let templates = configStore.loadLLMPromptTemplates(profile: profile)
+                .withReferenceGuide()
             let request = PolishPromptWarmup.request(templates: templates)
             for _ in 0..<3 {
                 do {
@@ -1057,17 +1065,6 @@ final class AgentDictationE2EEvalTests: XCTestCase {
 
     // MARK: - Settings
 
-    private func makeSettings() -> SettingsStore {
-        let suiteName = "localvoxtral.AgentDictationE2EEvalTests.\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suiteName)!
-        defaults.removePersistentDomain(forName: suiteName)
-        addTeardownBlock {
-            defaults.removePersistentDomain(forName: suiteName)
-        }
-        let settings = SettingsStore(defaults: defaults, environment: [:])
-        settings.dictationOutputMode = .overlayBuffer
-        return settings
-    }
 }
 
 // MARK: - Local doubles
@@ -1078,7 +1075,7 @@ final class AgentDictationE2EEvalTests: XCTestCase {
 /// column) plus the request itself (inspection report). The
 /// request is assembled by the production stop-commit path; this wrapper
 /// adds no request shaping.
-private actor EvalRecordingPolishingService: LLMPolishingServicing {
+actor EvalRecordingPolishingService: LLMPolishingServicing {
     private let underlying = LLMPolishingService()
     private let configuration: LLMPolishingConfiguration
     private(set) var lastRawPolishedText: String?
@@ -1099,37 +1096,7 @@ private actor EvalRecordingPolishingService: LLMPolishingServicing {
     }
 }
 
-/// Overlay coordinator double: the commit itself (AX insertion / pasteboard)
-/// is out of scope for the eval — the scored artifact is the committed TEXT,
-/// read from the view model exactly like the token-guard suite does.
-@MainActor
-private final class EvalOverlayCoordinator: OverlayBufferSessionCoordinating {
-    var commitTargetAppPID: pid_t? = nil
-
-    func resolveAnchorNow() -> OverlayAnchor {
-        OverlayAnchor(
-            targetRect: CGRect(x: 0, y: 0, width: 100, height: 24),
-            source: .windowCenter
-        )
-    }
-
-    func startSession(preResolvedAnchor _: OverlayAnchor?) {}
-    func beginFinalizing(displayBufferText _: String, commitBufferText _: String) {}
-    func refresh(displayBufferText _: String, commitBufferText _: String) {}
-
-    func commitIfNeeded(
-        using _: OverlayTextCommitting,
-        autoCopyEnabled _: Bool
-    ) -> OverlayBufferCommitOutcome {
-        .succeeded
-    }
-
-    func dismissAfterHold(minimumVisibility _: TimeInterval) {}
-    func reset() {}
-    func captureLiveCommitTargetAppPID() {}
-}
-
-private struct EvalInfraError: Error, CustomStringConvertible {
+struct EvalInfraError: Error, CustomStringConvertible {
     let description: String
 
     init(_ description: String) {

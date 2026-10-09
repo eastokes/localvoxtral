@@ -2,14 +2,9 @@ import AppKit
 import SwiftUI
 
 struct StatusPopoverConnectionFailurePresenter {
-    static func detail(statusText: String, lastError: String?, endpoint: String) -> String? {
+    static func detail(statusText: String) -> String? {
         guard isConnectionFailureStatus(statusText) else { return nil }
-        if statusText != "Invalid endpoint URL.",
-           lastError?.contains(endpoint) != true
-        {
-            return nil
-        }
-        return "Endpoint: \(endpoint)"
+        return "Check the engine in Settings."
     }
 
     private static func isConnectionFailureStatus(_ statusText: String) -> Bool {
@@ -19,7 +14,10 @@ struct StatusPopoverConnectionFailurePresenter {
              "Host unreachable.",
              "Connection timed out.",
              "Endpoint path rejected.",
-             "Network lost. Dictation stopped.",
+             "API key rejected.",
+             "API key missing.",
+             "Rate limited.",
+             "Dictation stopped after the network disconnected.",
              "Connection failed.":
             return true
         default:
@@ -35,10 +33,8 @@ struct StatusPopoverView: View {
     @State private var isConfirmingAccessibilityReset = false
 
     var viewModel: DictationViewModel
-
-    private var hasLatestSegment: Bool {
-        !viewModel.lastFinalSegment.trimmed.isEmpty
-    }
+    var navigator: SettingsNavigator
+    var accessibilityPane: AccessibilitySettingsPane = .current
 
     private var dictationButtonTitle: String {
         if viewModel.isFinalizingStop {
@@ -47,29 +43,11 @@ struct StatusPopoverView: View {
         if viewModel.isConnectingRealtimeSession {
             return "Connecting..."
         }
-        return viewModel.isDictating ? "Stop Dictation" : "Start Dictation"
+        return viewModel.isDictating ? "Stop dictation" : "Start dictation"
     }
 
     private var connectionFailureDetail: String? {
-        StatusPopoverConnectionFailurePresenter.detail(
-            statusText: viewModel.statusText,
-            lastError: viewModel.lastError,
-            endpoint: sanitizedRealtimeEndpointDescription
-        )
-    }
-
-    private var sanitizedRealtimeEndpointDescription: String {
-        guard let endpoint = viewModel.settings.resolvedWebSocketURL(for: viewModel.settings.realtimeProvider) else {
-            return "<invalid endpoint>"
-        }
-        guard var components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false) else {
-            return endpoint.absoluteString
-        }
-        components.user = nil
-        components.password = nil
-        components.query = nil
-        components.fragment = nil
-        return components.string ?? endpoint.absoluteString
+        StatusPopoverConnectionFailurePresenter.detail(statusText: viewModel.statusText)
     }
 
     var body: some View {
@@ -83,7 +61,7 @@ struct StatusPopoverView: View {
 
             Menu("Microphone") {
                 if viewModel.availableInputDevices.isEmpty {
-                    Text("No Input Devices")
+                    Text("No input devices")
                 } else {
                     ForEach(viewModel.availableInputDevices) { device in
                         Button {
@@ -99,33 +77,66 @@ struct StatusPopoverView: View {
                 }
             }
 
-            Button("Copy Latest Segment") {
-                viewModel.copyLatestSegment()
+            // Above stereo there is no meaningful downmix to mono, so capture
+            // takes ONE channel and the user says which (a mic sits on one
+            // preamp of a multi-input interface). Hidden for mono/stereo
+            // devices, where the standard downmix applies and the choice would
+            // be meaningless.
+            if viewModel.selectedInputDeviceChannelCount > 2 {
+                Menu("Input channel") {
+                    ForEach(0..<Int(viewModel.selectedInputDeviceChannelCount), id: \.self) {
+                        channel in
+                        Button {
+                            viewModel.selectMicrophoneInputChannel(channel)
+                        } label: {
+                            if viewModel.selectedInputChannel == channel {
+                                Label("Channel \(channel + 1)", systemImage: "checkmark")
+                            } else {
+                                Text("Channel \(channel + 1)")
+                            }
+                        }
+                    }
+                }
             }
-            .disabled(!hasLatestSegment)
+
+            // The last dictation's text, including one that never reached
+            // the target app (#526).
+            Button("Copy last dictation") {
+                viewModel.copyLastDictation()
+            }
+            .disabled(!viewModel.canCopyLastDictation)
 
             // Polished commits can't be un-typed into the target app; offer the
             // pre-polish raw transcript for one-tap copy instead (F6). Appears
             // only after a polish-changed commit; a one-line action, never the
             // transcript itself (owner rule: no long text in the popover).
             if viewModel.canCopyRawTranscript {
-                Button("Copy Raw Transcript") {
+                Button("Copy raw transcript") {
                     viewModel.copyRawTranscript()
                 }
             }
 
             Divider()
 
-            Button("Settings…") {
+            // Same window as Settings, opened on its History pane.
+            Button("History") {
+                navigator.selectedTab = .history
                 NSApp.activate(ignoringOtherApps: true)
                 openSettings()
             }
 
-            if !viewModel.isAccessibilityTrusted,
-               !viewModel.isAccessibilityRestartRequired
-            {
-                Button("Enable Accessibility…") {
-                    viewModel.requestAccessibilityPermission()
+            Button("Settings…") {
+                // Settings… must land on a settings pane, not on the page History left open.
+                if [.history, .insights].contains(navigator.selectedTab) {
+                    navigator.selectedTab = .general
+                }
+                NSApp.activate(ignoringOtherApps: true)
+                openSettings()
+            }
+
+            if !viewModel.isAccessibilityTrusted, !viewModel.isAccessibilityRestartRequired {
+                Button("Enable \(accessibilityPane.name)…") {
+                    viewModel.permissions.requestAccessibilityPermission()
                     openAccessibilitySettings()
                 }
 
@@ -139,15 +150,32 @@ struct StatusPopoverView: View {
             // Prominent, single-source-of-truth "why can't I dictate right now"
             // banner. Surfaces the Live Auto-Paste + Accessibility gap before the
             // user speaks into the void; the affordance to fix it is right below.
-            if let warning = viewModel.liveAutoPasteAccessibilityWarning {
-                Text(warning)
+            if viewModel.liveAutoPasteAccessibilityWarning != nil {
+                Text(DictationViewModel.liveAutoPastePopoverAccessibilityWarningMessage)
                     .foregroundStyle(.orange)
                     .lineLimit(nil)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(width: Self.contentWidth, alignment: .leading)
             }
 
-            Text("Status: \(viewModel.statusText)")
+            // History stopped saving: said while it lasts, not only in a
+            // pane the user may not open for days (#985).
+            if let historyWarning = viewModel.historyPopoverWarning {
+                Text(historyWarning)
+                    .foregroundStyle(.orange)
+                    .lineLimit(1)
+                    .frame(width: Self.contentWidth, alignment: .leading)
+            }
+
+            // One sentence naming the session that needs you (#717).
+            if let agentAttentionLine = viewModel.agentAttentionLine {
+                Text(agentAttentionLine)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .frame(width: Self.contentWidth, alignment: .leading)
+            }
+
+            Text(viewModel.statusText)
                 .foregroundStyle(.secondary)
                 .lineLimit(nil)
                 .fixedSize(horizontal: false, vertical: true)
@@ -155,8 +183,10 @@ struct StatusPopoverView: View {
 
             if let connectionFailureDetail {
                 statusDetailView(connectionFailureDetail)
-            } else if let lastError = viewModel.lastError {
-                statusDetailView("Error: \(lastError)")
+            } else if viewModel.currentErrorToken == .microphoneDisconnected {
+                statusDetailView(DictationViewModel.microphoneDisconnectedMessage)
+            } else if viewModel.lastError != nil {
+                statusDetailView("See Console for details.")
             }
 
             Divider()
@@ -166,11 +196,12 @@ struct StatusPopoverView: View {
             }
         }
         .onAppear {
+            viewModel.agentAttention?.tracker.prune()
             viewModel.refreshMicrophoneInputs()
-            viewModel.refreshAccessibilityTrustState()
+            viewModel.permissions.refreshAccessibilityTrustState()
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-            viewModel.refreshAccessibilityTrustState()
+            viewModel.permissions.refreshAccessibilityTrustState()
         }
         .alert("Reset Accessibility Permission?", isPresented: $isConfirmingAccessibilityReset) {
             Button("Cancel", role: .cancel) {}

@@ -28,25 +28,29 @@ public enum ClaudeHookWire {
 /// Which coding agent published a record. Content, not trust: trust stays a
 /// property of the transport (`ClaudeTransportOrigin`), and every local agent
 /// publishes over the same peer-authenticated socket. What the agent tag
-/// decides is session-id namespacing (`ClaudeAgentSessionScope`) and
-/// per-agent channel rules — e.g. the broker never returns a title marker to
-/// an opencode session, because opencode owns its window title the way herdr
-/// owns its pane titles.
+/// decides is session-id namespacing (`ClaudeAgentSessionScope`) and any
+/// per-agent rule a join arm needs.
 ///
 /// Decoding an unknown agent name is a drop, mirroring unknown events: a
 /// newer plugin talking to an older app degrades to "ignored", and an agent
-/// whose channel rules we do not know must not inherit another's.
+/// whose rules we do not know must not inherit another's.
 public enum ClaudeHookAgent: String, Sendable, Equatable, CaseIterable, Codable {
     case claude
     case opencode
+    /// Mistral Vibe CLI. Published by the same hook binary as Claude Code, from
+    /// Vibe's `hooks.toml` command hooks (`VibeHookInputParser`).
+    case vibe
+    /// OpenAI Codex CLI. Published by the same hook binary, from Codex's
+    /// `hooks.json` command hooks (`CodexHookInputParser`).
+    case codex
 }
 
 /// Namespacing for per-agent session ids, mirroring `ClaudeRemoteSessionScope`.
 ///
-/// Two agents pick their own session ids and cannot coordinate — Claude Code
-/// uses bare UUIDs, opencode uses `ses_…` — so a bare id is a claim, not a
-/// key. Scoping opencode ids under a prefix no Claude-published UUID can carry
-/// makes cross-agent collision structurally impossible. Applied by the
+/// Agents pick their own session ids and cannot coordinate — Claude Code,
+/// Vibe and Codex all use bare UUIDs, opencode uses `ses_…` — so a bare id is a claim,
+/// not a key. Scoping every non-Claude id under a prefix no Claude-published
+/// UUID can carry makes cross-agent collision structurally impossible. Applied by the
 /// RECEIVER (`ClaudeSessionRegistry.ingest`), never trusted from the wire, so
 /// a publisher cannot pre-scope itself into another namespace being honest or
 /// otherwise — the registry recomputes the key from the agent tag every time.
@@ -56,14 +60,29 @@ public enum ClaudeAgentSessionScope {
     /// Distinct from `ClaudeRemoteSessionScope.prefix` ("remote:") — the two
     /// namespaces must never alias.
     public static let opencodePrefix = "opencode:"
+    public static let vibePrefix = "vibe:"
+    public static let codexPrefix = "codex:"
 
-    public static func scopedSessionID(agent: ClaudeHookAgent, sessionID: String) -> String {
+    /// The prefix the receiver adds for `agent`, nil for Claude Code's bare ids.
+    public static func prefix(for agent: ClaudeHookAgent) -> String? {
         switch agent {
         case .claude:
-            return sessionID
+            return nil
         case .opencode:
-            return opencodePrefix + sessionID
+            return opencodePrefix
+        case .vibe:
+            return vibePrefix
+        case .codex:
+            return codexPrefix
         }
+    }
+
+    /// Every prefix a non-Claude agent's scoped id carries. A bare Claude id
+    /// spelling one of these names a key that can never be its own.
+    public static let agentPrefixes: [String] = ClaudeHookAgent.allCases.compactMap(prefix(for:))
+
+    public static func scopedSessionID(agent: ClaudeHookAgent, sessionID: String) -> String {
+        (prefix(for: agent) ?? "") + sessionID
     }
 }
 
@@ -87,6 +106,12 @@ public enum ClaudeHookEvent: String, Sendable, Equatable, CaseIterable, Codable 
     /// the event. See `ClaudeHookInputParser.filePaths` for its classification.
     case fileChanged = "FileChanged"
     case stop = "Stop"
+    /// The agent waits on the user (#717): a permission prompt, a question,
+    /// an input request. Carries only `notificationType`; Claude Code's
+    /// `message` and `title` quote tool names and command text and stay
+    /// behind. Codex's `PermissionRequest` and opencode's `permission.asked`
+    /// and `question.asked` are published under this event too.
+    case notification = "Notification"
     case sessionEnd = "SessionEnd"
     /// Published by the opencode plugin's TUI half only (v2): "the pane on
     /// this TTY currently displays this session". One opencode process hosts
@@ -103,6 +128,25 @@ public enum ClaudeHookEvent: String, Sendable, Equatable, CaseIterable, Codable 
     /// TTY's declaration regardless, because a clear can only ever widen
     /// abstention.
     case focusCleared = "FocusCleared"
+    /// A read-only liveness probe, synthesized by the publisher's status-line
+    /// mode (`localvoxtral-claude-hook --statusline`) — NOT a Claude Code hook
+    /// name; Claude Code never sends it and the shim never forwards it. The
+    /// broker answers `accepted == the named session is live in the registry`
+    /// and MUST NOT ingest it: a probe that created or refreshed a session
+    /// would keep dead sessions alive by the very act of asking after them.
+    /// `ClaudeSessionRegistry.ingest` refuses it outright as the backstop.
+    case statusQuery = "StatusQuery"
+}
+
+/// What a `Notification` record says the agent waits for (#717). A closed
+/// set, the waits a user answers in the pane: Claude Code's other types
+/// (`idle_prompt`, `auth_success`, `agent_completed`, …) are not published,
+/// and a record naming a type this build does not know is dropped.
+public enum ClaudeNotificationType: String, Sendable, Equatable, CaseIterable, Codable {
+    case permissionPrompt = "permission_prompt"
+    case elicitationDialog = "elicitation_dialog"
+    case elicitationURLDialog = "elicitation_url_dialog"
+    case agentNeedsInput = "agent_needs_input"
 }
 
 /// Hard bounds applied at BOTH ends of the wire.
@@ -120,17 +164,22 @@ public struct ClaudeHookLimits: Sendable, Equatable {
     public var maxPathBytes: Int
     /// Max file paths carried by a single record.
     public var maxFilePathsPerRecord: Int
+    /// Max UTF-8 bytes of a session title (#1020). A title is a name, and
+    /// the app shows at most 80 characters of it.
+    public var maxTitleBytes: Int
 
     public init(
         maxLineBytes: Int = 64 * 1024,
         maxPromptBytes: Int = 8 * 1024,
         maxPathBytes: Int = 4 * 1024,
-        maxFilePathsPerRecord: Int = 16
+        maxFilePathsPerRecord: Int = 16,
+        maxTitleBytes: Int = 320
     ) {
         self.maxLineBytes = maxLineBytes
         self.maxPromptBytes = maxPromptBytes
         self.maxPathBytes = maxPathBytes
         self.maxFilePathsPerRecord = maxFilePathsPerRecord
+        self.maxTitleBytes = maxTitleBytes
     }
 
     public static let `default` = ClaudeHookLimits()
@@ -177,6 +226,19 @@ public struct ClaudeHookProcessInfo: Sendable, Equatable, Codable {
     /// `$CLAUDE_CODE_BRIDGE_SESSION_ID` — the browser-side session handle a
     /// Remote Control bridge injects, when this session is driven by one.
     public var bridgeSessionID: String?
+    /// `$CLAUDE_CODE_HOST_SESSION_ID` — the Claude Desktop Code-tab session
+    /// handle (`local_<uuid>`) the desktop app injects into every session it
+    /// hosts. The same value is the last path component of the web view the
+    /// desktop app shows that session in, which is what the desktop join arm
+    /// compares it against.
+    public var desktopSessionID: String?
+    /// When the process behind `claudePID` started, in microseconds since the
+    /// epoch, from the kernel's process table. A pid is reused; a pid together
+    /// with its start time is not. Published by agents that have no
+    /// session-end event (Vibe), where pid liveness alone would let a reused
+    /// pid keep a dead session joinable for the whole TTL. Absent on records
+    /// that predate it, and then liveness is the pid alone.
+    public var agentStartMicros: Int64?
 
     public init(
         hookPID: Int32,
@@ -187,7 +249,9 @@ public struct ClaudeHookProcessInfo: Sendable, Equatable, Codable {
         herdrSocketPath: String? = nil,
         cmuxSurfaceID: String? = nil,
         cmuxSocketPath: String? = nil,
-        bridgeSessionID: String? = nil
+        bridgeSessionID: String? = nil,
+        desktopSessionID: String? = nil,
+        agentStartMicros: Int64? = nil
     ) {
         self.hookPID = hookPID
         self.claudePID = claudePID
@@ -198,6 +262,8 @@ public struct ClaudeHookProcessInfo: Sendable, Equatable, Codable {
         self.cmuxSurfaceID = cmuxSurfaceID
         self.cmuxSocketPath = cmuxSocketPath
         self.bridgeSessionID = bridgeSessionID
+        self.desktopSessionID = desktopSessionID
+        self.agentStartMicros = agentStartMicros
     }
 
     enum CodingKeys: String, CodingKey {
@@ -210,6 +276,8 @@ public struct ClaudeHookProcessInfo: Sendable, Equatable, Codable {
         case cmuxSurfaceID = "cmux_surface_id"
         case cmuxSocketPath = "cmux_socket_path"
         case bridgeSessionID = "bridge_session_id"
+        case desktopSessionID = "desktop_session_id"
+        case agentStartMicros = "agent_start_us"
     }
 }
 
@@ -257,6 +325,27 @@ public struct ClaudeHookRecord: Sendable, Equatable {
     public var toolName: String?
     public var files: [ClaudeFileTouch]
     public var process: ClaudeHookProcessInfo?
+    /// The opencode TUI half's prompt relay, on its `FocusChanged` records
+    /// only (#719). Dropped by `clamp` from every other record and whenever
+    /// malformed, so a record that carries it is otherwise unchanged.
+    public var promptRelay: OpencodePromptRelayAddress?
+    /// What a `Notification` record waits for. Required on that event and
+    /// dropped by `clamp` from every other one.
+    public var notificationType: ClaudeNotificationType?
+    /// The harness's own title for the session (#1020): Claude Code's
+    /// `session_title`, opencode's `title`, Codex's `thread_name`. A name to
+    /// show and say, never evidence (docs/agent/invariants.md, "A session's
+    /// title is a name, never evidence"). Optional and additive: an app that
+    /// predates it ignores the key, and a record without it reads nil. `clamp`
+    /// makes it one sanitized line and drops it from focus records.
+    public var sessionTitle: String?
+    /// Which user message a Vibe `UserPromptSubmit` carries: the message's
+    /// `message_id` in Vibe's session log (#1285). Vibe hooks carry no
+    /// prompt, so the publisher reads the newest one from the log on every
+    /// hook, and the same message arrives many times; the registry counts it
+    /// once per id. Text cannot tell such a replay from a prompt typed again.
+    /// Opaque, bounded by `clamp`, and kept on `UserPromptSubmit` only.
+    public var promptID: String?
 
     public init(
         version: Int = ClaudeHookWire.version,
@@ -268,7 +357,11 @@ public struct ClaudeHookRecord: Sendable, Equatable {
         prompt: String? = nil,
         toolName: String? = nil,
         files: [ClaudeFileTouch] = [],
-        process: ClaudeHookProcessInfo? = nil
+        process: ClaudeHookProcessInfo? = nil,
+        promptRelay: OpencodePromptRelayAddress? = nil,
+        notificationType: ClaudeNotificationType? = nil,
+        sessionTitle: String? = nil,
+        promptID: String? = nil
     ) {
         self.version = version
         self.event = event
@@ -280,6 +373,35 @@ public struct ClaudeHookRecord: Sendable, Equatable {
         self.toolName = toolName
         self.files = files
         self.process = process
+        self.promptRelay = promptRelay
+        self.notificationType = notificationType
+        self.sessionTitle = sessionTitle
+        self.promptID = promptID
+    }
+}
+
+/// Where the opencode TUI half's prompt relay listens: a port on 127.0.0.1
+/// and the bearer token the relay demands (#719). The wire carries a port,
+/// never a host, so the app can only ever dial loopback. The relay forwards
+/// two calls into the pane's own prompt, append and submit, and nothing else;
+/// see docs/agent/invariants.md ("The app writes into an agent only through
+/// opencode's prompt relay").
+public struct OpencodePromptRelayAddress: Sendable, Hashable, Codable {
+    public var port: Int
+    /// 32 random bytes, lowercase hex.
+    public var token: String
+
+    public static let tokenLength = 64
+
+    public init(port: Int, token: String) {
+        self.port = port
+        self.token = token
+    }
+
+    public var isWellFormed: Bool {
+        (1...65_535).contains(port)
+            && token.utf8.count == Self.tokenLength
+            && token.utf8.allSatisfy { (0x30...0x39).contains($0) || (0x61...0x66).contains($0) }
     }
 }
 
@@ -295,6 +417,10 @@ extension ClaudeHookRecord: Codable {
         case toolName = "tool_name"
         case files
         case process
+        case promptRelay = "prompt_relay"
+        case notificationType = "notification_type"
+        case sessionTitle = "session_title"
+        case promptID = "prompt_id"
     }
 
     public init(from decoder: Decoder) throws {
@@ -313,6 +439,15 @@ extension ClaudeHookRecord: Codable {
         toolName = try container.decodeIfPresent(String.self, forKey: .toolName)
         files = try container.decodeIfPresent([ClaudeFileTouch].self, forKey: .files) ?? []
         process = try container.decodeIfPresent(ClaudeHookProcessInfo.self, forKey: .process)
+        // A relay that does not decode loses the field, not the record: the
+        // focus declaration it rides on stands without it.
+        promptRelay = (try? container.decodeIfPresent(OpencodePromptRelayAddress.self, forKey: .promptRelay)) ?? nil
+        // An unknown type decodes to nil, and `decodeLine` drops a
+        // Notification without one.
+        notificationType = (try? container.decodeIfPresent(ClaudeNotificationType.self, forKey: .notificationType)) ?? nil
+        // A title that is not a string loses the field, not the record.
+        sessionTitle = (try? container.decodeIfPresent(String.self, forKey: .sessionTitle)) ?? nil
+        promptID = (try? container.decodeIfPresent(String.self, forKey: .promptID)) ?? nil
         // Any other key on the wire — notably an `origin`-shaped one — is
         // silently discarded here. That is the point: trust is not a field.
     }
@@ -333,22 +468,28 @@ extension ClaudeHookRecord: Codable {
         try container.encodeIfPresent(toolName, forKey: .toolName)
         try container.encode(files, forKey: .files)
         try container.encodeIfPresent(process, forKey: .process)
+        try container.encodeIfPresent(promptRelay, forKey: .promptRelay)
+        try container.encodeIfPresent(notificationType, forKey: .notificationType)
+        try container.encodeIfPresent(sessionTitle, forKey: .sessionTitle)
+        try container.encodeIfPresent(promptID, forKey: .promptID)
     }
 }
 
-/// Errors surfaced while turning a wire line into a record.
+/// Errors surfaced while turning a wire line into a record. No case carries
+/// text from the line: the broker logs these public, and a rejected field can
+/// hold a prompt or a key (#1107).
 public enum ClaudeHookWireError: Error, Equatable {
     /// Line exceeded `ClaudeHookLimits.maxLineBytes`.
     case lineTooLong(bytes: Int)
     /// `v` was absent or not a version this build understands.
     case unsupportedVersion(Int?)
     /// Event name we do not know (e.g. from a newer plugin).
-    case unknownEvent(String?)
+    case unknownEvent
     /// Agent name we do not know. Dropped for the same reason as an unknown
-    /// event — and additionally because per-agent channel rules (marker
-    /// emission, session namespacing) cannot be applied to an agent this build
-    /// has never heard of.
-    case unknownAgent(String?)
+    /// event — and additionally because per-agent rules (session namespacing,
+    /// and which arms may speak for it) cannot be applied to an agent this
+    /// build has never heard of.
+    case unknownAgent
     /// Malformed JSON, or a required field missing.
     case malformed
     /// `session_id` was empty — the record cannot be attributed.
@@ -402,7 +543,7 @@ public enum ClaudeHookWireCodec {
         }
         let eventName = dictionary["event"] as? String
         guard let eventName, ClaudeHookEvent(rawValue: eventName) != nil else {
-            throw ClaudeHookWireError.unknownEvent(eventName)
+            throw ClaudeHookWireError.unknownEvent
         }
         // Probed like the event: an unknown agent must be a precise "ignored",
         // not a generic decode failure — and never a fallthrough to `.claude`,
@@ -417,7 +558,7 @@ public enum ClaudeHookWireCodec {
             }
             let agentName = agentValue as? String
             guard let agentName, ClaudeHookAgent(rawValue: agentName) != nil else {
-                throw ClaudeHookWireError.unknownAgent(agentName)
+                throw ClaudeHookWireError.unknownAgent
             }
         }
 
@@ -426,6 +567,11 @@ public enum ClaudeHookWireCodec {
         }
         guard !record.sessionID.isEmpty else {
             throw ClaudeHookWireError.missingSessionID
+        }
+        // A wait that does not say what it waits for is not one this build
+        // can show.
+        if record.event == .notification, record.notificationType == nil {
+            throw ClaudeHookWireError.malformed
         }
         return clamp(record, limits: limits)
     }
@@ -453,6 +599,20 @@ public enum ClaudeHookWireCodec {
 
     static func clamp(_ record: ClaudeHookRecord, limits: ClaudeHookLimits) -> ClaudeHookRecord {
         var clamped = record
+        if let relay = record.promptRelay,
+           !(record.agent == .opencode && record.event == .focusChanged && relay.isWellFormed) {
+            clamped.promptRelay = nil
+        }
+        if record.event != .notification {
+            clamped.notificationType = nil
+        }
+        // A focus record describes a pane, not the session.
+        if record.event == .focusChanged || record.event == .focusCleared {
+            clamped.sessionTitle = nil
+        } else {
+            clamped.sessionTitle = record.sessionTitle.flatMap { cleanTitle($0, limits: limits) }
+        }
+        clamped.promptID = record.event == .userPromptSubmit ? cleanPromptID(record.promptID) : nil
         clamped.sessionID = truncate(record.sessionID, toUTF8Bytes: limits.maxPathBytes)
         clamped.prompt = record.prompt.map { truncate($0, toUTF8Bytes: limits.maxPromptBytes) }
         clamped.rawCwd = record.rawCwd.map { truncate($0, toUTF8Bytes: limits.maxPathBytes) }
@@ -480,15 +640,39 @@ public enum ClaudeHookWireCodec {
             process.bridgeSessionID = process.bridgeSessionID.map {
                 truncate($0, toUTF8Bytes: limits.maxPathBytes)
             }
+            process.desktopSessionID = process.desktopSessionID.map {
+                truncate($0, toUTF8Bytes: limits.maxPathBytes)
+            }
             clamped.process = process
         }
         return clamped
     }
 
+    /// Longest prompt id kept. Vibe's are UUIDs; a longer one is not an id
+    /// this code knows, and truncating it could make two ids equal.
+    public static let maxPromptIDBytes = 128
+
+    /// A prompt id as sent, or nil when empty or too long.
+    public static func cleanPromptID(_ raw: String?) -> String? {
+        guard let raw, !raw.isEmpty, raw.utf8.count <= maxPromptIDBytes else { return nil }
+        return raw
+    }
+
+    /// A title as one line: controls, bidi overrides and zero-width
+    /// characters removed (`ClaudeTextSanitizer`), bounded, nil when nothing
+    /// is left.
+    static func cleanTitle(_ raw: String, limits: ClaudeHookLimits) -> String? {
+        let line = ClaudeTextSanitizer.sanitize(raw, maxBytes: limits.maxTitleBytes)
+            .trimmingCharacters(in: .whitespaces)
+        return line.isEmpty ? nil : line
+    }
+
     /// Truncate on a Character boundary so the result is always valid UTF-8
     /// (a byte-slice truncation could split a multi-byte scalar and produce a
-    /// string that fails to encode).
-    static func truncate(_ value: String, toUTF8Bytes limit: Int) -> String {
+    /// string that fails to encode). Public because the publisher's
+    /// status-line mode bounds `session_id` with the same rule the wire clamp
+    /// applies — one truncation semantic, not two.
+    public static func truncate(_ value: String, toUTF8Bytes limit: Int) -> String {
         guard value.utf8.count > limit else { return value }
         var result = ""
         var used = 0

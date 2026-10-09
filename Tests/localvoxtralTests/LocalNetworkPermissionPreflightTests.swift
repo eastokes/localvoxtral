@@ -4,10 +4,6 @@ import XCTest
 
 @MainActor
 final class LocalNetworkPermissionPreflightTests: XCTestCase {
-    // DictationViewModel owns app-lifetime services whose teardown can race
-    // asynchronous pipe/task callbacks under the full test suite. Keep test
-    // instances alive for the process, matching the other view-model suites.
-    private static var retainedViewModels: [DictationViewModel] = []
     private static var retainedPreflights: [LocalNetworkPermissionPreflight] = []
 
     func testPolicySelectsPrivateAndLocalOnlyEndpoints() throws {
@@ -60,23 +56,21 @@ final class LocalNetworkPermissionPreflightTests: XCTestCase {
     }
 
     func testEndpointEditsProbeOnlyEligibleActiveExternalBackends() {
-        let (settings, suiteName) = makeSettings()
-        defer { UserDefaults.standard.removePersistentDomain(forName: suiteName) }
+        let settings = makeSettings()
         settings.dictationBackendMode = .externalURL
         settings.polishingBackendMode = .externalURL
         settings.llmPolishingEnabled = false
         let preflight = RecordingLocalNetworkPermissionPreflight()
-        let viewModel = DictationViewModel(
+        let engines = EnginesModel(
             settings: settings,
-            localNetworkPermissionPreflight: preflight,
-            startRuntimeServices: false
+            backendManager: OnboardingTestBackendManager(),
+            localNetworkPermissionPreflight: preflight
         )
-        Self.retainedViewModels.append(viewModel)
 
-        viewModel.applyRealtimeEndpointChange("ws://192.168.1.20:8000/v1/realtime")
-        viewModel.applyLLMPolishingEndpointChange("http://10.0.0.9:8080/v1/chat/completions")
-        viewModel.applyRealtimeEndpointChange("ws://127.0.0.1:8000/v1/realtime")
-        viewModel.applyLLMPolishingEndpointChange("https://api.example.com/v1/chat/completions")
+        engines.applyRealtimeEndpointChange("ws://192.168.1.20:8000/v1/realtime")
+        engines.applyLLMPolishingEndpointChange("http://10.0.0.9:8080/v1/chat/completions")
+        engines.applyRealtimeEndpointChange("ws://127.0.0.1:8000/v1/realtime")
+        engines.applyLLMPolishingEndpointChange("https://api.example.com/v1/chat/completions")
 
         XCTAssertEqual(
             preflight.requests.map(\.endpoint.absoluteString),
@@ -92,25 +86,23 @@ final class LocalNetworkPermissionPreflightTests: XCTestCase {
     }
 
     func testEndpointEditWhileManagedWaitsUntilExternalModeSwitch() {
-        let (settings, suiteName) = makeSettings()
-        defer { UserDefaults.standard.removePersistentDomain(forName: suiteName) }
+        let settings = makeSettings()
         settings.dictationBackendMode = .managedLocal
         settings.polishingBackendMode = .managedLocal
         settings.llmPolishingEnabled = false
         let preflight = RecordingLocalNetworkPermissionPreflight()
-        let viewModel = DictationViewModel(
+        let engines = EnginesModel(
             settings: settings,
-            localNetworkPermissionPreflight: preflight,
-            startRuntimeServices: false
+            backendManager: OnboardingTestBackendManager(),
+            localNetworkPermissionPreflight: preflight
         )
-        Self.retainedViewModels.append(viewModel)
 
-        viewModel.applyRealtimeEndpointChange("ws://192.168.2.30:8000/v1/realtime")
-        viewModel.applyLLMPolishingEndpointChange("http://10.2.0.4:8080/v1/chat/completions")
+        engines.applyRealtimeEndpointChange("ws://192.168.2.30:8000/v1/realtime")
+        engines.applyLLMPolishingEndpointChange("http://10.2.0.4:8080/v1/chat/completions")
         XCTAssertTrue(preflight.requests.isEmpty)
 
-        viewModel.applyDictationBackendModeChange(.externalURL)
-        viewModel.applyPolishingBackendModeChange(.externalURL)
+        engines.applyDictationBackendModeChange(.externalURL)
+        engines.applyPolishingBackendModeChange(.externalURL)
 
         XCTAssertEqual(
             preflight.requests.map(\.endpoint.absoluteString),
@@ -122,22 +114,20 @@ final class LocalNetworkPermissionPreflightTests: XCTestCase {
     }
 
     func testConfiguredExternalEndpointsArePreflightedBeforeUse() {
-        let (settings, suiteName) = makeSettings()
-        defer { UserDefaults.standard.removePersistentDomain(forName: suiteName) }
+        let settings = makeSettings()
         settings.dictationBackendMode = .externalURL
         settings.polishingBackendMode = .externalURL
         settings.realtimeAPIEndpointURL = "ws://192.168.3.5:8000/v1/realtime"
         settings.llmPolishingEndpointURL = "http://polisher.local:8080/v1/chat/completions"
         settings.llmPolishingEnabled = false
         let preflight = RecordingLocalNetworkPermissionPreflight()
-        let viewModel = DictationViewModel(
+        let engines = EnginesModel(
             settings: settings,
-            localNetworkPermissionPreflight: preflight,
-            startRuntimeServices: false
+            backendManager: OnboardingTestBackendManager(),
+            localNetworkPermissionPreflight: preflight
         )
-        Self.retainedViewModels.append(viewModel)
 
-        viewModel.preflightConfiguredLocalNetworkEndpoints()
+        engines.preflightConfiguredLocalNetworkEndpoints()
 
         XCTAssertEqual(
             preflight.requests.map(\.endpoint.absoluteString),
@@ -173,13 +163,6 @@ final class LocalNetworkPermissionPreflightTests: XCTestCase {
         }
     }
 
-    private func makeSettings() -> (SettingsStore, String) {
-        let suiteName = "localvoxtral.LocalNetworkPreflight.\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suiteName)!
-        defaults.removePersistentDomain(forName: suiteName)
-        return (SettingsStore(defaults: defaults, environment: [:]), suiteName)
-    }
-
     func testProductionPreflightDedupesRepeatedTargetsWithoutOpeningConnections() throws {
         let preflight = LocalNetworkPermissionPreflight()
         Self.retainedPreflights.append(preflight)
@@ -196,21 +179,5 @@ final class LocalNetworkPermissionPreflightTests: XCTestCase {
 
         XCTAssertEqual(probed.map(\.host), ["192.168.50.4", "192.168.50.4"])
         XCTAssertEqual(probed.map(\.port), [8000, 8080])
-    }
-}
-
-@MainActor
-private final class RecordingLocalNetworkPermissionPreflight:
-    LocalNetworkPermissionPreflighting
-{
-    struct Request {
-        let endpoint: URL
-        let reason: String
-    }
-
-    private(set) var requests: [Request] = []
-
-    func preflight(endpoint: URL, reason: String) {
-        requests.append(Request(endpoint: endpoint, reason: reason))
     }
 }

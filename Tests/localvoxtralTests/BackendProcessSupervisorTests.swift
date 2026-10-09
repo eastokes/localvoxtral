@@ -2,10 +2,23 @@ import Darwin
 import Foundation
 import Synchronization
 import XCTest
+
+import localvoxtralTestSupport
 @testable import localvoxtral
 
 @MainActor
 final class BackendProcessSupervisorTests: XCTestCase {
+    /// A helper may print what it transcribes, so its output lines log their
+    /// origin and length public and their text not.
+    func testAHelperOutputLineLogsItsOriginPublicAndItsTextNot() {
+        XCTAssertEqual(
+            BackendProcessSupervisor.publicOutputLogDescription(
+                name: "speechd", source: "stderr", line: "partial: the words I dictated"
+            ),
+            "[speechd stderr] 29 characters"
+        )
+    }
+
     func testHappyPathWaitsForReadinessThenRuns() async throws {
         let directory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -74,6 +87,157 @@ final class BackendProcessSupervisorTests: XCTestCase {
         XCTAssertTrue(summary.contains("port already in use"))
         XCTAssertNil(detail)
         XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+    }
+
+    /// Another process binds the port while the helper loads and answers
+    /// the readiness probe: the supervisor refuses it and stops the child
+    /// instead of reporting a backend it does not own as running (#1760).
+    func testAForeignListenerThatAnswersReadinessIsRefused() async throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let pidFile = directory.appendingPathComponent("pid")
+        let script = try writeScript(
+            in: directory,
+            name: "backend.sh",
+            body: """
+            #!/bin/sh
+            echo $$ > "\(pidFile.path)"
+            trap 'exit 0' TERM
+            while true; do sleep 1; done
+            """
+        )
+        let supervisor = makeSupervisor(
+            executableURL: script,
+            readinessReportsOwnerPID: true,
+            probe: Self.readyOnceSpawned(),
+            ownerProbe: { _ in 1 },
+            sleepFor: { _ in }
+        )
+        let watcher = StateWatcher(stream: supervisor.stateUpdates)
+        defer { watcher.cancel() }
+
+        await supervisor.start()
+        let state = try await watcher.waitForState { state in
+            switch state {
+            case .failed, .running: return true
+            default: return false
+            }
+        }
+
+        guard case let .failed(summary, _) = state else {
+            await supervisor.stop()
+            return XCTFail("expected the foreign listener refused, got \(state)")
+        }
+        XCTAssertTrue(summary.contains("port already in use"), summary)
+        if let pid = try readPID(from: pidFile) {
+            XCTAssertFalse(isProcessRunning(pid))
+        }
+    }
+
+    /// The child answers readiness, then dies before the owner check: that is
+    /// a crash to restart, not a foreign listener on the port. The probes
+    /// read the child's pid from the supervisor, not from a file the child
+    /// writes: a shell's `echo $$ > file` creates the file before it writes
+    /// the pid, and an owner probe that read it empty killed nothing and
+    /// waited out the test (#1794).
+    func testAChildThatDiesDuringTheOwnerCheckRestarts() async throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let script = try writeScript(
+            in: directory,
+            name: "backend.sh",
+            body: """
+            #!/bin/sh
+            trap 'exit 0' TERM
+            while true; do sleep 1; done
+            """
+        )
+        let exitHandled = BoundedWait()
+        let child = SupervisedChild()
+        let supervisor = makeSupervisor(
+            executableURL: script,
+            readinessTimeout: .seconds(3_600),
+            readinessReportsOwnerPID: true,
+            // Not ready before the spawn (the port check), ready once the
+            // child runs.
+            probe: { _ in await child.pid() != nil },
+            ownerProbe: { _ in
+                if let pid = await child.pid() { kill(pid, SIGKILL) }
+                _ = await exitHandled.value(failAfter: 10)
+                return nil
+            },
+            sleepFor: { _ in await Task.yield() }
+        )
+        child.supervisor = supervisor
+        supervisor.debugProcessExitHandled = { _ in exitHandled.resolve() }
+        let watcher = StateWatcher(stream: supervisor.stateUpdates)
+        defer { watcher.cancel() }
+
+        await supervisor.start()
+        let state = try await watcher.waitForState { state in
+            switch state {
+            case .failed, .restarting: return true
+            default: return false
+            }
+        }
+        await supervisor.stop()
+
+        XCTAssertEqual(state, .restarting(attempt: 1))
+    }
+
+    /// The listener that answers is the child: it runs as before. A shell's
+    /// `echo $$ > file` creates the file before it writes the pid (#1830):
+    /// the child holds that empty file until the probe has seen it, so the
+    /// readiness check meets it every run.
+    func testAReadyChildThatReportsItsOwnPIDRuns() async throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let pidFile = directory.appendingPathComponent("pid")
+        let release = try FifoGate(at: directory.appendingPathComponent("release"))
+        let script = try writeScript(
+            in: directory,
+            name: "backend.sh",
+            body: """
+            #!/bin/sh
+            : > "\(pidFile.path)"
+            read _ < "\(release.url.path)"
+            echo $$ > "\(pidFile.path)"
+            trap 'exit 0' TERM
+            while true; do sleep 1; done
+            """
+        )
+        let writtenPID: @Sendable () -> pid_t? = {
+            (try? String(contentsOf: pidFile, encoding: .utf8))
+                .flatMap { pid_t($0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        }
+        let released = LockedValue(false)
+        let supervisor = makeSupervisor(
+            executableURL: script,
+            // Polls until the child wrote its pid; the yields count no time.
+            readinessTimeout: .seconds(3_600),
+            readinessReportsOwnerPID: true,
+            probe: { _ in
+                if writtenPID() != nil { return true }
+                if FileManager.default.fileExists(atPath: pidFile.path),
+                   released.withLock({ done in defer { done = true }; return !done }) {
+                    release.releaseOne()
+                }
+                return false
+            },
+            ownerProbe: { _ in writtenPID() },
+            sleepFor: { _ in await Task.yield() }
+        )
+        let watcher = StateWatcher(stream: supervisor.stateUpdates)
+        defer { watcher.cancel() }
+
+        await supervisor.start()
+
+        _ = try await watcher.waitForState(.running)
+        await supervisor.stop()
+        XCTAssertTrue(released.value, "the probe met the empty pid file")
     }
 
     func testReadinessTimeoutFailsAndTerminatesChild() async throws {
@@ -190,6 +354,10 @@ final class BackendProcessSupervisorTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: directory) }
 
         let countFile = directory.appendingPathComponent("count")
+        // Each child stays alive after writing its count until the test
+        // releases it: the ordering #753 hit under load, where the count
+        // exists but the exit has not reached the supervisor yet.
+        let release = try FifoGate(at: directory.appendingPathComponent("release"))
         let script = try writeScript(
             in: directory,
             name: "backend.sh",
@@ -201,11 +369,14 @@ final class BackendProcessSupervisorTests: XCTestCase {
             fi
             count=$((count + 1))
             echo "$count" > "\(countFile.path)"
+            read _ < "\(release.url.path)"
             echo "fatal backend failure $count" >&2
             exit 7
             """
         )
-        let sleeps = SpawnAwareRecordingSleep(countFile: countFile)
+        let sleeps = ExitGatedSleep(readinessPollInterval: .milliseconds(10)) {
+            release.releaseOne()
+        }
         let supervisor = makeSupervisor(
             executableURL: script,
             readinessPollInterval: .milliseconds(10),
@@ -213,6 +384,7 @@ final class BackendProcessSupervisorTests: XCTestCase {
             probe: { _ in false },
             sleepFor: { duration in try await sleeps.sleep(duration) }
         )
+        sleeps.attach(to: supervisor)
         let watcher = StateWatcher(stream: supervisor.stateUpdates)
         defer { watcher.cancel() }
 
@@ -244,11 +416,17 @@ final class BackendProcessSupervisorTests: XCTestCase {
         let script = try writeScript(
             in: directory,
             name: "backend.sh",
+            // Same ordering rule as testStopHonorsTERMWithoutRestarting: arm
+            // the trap BEFORE announcing readiness. This script had it the
+            // other way round, so the supervisor could observe readiness and
+            // send TERM while the shell was still between the two lines, with
+            // the default disposition in force. Nothing asserted on the
+            // difference here, which is exactly why it went unnoticed.
             body: """
             #!/bin/sh
             if [ -f "\(succeedMarker.path)" ]; then
-              touch "\(readyMarker.path)"
               trap 'exit 0' TERM
+              : > "\(readyMarker.path)"
               while true; do sleep 1; done
             fi
             echo "intentional fast failure" >&2
@@ -287,6 +465,87 @@ final class BackendProcessSupervisorTests: XCTestCase {
         await supervisor.stop()
     }
 
+    /// #1306: a helper that crashes soon after every ready transition (the
+    /// prompt warmup crashing it, say) used to have its count reset by each
+    /// readiness, so it restarted forever on the first backoff step.
+    func testRepeatedCrashesAfterReadinessReachFailureLimit() async throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let countFile = directory.appendingPathComponent("count")
+        let release = try FifoGate(at: directory.appendingPathComponent("release"))
+        let script = try writeCrashAfterReleaseScript(in: directory, countFile: countFile, release: release)
+        let sleeps = RecordingSleep()
+        let supervisor = makeSupervisor(
+            executableURL: script,
+            maxConsecutiveRestartFailures: 3,
+            probe: Self.readyOnceSpawned(),
+            sleepFor: { duration in try await sleeps.sleep(duration) }
+        )
+        let watcher = StateWatcher(stream: supervisor.stateUpdates)
+        defer { watcher.cancel() }
+        let runs = RunGate(stream: supervisor.stateUpdates) { _ in release.releaseOne() }
+        defer { runs.cancel() }
+
+        await supervisor.start()
+        let state: BackendProcessSupervisor.State
+        do {
+            state = try await watcher.waitForState { state in
+                if case .failed = state { return true }
+                return false
+            }
+        } catch {
+            await supervisor.stop()
+            throw error
+        }
+
+        guard case let .failed(summary, _) = state else {
+            return XCTFail("expected failed state, got \(state)")
+        }
+        XCTAssertEqual(summary, "test-backend exited 3 consecutive times.")
+        XCTAssertEqual(runs.runningCount, 3)
+        XCTAssertEqual(try readCount(from: countFile), 3)
+        XCTAssertEqual(sleeps.recordedDurations, [.milliseconds(500), .seconds(1)])
+    }
+
+    /// A helper that stayed ready for the healthy-run duration before it
+    /// crashed starts a new count: it restarts on the first backoff step
+    /// instead of failing.
+    func testACrashAfterALongHealthyRunRestartsFromTheFirstAttempt() async throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let countFile = directory.appendingPathComponent("count")
+        let release = try FifoGate(at: directory.appendingPathComponent("release"))
+        let script = try writeCrashAfterReleaseScript(in: directory, countFile: countFile, release: release)
+        let clock = ManualSessionClock()
+        let supervisor = makeSupervisor(
+            executableURL: script,
+            maxConsecutiveRestartFailures: 2,
+            healthyRunDuration: .seconds(60),
+            probe: Self.readyOnceSpawned(),
+            sleepFor: { _ in await Task.yield() },
+            now: clock.clock.now
+        )
+        let runs = RunGate(stream: supervisor.stateUpdates) { run in
+            // The first run crashes at once and the second after a minute
+            // ready; the third is left running.
+            if run == 2 { clock.advance(by: 60) }
+            if run < 3 { release.releaseOne() }
+        }
+        defer { runs.cancel() }
+
+        await supervisor.start()
+        let reachedThirdRun = await runs.waitForRun(3)
+        await supervisor.stop()
+
+        XCTAssertTrue(reachedThirdRun, "the helper did not restart after its healthy run; it went through \(runs.states)")
+        XCTAssertEqual(
+            runs.states.filter { if case .restarting = $0 { true } else { false } },
+            [.restarting(attempt: 1), .restarting(attempt: 1)]
+        )
+    }
+
     func testStopHonorsTERMWithoutRestarting() async throws {
         let directory = try makeTemporaryDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -296,15 +555,26 @@ final class BackendProcessSupervisorTests: XCTestCase {
         let script = try writeScript(
             in: directory,
             name: "backend.sh",
+            // `: > file`, not `touch file`. `touch` is /usr/bin/touch: a fork
+            // AND an exec inside the TERM handler, i.e. in the exact window
+            // where the supervisor is deciding whether to escalate to SIGKILL.
+            // A redirection creates the file in-process, so the child needs one
+            // scheduling slice rather than a whole process spawn.
+            //
+            // ORDER IS LOAD-BEARING: the trap is armed BEFORE the ready marker
+            // exists, so "ready" means "this shell will handle TERM itself".
+            // Reversed, the supervisor could see readiness and send TERM while
+            // the default disposition is still in force, and the child would
+            // die without ever running the handler.
             body: """
             #!/bin/sh
-            trap 'touch "\(termMarker.path)"; exit 0' TERM
-            touch "\(readyMarker.path)"
+            trap ': > "\(termMarker.path)"; exit 0' TERM
+            : > "\(readyMarker.path)"
             while true; do sleep 1 & wait $!; done
             """
         )
         let probe = LockedValue(false)
-        let sleeps = TerminationAwareSleep(readyMarker: readyMarker)
+        let sleeps = TerminationAwareSleep(termMarker: termMarker, readyMarker: readyMarker)
         let supervisor = makeSupervisor(
             executableURL: script,
             readinessPollInterval: .milliseconds(10),
@@ -335,13 +605,18 @@ final class BackendProcessSupervisorTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: directory) }
 
         let pidFile = directory.appendingPathComponent("pid")
+        // The pid file is the ready marker, written only once TERM is ignored:
+        // written first, a TERM landing between the two lines killed the
+        // shell outright, nothing escalated, and the 2 ms grace sleep was
+        // never requested (seen with suites in parallel, #442). Same
+        // handshake as `testStopHonorsTERMWithoutRestarting`'s.
         let script = try writeScript(
             in: directory,
             name: "backend.sh",
             body: """
             #!/bin/sh
-            echo $$ > "\(pidFile.path)"
             trap '' TERM
+            echo $$ > "\(pidFile.path)"
             while true; do sleep 1; done
             """
         )
@@ -349,9 +624,25 @@ final class BackendProcessSupervisorTests: XCTestCase {
         let sleeps = ControlledSleep()
         let supervisor = makeSupervisor(
             executableURL: script,
+            readinessPollInterval: .milliseconds(20),
+            readinessTimeout: .seconds(600),
             terminationGracePeriod: .milliseconds(2),
-            probe: { _ in probe.value },
-            sleepFor: { duration in try await sleeps.sleep(duration) }
+            probe: { _ in probe.value && FileManager.default.fileExists(atPath: pidFile.path) },
+            sleepFor: { duration in
+                if duration == .milliseconds(20) {
+                    await TerminationAwareSleep.waitForFile(pidFile)
+                    return
+                }
+                // The 10 ms slices after SIGKILL wait for Foundation to reap
+                // the shell, which only real time brings: returned at once,
+                // their hundred iterations ran out before the reap on a
+                // loaded runner and `stop()` came back with the shell alive.
+                if duration == .milliseconds(10) {
+                    try await Task.sleep(for: duration)
+                    return
+                }
+                try await sleeps.sleep(duration)
+            }
         )
         let watcher = StateWatcher(stream: supervisor.stateUpdates)
         defer { watcher.cancel() }
@@ -377,8 +668,12 @@ final class BackendProcessSupervisorTests: XCTestCase {
         readinessTimeout: Duration = .seconds(5),
         terminationGracePeriod: Duration = .milliseconds(100),
         maxConsecutiveRestartFailures: Int = 5,
+        healthyRunDuration: Duration = .seconds(60),
+        readinessReportsOwnerPID: Bool = false,
         probe: @escaping @Sendable (URL) async -> Bool,
-        sleepFor: @escaping @Sendable (Duration) async throws -> Void
+        ownerProbe: @escaping @Sendable (URL) async -> pid_t? = { _ in nil },
+        sleepFor: @escaping @Sendable (Duration) async throws -> Void,
+        now: @escaping @Sendable () -> Date = ManualSessionClock().clock.now
     ) -> BackendProcessSupervisor {
         BackendProcessSupervisor(
             configuration: BackendProcessConfiguration(
@@ -390,11 +685,48 @@ final class BackendProcessSupervisorTests: XCTestCase {
                 readinessPollInterval: readinessPollInterval,
                 readinessTimeout: readinessTimeout,
                 terminationGracePeriod: terminationGracePeriod,
-                maxConsecutiveRestartFailures: maxConsecutiveRestartFailures
+                maxConsecutiveRestartFailures: maxConsecutiveRestartFailures,
+                healthyRunDuration: healthyRunDuration,
+                readinessReportsOwnerPID: readinessReportsOwnerPID
             ),
             probe: probe,
-            sleepFor: sleepFor
+            ownerProbe: ownerProbe,
+            sleepFor: sleepFor,
+            now: now
         )
+    }
+
+    /// A child that counts its launch, waits for one release from the
+    /// test, then crashes.
+    private func writeCrashAfterReleaseScript(in directory: URL, countFile: URL, release: FifoGate) throws -> URL {
+        try writeScript(
+            in: directory,
+            name: "backend.sh",
+            body: """
+            #!/bin/sh
+            count=0
+            if [ -f "\(countFile.path)" ]; then
+              count=$(cat "\(countFile.path)")
+            fi
+            count=$((count + 1))
+            echo "$count" > "\(countFile.path)"
+            read _ < "\(release.url.path)"
+            echo "crashed after readiness $count" >&2
+            exit 7
+            """
+        )
+    }
+
+    /// Not ready before the first spawn (the supervisor's port check), ready
+    /// at every readiness poll after it.
+    private static func readyOnceSpawned() -> @Sendable (URL) async -> Bool {
+        let calls = LockedValue(0)
+        return { _ in
+            calls.withLock { count in
+                count += 1
+                return count > 1
+            }
+        }
     }
 
     private func makeTemporaryDirectory() throws -> URL {
@@ -427,6 +759,15 @@ final class BackendProcessSupervisorTests: XCTestCase {
     }
 }
 
+/// The supervisor's child pid, for probes that run off the main actor.
+private final class SupervisedChild: @unchecked Sendable {
+    @MainActor weak var supervisor: BackendProcessSupervisor?
+
+    func pid() async -> pid_t? {
+        await MainActor.run { supervisor?.processID }
+    }
+}
+
 private final class StateWatcher: @unchecked Sendable {
     private let storage = Mutex(Storage())
     private var task: Task<Void, Never>?
@@ -456,6 +797,11 @@ private final class StateWatcher: @unchecked Sendable {
             }
             group.addTask {
                 try await Task.sleep(for: timeout)
+                // Said here rather than left to the thrown error: XCTest can
+                // report a thrown error as the last one a try? swallowed, and
+                // #753's timeout read as "the file count couldn't be opened".
+                let seen = self.storage.withLock { $0.states }
+                XCTFail("no matching state within \(timeout); the supervisor went through \(seen)")
                 throw WaitTimeout()
             }
 
@@ -506,17 +852,24 @@ private final class StateWatcher: @unchecked Sendable {
         let id = UUID()
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
-                let state: BackendProcessSupervisor.State? = storage.withLock { storage in
+                // Registered under the same lock the cancel handler takes, and
+                // only while the task is live: a task cancelled before this
+                // point has had its handler run against an empty waiter list,
+                // so a waiter appended now would never be resumed.
+                let outcome: Result<BackendProcessSupervisor.State, Error>? = storage.withLock { storage in
                     if let state = storage.states.first(where: predicate) {
-                        return state
+                        return .success(state)
+                    }
+                    if Task.isCancelled {
+                        return .failure(CancellationError())
                     }
                     storage.waiters.append(
                         Waiter(id: id, predicate: predicate, continuation: continuation)
                     )
                     return nil
                 }
-                if let state {
-                    continuation.resume(returning: state)
+                if let outcome {
+                    continuation.resume(with: outcome)
                 }
             }
         } onCancel: {
@@ -542,7 +895,93 @@ private final class StateWatcher: @unchecked Sendable {
     }
 }
 
+/// Calls `onRunning` with the run's number each time the supervisor reports
+/// `.running`, so a test decides when each ready child exits.
+@MainActor
+private final class RunGate {
+    private(set) var states: [BackendProcessSupervisor.State] = []
+    private(set) var runningCount = 0
+    private var task: Task<Void, Never>?
+    private var runWaiters: [(run: Int, wait: BoundedWait)] = []
+
+    init(
+        stream: AsyncStream<BackendProcessSupervisor.State>,
+        onRunning: @escaping @MainActor (Int) -> Void
+    ) {
+        task = Task { @MainActor [weak self] in
+            for await state in stream {
+                guard let self else { return }
+                self.states.append(state)
+                guard state == .running else { continue }
+                self.runningCount += 1
+                onRunning(self.runningCount)
+                let count = self.runningCount
+                let reached = self.runWaiters.filter { $0.run <= count }
+                self.runWaiters.removeAll { $0.run <= count }
+                reached.forEach { $0.wait.resolve() }
+            }
+        }
+    }
+
+    /// True once the `run`th `.running` arrived; false after the failure bound.
+    func waitForRun(_ run: Int) async -> Bool {
+        let wait = BoundedWait()
+        if runningCount >= run {
+            wait.resolve()
+        } else {
+            runWaiters.append((run, wait))
+        }
+        return await wait.value(failAfter: 10)
+    }
+
+    func cancel() {
+        task?.cancel()
+        task = nil
+    }
+}
+
 private struct WaitTimeout: Error {}
+
+/// A fifo a child script waits at with `read _ < fifo`. The test holds it
+/// open for reading and writing, so a child's open never waits for a peer, and
+/// a release is one newline in the fifo's buffer: sent before the child
+/// reaches its `read`, it waits there. The earlier release opened the fifo for
+/// writing and closed it, and the child waited for end-of-file. Under parallel
+/// load that end-of-file sometimes never came, though the open and close had
+/// both succeeded, and the child sat in `read` until the test timed out
+/// (#984). A newline ends a `read` whatever else holds the fifo open.
+private final class FifoGate: Sendable {
+    let url: URL
+    private let descriptor: Int32
+
+    init(at url: URL) throws {
+        guard mkfifo(url.path, 0o600) == 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        // A fifo opened for both reading and writing does not wait for a peer.
+        let descriptor = open(url.path, O_RDWR | O_CLOEXEC)
+        guard descriptor >= 0 else {
+            throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+        }
+        self.url = url
+        self.descriptor = descriptor
+    }
+
+    deinit {
+        close(descriptor)
+    }
+
+    /// Lets exactly one `read _ < fifo` through: `sh` reads a pipe one byte at
+    /// a time, so one newline ends one `read`.
+    func releaseOne() {
+        var newline = UInt8(ascii: "\n")
+        var written: Int
+        repeat {
+            written = write(descriptor, &newline, 1)
+        } while written == -1 && errno == EINTR
+        precondition(written == 1, "fifo release failed: \(String(cString: strerror(errno)))")
+    }
+}
 
 private final class LockedValue<Value>: @unchecked Sendable {
     private let lock = NSLock()
@@ -564,6 +1003,14 @@ private final class LockedValue<Value>: @unchecked Sendable {
             lock.unlock()
         }
     }
+
+    /// Read-modify-write under one acquisition, for the check-then-set a
+    /// separate `get` and `set` cannot express atomically.
+    func withLock<Result>(_ body: (inout Value) -> Result) -> Result {
+        lock.lock()
+        defer { lock.unlock() }
+        return body(&storage)
+    }
 }
 
 private final class RecordingSleep: @unchecked Sendable {
@@ -581,52 +1028,101 @@ private final class RecordingSleep: @unchecked Sendable {
     }
 }
 
-private final class SpawnAwareRecordingSleep: @unchecked Sendable {
-    private let durations = LockedValue<[Duration]>([])
-    private let countFile: URL
-    private let lastObservedCount = LockedValue(0)
-    private let awaitingNextSpawn = LockedValue(true)
+/// Sleeps for a crash-loop test. A readiness poll does not return until the
+/// supervisor has handled the running child's exit, so the fake clock cannot
+/// run out the readiness timeout while the child is still starting or exiting,
+/// however loaded the machine (#753). Every other sleep is recorded and
+/// returns at once. Only for children that exit on their own.
+private final class ExitGatedSleep: @unchecked Sendable {
+    private let readinessPollInterval: Duration
+    private let onAwaitingExit: @Sendable () -> Void
+    private let storage = Mutex(Storage())
+    private weak var supervisor: BackendProcessSupervisor?
 
-    init(countFile: URL) {
-        self.countFile = countFile
+    /// `onAwaitingExit` runs each time a readiness poll suspends for a child
+    /// that has not exited yet.
+    init(readinessPollInterval: Duration, onAwaitingExit: @escaping @Sendable () -> Void) {
+        self.readinessPollInterval = readinessPollInterval
+        self.onAwaitingExit = onAwaitingExit
     }
 
     var recordedDurations: [Duration] {
-        durations.value
+        storage.withLock { $0.durations }
+    }
+
+    @MainActor
+    func attach(to supervisor: BackendProcessSupervisor) {
+        self.supervisor = supervisor
+        supervisor.debugProcessExitHandled = { [self] pid in
+            recordHandledExit(of: pid)
+        }
     }
 
     func sleep(_ duration: Duration) async throws {
-        var recorded = durations.value
-        recorded.append(duration)
-        durations.value = recorded
-
-        guard duration == .milliseconds(10) else {
-            awaitingNextSpawn.value = true
+        storage.withLock { $0.durations.append(duration) }
+        guard duration == readinessPollInterval,
+              let pid = await MainActor.run(body: { supervisor?.processID })
+        else {
             await Task.yield()
             return
         }
-
-        guard awaitingNextSpawn.value else {
-            await Task.yield()
-            return
-        }
-
-        while !Task.isCancelled {
-            let count = currentCount()
-            if count > lastObservedCount.value {
-                lastObservedCount.value = count
-                awaitingNextSpawn.value = false
-                return
-            }
-            await Task.yield()
-        }
-
-        throw CancellationError()
+        try await waitForHandledExit(of: pid)
     }
 
-    private func currentCount() -> Int {
-        guard let text = try? String(contentsOf: countFile, encoding: .utf8) else { return 0 }
-        return Int(text.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
+    private func recordHandledExit(of pid: pid_t) {
+        let continuations = storage.withLock { storage in
+            storage.handledExits.insert(pid)
+            let released = storage.waiters.filter { $0.pid == pid }.map(\.continuation)
+            storage.waiters.removeAll { $0.pid == pid }
+            return released
+        }
+        for continuation in continuations {
+            continuation.resume()
+        }
+    }
+
+    private func waitForHandledExit(of pid: pid_t) async throws {
+        let id = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                // Same cancel-before-suspend rule as StateWatcher.wait.
+                let outcome: Result<Void, Error>? = storage.withLock { storage in
+                    if storage.handledExits.contains(pid) {
+                        return .success(())
+                    }
+                    if Task.isCancelled {
+                        return .failure(CancellationError())
+                    }
+                    storage.waiters.append(Waiter(id: id, pid: pid, continuation: continuation))
+                    return nil
+                }
+                if let outcome {
+                    continuation.resume(with: outcome)
+                } else {
+                    onAwaitingExit()
+                }
+            }
+        } onCancel: {
+            let continuation = storage.withLock { storage in
+                guard let index = storage.waiters.firstIndex(where: { $0.id == id }) else {
+                    return nil as CheckedContinuation<Void, Error>?
+                }
+                return storage.waiters.remove(at: index).continuation
+            }
+            continuation?.resume(throwing: CancellationError())
+        }
+    }
+
+    private struct Waiter: Sendable {
+        var id: UUID
+        var pid: pid_t
+        var continuation: CheckedContinuation<Void, Error>
+    }
+
+    private struct Storage: Sendable {
+        var durations: [Duration] = []
+        var handledExits: Set<pid_t> = []
+        var waiters: [Waiter] = []
     }
 }
 
@@ -707,34 +1203,99 @@ private final class ControlledSleep: @unchecked Sendable {
 
 private final class TerminationAwareSleep: @unchecked Sendable {
     private let controlledSleep = ControlledSleep()
+    private let termMarker: URL
     private let readyMarker: URL
 
-    init(readyMarker: URL) {
+    init(termMarker: URL, readyMarker: URL) {
+        self.termMarker = termMarker
         self.readyMarker = readyMarker
     }
 
+    // Both arms stand in for a real sleep the supervisor performs while waiting
+    // on a REAL child process, so what they must express is "until the child
+    // did the thing", not "for a while".
+    //
+    // They used to spin `for _ in 0 ..< 1_000 { await Task.yield() }` and then
+    // RETURN whether or not the marker had appeared. That budget, not any
+    // clock, is what decided the test: the supervisor's grace loop is a single
+    // 100 ms slice, so when this returned early the very next statement was
+    // `if process.isRunning { SIGKILL }` — killing the child before it could
+    // run its TERM handler, and `termMarker` never appeared.
+    //
+    // And 1000 yields is not "a moment": `Task.yield()` only reschedules on the
+    // cooperative pool, so with nothing else runnable the whole budget elapses
+    // in about a millisecond of wall-clock while spinning a core the child
+    // needs. Measured on the hosted lane (3-core shared VM), that lost the race
+    // 14 times in 20.
+    //
+    // So: wait for the actual filesystem event instead. No polling, no spin, no
+    // budget to tune — it returns the moment the marker exists and not before.
+    // A child that genuinely never writes it hangs the test, which XCTest's own
+    // timeout turns into a failure with `run-supervised-command.sh`'s stack
+    // sample attached; that is the correct bound and the correct diagnostic,
+    // where the old budget silently converted "not yet" into "SIGKILL it".
     func sleep(_ duration: Duration) async throws {
         if duration == .milliseconds(10) {
-            for _ in 0 ..< 1_000 {
-                if FileManager.default.fileExists(atPath: readyMarker.path) {
-                    return
-                }
+            await Self.waitForFile(readyMarker)
+            return
+        }
+
+        if duration == .milliseconds(100) {
+            await Self.waitForFile(termMarker)
+            return
+        }
+
+        try await controlledSleep.sleep(duration)
+    }
+
+    /// Returns once `url` exists, driven by a directory write event rather than
+    /// by polling.
+    static func waitForFile(_ url: URL) async {
+        if FileManager.default.fileExists(atPath: url.path) { return }
+
+        let directory = url.deletingLastPathComponent()
+        let descriptor = open(directory.path, O_EVTONLY)
+        guard descriptor >= 0 else {
+            // No watch possible. Fall back to yielding rather than returning
+            // immediately, which would reinstate the early-SIGKILL bug.
+            while !FileManager.default.fileExists(atPath: url.path) {
                 await Task.yield()
             }
             return
         }
 
-        if duration == .milliseconds(100) {
-            // This path waits on a real child process. Yield-only polling
-            // fast-forwards the supervisor's whole grace period before /bin/sh
-            // gets scheduled to run its TERM trap, causing a false SIGKILL.
-            // Keep the production-sized wait here; the marker assertion below
-            // proves the child handled TERM within that grace period.
-            try await Task.sleep(for: duration)
-            return
-        }
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: descriptor,
+            eventMask: [.write, .extend, .attrib],
+            queue: .global()
+        )
+        let resumed = LockedValue(false)
 
-        try await controlledSleep.sleep(duration)
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            // One-shot: the event handler can fire more than once (any write to
+            // the directory), and the pre-arm check below can race with it.
+            let finish: @Sendable () -> Void = {
+                var shouldResume = false
+                resumed.withLock { alreadyResumed in
+                    if !alreadyResumed {
+                        alreadyResumed = true
+                        shouldResume = true
+                    }
+                }
+                if shouldResume {
+                    source.cancel()
+                    continuation.resume()
+                }
+            }
+            source.setEventHandler {
+                if FileManager.default.fileExists(atPath: url.path) { finish() }
+            }
+            source.setCancelHandler { close(descriptor) }
+            source.resume()
+            // The marker may have appeared between the check above and the
+            // source being armed; that event is gone, so look once more.
+            if FileManager.default.fileExists(atPath: url.path) { finish() }
+        }
     }
 
     func resumeAll() {

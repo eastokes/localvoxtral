@@ -1,12 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# `lv_open`: `open`, plus the env the CI lanes need the app to see.
+# shellcheck source=scripts/lib/launch-app.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/launch-app.sh"
+
 # Regenerate the README screenshots:
 #   assets/popover.png                     (menu bar menu)
 #   assets/settings-general.png            (Settings > General)
-#   assets/settings-endpoints.png          (Settings > Endpoints)
+#   assets/settings-endpoints.png          (Settings > Engines)
 #   assets/settings-dictation.png          (Settings > Dictation)
 #   assets/settings-text-processing.png    (Settings > Text Processing)
+#   assets/settings-integrations-*.png     (Settings > Integrations section:
+#                                          Context, Claude Code, opencode, Mistral Vibe,
+#                                          herdr)
+#   assets/settings-terminal-*.png         (Settings > Terminals section, one
+#                                          pane per terminal)
+#   assets/settings-enrollment.png         (the remote-SSH enrollment sheet)
+#
+# settings-enrollment.png is deliberately NOT in the README table — it exists
+# for docs and PR bodies. It is captured from a SAMPLE sheet armed by the
+# hidden `debug.enrollment_sheet_preview` default, in which every mutating
+# button is refused by the model, so the capture cannot write ~/.ssh/config,
+# spawn ssh, or enroll a host.
 #
 # Run ON A MAC from the repo root:
 #   ./scripts/capture-readme-assets.sh [path/to/localvoxtral.app]
@@ -14,7 +30,8 @@ set -euo pipefail
 #
 # One-time TCC grants required for the terminal you run this from
 # (System Settings > Privacy & Security):
-#   - Accessibility    (System Events drives the menu and settings tabs)
+#   - Accessibility, called Device Control and Data Access on macOS 27
+#                      (System Events drives the menu and settings tabs)
 #   - Screen Recording (screencapture -l reads window contents)
 #
 # The run takes over the GUI session (appearance switch, app launch, menus,
@@ -31,52 +48,38 @@ fi
 APP_PATH="${1:-dist/localvoxtral.app}"
 APP_PROCESS="localvoxtral"
 BUNDLE_ID="com.localvoxtral.app"
-PERSISTENT_DEFAULTS_BACKUP="${HOME}/.localvoxtral-capture-assets.pre.plist"
-PERSISTENT_DEFAULTS_BACKUP_HAD_DOMAIN="${PERSISTENT_DEFAULTS_BACKUP}.had-domain"
 ASSETS_DIR="assets"
-TAB_NAMES=("General" "Endpoints" "Dictation" "Text Processing")
-TAB_FILES=("settings-general.png" "settings-endpoints.png" "settings-dictation.png" "settings-text-processing.png")
+# Display names, one per captured pane, in sidebar order. The Integrations
+# section (Claude Code, opencode, Mistral Vibe, herdr, Remote hosts) and the Terminals
+# section (one pane per terminal) replaced the single Integrations pane
+# (2026-09-07 owner decision).
+TAB_NAMES=("General" "Dictation" "Engines" "Text Processing" "Context" "Claude Code" "opencode" "Mistral Vibe" "Codex" "herdr" "Remote hosts" "Ghostty" "iTerm2" "Terminal.app" "cmux" "Warp" "WezTerm" "kitty" "Alacritty" "Hyper" "Tabby" "Rio")
+# SettingsTab raw values — the sidebar rows carry them as AXIdentifiers
+# (settings.tab.<raw>). SettingsTabTests pins both the raw values and the
+# identifier scheme.
+TAB_IDS=("general" "dictation" "endpoints" "textProcessing" "integrations.context" "integrations.claude" "integrations.opencode" "integrations.vibe" "integrations.codex" "integrations.herdr" "integrations.remote" "terminals.ghostty" "terminals.iterm2" "terminals.apple-terminal" "terminals.cmux" "terminals.warp" "terminals.wezterm" "terminals.kitty" "terminals.alacritty" "terminals.hyper" "terminals.tabby" "terminals.rio")
+TAB_FILES=("settings-general.png" "settings-dictation.png" "settings-endpoints.png" "settings-text-processing.png" "settings-integrations-context.png" "settings-integrations-claude-code.png" "settings-integrations-opencode.png" "settings-integrations-vibe.png" "settings-integrations-codex.png" "settings-integrations-herdr.png" "settings-integrations-remote-hosts.png" "settings-terminal-ghostty.png" "settings-terminal-iterm2.png" "settings-terminal-apple-terminal.png" "settings-terminal-cmux.png" "settings-terminal-warp.png" "settings-terminal-wezterm.png" "settings-terminal-kitty.png" "settings-terminal-alacritty.png" "settings-terminal-hyper.png" "settings-terminal-tabby.png" "settings-terminal-rio.png")
+# The three arrays are indexed together below; a mismatch would silently capture
+# one tab's window into another tab's file.
+if (( ${#TAB_NAMES[@]} != ${#TAB_IDS[@]} || ${#TAB_NAMES[@]} != ${#TAB_FILES[@]} )); then
+  echo "Tab tables disagree: ${#TAB_NAMES[@]} names, ${#TAB_IDS[@]} ids, ${#TAB_FILES[@]} files. Fix them together." >&2
+  exit 1
+fi
+# Resolved from this script's location, not the cwd.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AX_PROBE="${SCRIPT_DIR}/lib/ax-probe.swift"
+# Pins the probe's shape-matched fallbacks to the Settings window; the app has
+# other windows the wrong AXButton/AXScrollArea could be found in.
+SETTINGS_WINDOW_TITLE="localvoxtral"
 
 [[ -d "$APP_PATH" ]] || { echo "App bundle not found: $APP_PATH (build with ./scripts/package_app.sh)" >&2; exit 1; }
 [[ -d "$ASSETS_DIR" ]] || { echo "Run from the repo root ($ASSETS_DIR/ not found)." >&2; exit 1; }
 
-# Defaults isolation:
-# localvoxtral uses UserDefaults.standard under bundle id com.localvoxtral.app.
-# This script snapshots that domain, writes only settings.onboarding_completed
-# so the first-launch wizard does not cover Settings, and restores on exit.
-restore_defaults() {
-  if [[ ! -f "$PERSISTENT_DEFAULTS_BACKUP" ]]; then
-    return
-  fi
-
-  defaults delete "$BUNDLE_ID" >/dev/null 2>&1 || true
-  if [[ -f "$PERSISTENT_DEFAULTS_BACKUP_HAD_DOMAIN" ]]; then
-    defaults import "$BUNDLE_ID" "$PERSISTENT_DEFAULTS_BACKUP" >/dev/null 2>&1 || return 1
-  fi
-  rm -f "$PERSISTENT_DEFAULTS_BACKUP" "$PERSISTENT_DEFAULTS_BACKUP_HAD_DOMAIN"
-}
-
-write_empty_defaults_backup() {
-  cat >"$PERSISTENT_DEFAULTS_BACKUP" <<'PLIST'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict/>
-</plist>
-PLIST
-}
-
-snapshot_defaults() {
-  rm -f "$PERSISTENT_DEFAULTS_BACKUP" "$PERSISTENT_DEFAULTS_BACKUP_HAD_DOMAIN"
-  if defaults export "$BUNDLE_ID" "$PERSISTENT_DEFAULTS_BACKUP" >/dev/null 2>&1; then
-    : >"$PERSISTENT_DEFAULTS_BACKUP_HAD_DOMAIN" || return 1
-  elif defaults read "$BUNDLE_ID" >/dev/null 2>&1; then
-    return 1
-  else
-    write_empty_defaults_backup || return 1
-  fi
-  [[ -f "$PERSISTENT_DEFAULTS_BACKUP" ]] || return 1
-}
+# Defaults isolation: the captured app runs on the harness defaults suite, and
+# the owner's com.localvoxtral.app domain is only read (#1450).
+# shellcheck source=scripts/lib/owner-app-session.sh
+source "${SCRIPT_DIR}/lib/owner-app-session.sh"
+record_fail() { echo "$*" >&2; }
 
 # --- permission preflight ----------------------------------------------------
 # System Events needs Accessibility; screencapture -l needs Screen Recording.
@@ -90,7 +93,7 @@ import CoreGraphics
 
 var ok = true
 if !AXIsProcessTrusted() {
-    print("MISSING Accessibility: System Settings > Privacy & Security > Accessibility — enable the app that launched this script (your terminal, or the CI runner app for workflow runs), then rerun.")
+    print("MISSING Accessibility: System Settings > Privacy & Security > Accessibility (Device Control and Data Access on macOS 27) — enable the app that launched this script (your terminal, or the CI runner app for workflow runs), then rerun.")
     ok = false
 }
 if !CGPreflightScreenCaptureAccess() {
@@ -113,22 +116,21 @@ LAUNCHED_APP=0
 ANNOUNCED_TAKEOVER=0
 CAPTURE_COMPLETED=0
 cleanup() {
-  rm -f "$HELPER" "$PREFLIGHT"
+  rm -f "$HELPER" "${HELPER_BIN:-}" "$PREFLIGHT"
   if [[ "$LAUNCHED_APP" == 1 ]]; then
     osascript -e 'tell application "System Events" to key code 53' >/dev/null 2>&1 || true
     osascript -e "tell application \"$APP_PROCESS\" to quit" >/dev/null 2>&1 || true
     sleep 1
     pkill -x "$APP_PROCESS" >/dev/null 2>&1 || true
   fi
-  if ! restore_defaults; then
-    echo "WARNING: failed to restore defaults backup at $PERSISTENT_DEFAULTS_BACKUP; leaving it in place." >&2
-  fi
+  drop_harness_defaults
+  report_owner_defaults
   if [[ -n "${ORIGINAL_DARK_MODE:-}" ]]; then
     osascript -e "tell application \"System Events\" to tell appearance preferences to set dark mode to ${ORIGINAL_DARK_MODE}" >/dev/null 2>&1 || true
   fi
   # Owner rule: announce completion audibly whenever the script took over the
   # GUI session, so an unattended run never ends silently.
-  if [[ "$ANNOUNCED_TAKEOVER" == 1 ]]; then
+  if [[ "$ANNOUNCED_TAKEOVER" == 1 && "${LOCALVOXTRAL_DEDICATED_GUI:-0}" != 1 ]]; then
     if [[ "$CAPTURE_COMPLETED" == 1 ]]; then
       say "capture readme assets done" >/dev/null 2>&1 || true
     else
@@ -136,14 +138,29 @@ cleanup() {
     fi
   fi
 }
-trap cleanup EXIT INT TERM HUP
+# A signal ends the run after cleanup. Without the exit, bash resumes the
+# script at the next command once the trap returns (#1720). Cleanup runs
+# once: a second signal during it is ignored.
+cleanup_once() {
+  trap '' INT TERM HUP
+  trap - EXIT
+  cleanup
+}
+trap cleanup_once EXIT
+trap 'cleanup_once; exit 130' INT
+trap 'cleanup_once; exit 143' TERM
+trap 'cleanup_once; exit 129' HUP
 
 # --- OWNER RULE: audible takeover warning BEFORE any focus-stealing action ---
 # Everything below drives the GUI session (appearance switch, app launch,
-# menus, synthetic keystrokes) — warn the human at the Mac first.
-say "capture readme assets taking control in 3" >/dev/null 2>&1 || true
+# menus, synthetic keystrokes) — warn the human at the Mac first. A runner
+# with nobody at it (LOCALVOXTRAL_DEDICATED_GUI=1 in its .env, the Mac Mini)
+# skips the warning and the pause.
+if [[ "${LOCALVOXTRAL_DEDICATED_GUI:-0}" != 1 ]]; then
+  say "capture readme assets taking control in 3" >/dev/null 2>&1 || true
+  sleep 3
+fi
 ANNOUNCED_TAKEOVER=1
-sleep 3
 
 # Appearance isolation: README assets are always captured in dark mode so
 # reruns are deterministic regardless of the Mac's current (possibly
@@ -160,6 +177,10 @@ guard CommandLine.arguments.count >= 3,
       let minLayer = Int(CommandLine.arguments[2])
 else { exit(2) }
 
+// Optional third argument: a window id to ignore. A sheet is its own CGWindow,
+// so excluding the settings window is how we get the sheet and not its parent.
+let excludedID = CommandLine.arguments.count >= 4 ? Int(CommandLine.arguments[3]) : nil
+
 let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? []
 var best: (id: Int, area: Double)?
 for window in windows {
@@ -167,6 +188,7 @@ for window in windows {
           let layer = window[kCGWindowLayer as String] as? Int, layer >= minLayer,
           minLayer > 0 || layer == 0,
           let id = window[kCGWindowNumber as String] as? Int,
+          id != excludedID,
           let bounds = window[kCGWindowBounds as String] as? [String: Double],
           let width = bounds["Width"], let height = bounds["Height"]
     else { continue }
@@ -176,15 +198,22 @@ for window in windows {
 guard let best else { exit(1) }
 print(best.id)
 SWIFT
+# Compiled once: an interpreted `swift` run can take the whole of a 5 s
+# window wait on a loaded 8 GB runner, so the poll saw a single attempt.
+# The target is pinned because swiftc defaults to the SDK's macOS, which can
+# be newer than the running one.
+HELPER_BIN="${HELPER%.swift}"
+swiftc -O -target "$(uname -m)-apple-macos15.0" -o "$HELPER_BIN" "$HELPER" \
+  || { echo "Could not compile the window-id helper." >&2; exit 1; }
 
-window_id() { # <pid> <min-layer>
-  swift "$HELPER" "$1" "$2" 2>/dev/null
+window_id() { # <pid> <min-layer> [exclude-window-id]
+  "$HELPER_BIN" "$1" "$2" "${3:-}" 2>/dev/null
 }
 
-wait_for_window() { # <pid> <min-layer> [timeout-seconds]
+wait_for_window() { # <pid> <min-layer> [timeout-seconds] [exclude-window-id]
   local deadline=$((SECONDS + ${3:-10}))
   while ((SECONDS < deadline)); do
-    if id="$(window_id "$1" "$2")"; then echo "$id"; return 0; fi
+    if id="$(window_id "$1" "$2" "${4:-}")"; then echo "$id"; return 0; fi
     sleep 0.3
   done
   return 1
@@ -202,18 +231,14 @@ if pgrep -xq "$APP_PROCESS"; then
   echo "A previous $APP_PROCESS instance refuses to quit; captures would show stale state. Aborting." >&2
   exit 1
 fi
-snapshot_defaults || { echo "Could not snapshot $BUNDLE_ID defaults; refusing to mutate owner defaults." >&2; exit 1; }
+recover_previous_defaults_backup || exit 1
+OWNER_DEFAULTS_BEFORE="$(owner_defaults_digest)"
 # Capture the app as a NEW USER sees it, not as this Mac happens to be set up:
-# clearing the domain drops personal and demo-staged values (record-demo leaves
-# a 22 pt overlay; opt-in features may be switched on), so the shots show real
-# defaults. AppleLanguages pins the app's language and AppleLocale its region
-# — the region is what byte/number formatting follows, so a French Mac renders
-# "3,3 GB" without it; this README is English and wants "3.3 GB". All these
-# keys live in the snapshotted domain and are restored on exit.
-defaults delete "$BUNDLE_ID" >/dev/null 2>&1 || true
-defaults write "$BUNDLE_ID" AppleLanguages -array en-US
-defaults write "$BUNDLE_ID" AppleLocale -string en_US
-defaults write "$BUNDLE_ID" "settings.onboarding_completed" -bool true
+# the suite starts empty, without personal or opt-in values, so the shots
+# show real defaults. onboarding_completed keeps the first-launch wizard off
+# Settings.
+use_harness_defaults
+defaults write "$HARNESS_DEFAULTS_SUITE" "settings.onboarding_completed" -bool true
 
 # The two settings a real first-time user ends up with, which marking onboarding
 # complete above would otherwise hide — so the shots depict a state that exists:
@@ -223,25 +248,47 @@ defaults write "$BUNDLE_ID" "settings.onboarding_completed" -bool true
 #     the model, and we skip the wizard.
 # Keep in step with SettingsStore.seedFreshInstallDefaults and
 # OnboardingViewModel.startDownloads.
-defaults write "$BUNDLE_ID" "settings.modifier_only_hotkey_enabled" -bool true
-defaults write "$BUNDLE_ID" "settings.llm_polishing_enabled" -bool true
+defaults write "$HARNESS_DEFAULTS_SUITE" "settings.modifier_only_hotkey_enabled" -bool true
+defaults write "$HARNESS_DEFAULTS_SUITE" "settings.llm_polishing_enabled" -bool true
+# AppleLanguages pins the app's language and AppleLocale its region: the
+# region is what byte and number formatting follows, so a French Mac renders
+# "3,3 GB" without it, and this README is English and wants "3.3 GB". AppKit
+# reads both from the argument domain or the app's own domain, never from a
+# suite, so they go on the command line.
+LOCALE_ARGS=(--args -AppleLanguages "(en-US)" -AppleLocale en_US)
 LAUNCHED_APP=1
-open "$APP_PATH"
+# The captured app keeps its History and other stores out of the owner's (#985).
+lv_isolate_data lv-readme-assets-data \
+  || { echo "Could not make a data folder for the captured app; not launching it on the owner's data." >&2; exit 1; }
+lv_open "$APP_PATH" "${LOCALE_ARGS[@]}"
 for _ in $(seq 1 20); do pgrep -xq "$APP_PROCESS" && break; sleep 0.5; done
 APP_PID="$(pgrep -xn "$APP_PROCESS")"
-sleep 2 # let the status item settle
+# Wait for the status item itself: a fixed pause was too short when the app
+# launched right after packaging on the busy 8 GB Mac Mini.
+for _ in $(seq 1 40); do
+  osascript -e "tell application \"System Events\" to exists menu bar item 1 of menu bar 2 of process \"$APP_PROCESS\"" 2>/dev/null \
+    | grep -q true && break
+  sleep 0.5
+done
+sleep 1 # let the status item settle
+
+# The app asks for the microphone at launch, and the open prompt keeps the
+# status menu from opening.
+answer_app_prompts 5 once
 
 open_status_menu() {
   # Clicking a menu bar item blocks System Events while the menu tracks, so
-  # fire it with "ignoring application responses" and give it time to open.
+  # fire it with "ignoring application responses". osascript then stays up
+  # for a second: under the Mac Mini's runner, a click whose sender had
+  # already exited never reached the app (#1838).
   osascript >/dev/null <<OSA
 tell application "System Events" to tell process "$APP_PROCESS"
   ignoring application responses
     click menu bar item 1 of menu bar 2
   end ignoring
 end tell
+delay 1
 OSA
-  sleep 1
 }
 
 dismiss_menu() {
@@ -250,14 +297,25 @@ dismiss_menu() {
 }
 
 # --- 1. menu ("popover") shot -----------------------------------------------
+# The checkout holds the tracked popover.png, and the workflow uploads every
+# PNG in assets/, so a missed shot must not leave the old one there (#1723).
 echo "Capturing $ASSETS_DIR/popover.png"
-open_status_menu
-if MENU_ID="$(wait_for_window "$APP_PID" 100 5)"; then
+rm -f "$ASSETS_DIR/popover.png"
+# A click that lands while the app is still busy starting does not open the
+# menu, so try three times before giving up.
+MENU_ID=""
+for _ in 1 2 3; do
+  open_status_menu
+  if MENU_ID="$(wait_for_window "$APP_PID" 100 5)"; then break; fi
+  MENU_ID=""
+  dismiss_menu
+done
+if [[ -n "$MENU_ID" ]]; then
   screencapture -o -x -l "$MENU_ID" "$ASSETS_DIR/popover.png"
   dismiss_menu
 else
-  dismiss_menu
-  echo "WARNING: could not find the open menu window; skipped popover.png" >&2
+  echo "Could not find the open menu window for popover.png." >&2
+  exit 1
 fi
 
 # --- 2. settings tabs ---------------------------------------------------------
@@ -271,19 +329,81 @@ OSA
 SETTINGS_ID="$(wait_for_window "$APP_PID" 0 10)" || { echo "Settings window never appeared." >&2; exit 1; }
 sleep 1
 
+# Tab selection presses the sidebar row by AXIdentifier. The old selector
+# (`button "<name>" of toolbar 1 of window 1`) died with the TabView — the
+# hand-rolled sidebar has no toolbar. The display name is passed as an AXTitle
+# fallback, and the probe prints which route it used.
+[[ -f "$AX_PROBE" ]] || { echo "AX probe helper not found: $AX_PROBE" >&2; exit 1; }
+
 for i in "${!TAB_NAMES[@]}"; do
   tab="${TAB_NAMES[$i]}"
+  tab_id="${TAB_IDS[$i]}"
   out="$ASSETS_DIR/${TAB_FILES[$i]}"
   echo "Capturing $out"
-  osascript >/dev/null <<OSA
-tell application "System Events" to tell process "$APP_PROCESS"
-  click button "$tab" of toolbar 1 of window 1
-end tell
-OSA
+  swift "$AX_PROBE" "$APP_PID" \
+    --press "settings.tab.${tab_id}" --title "$tab" \
+    --window "$SETTINGS_WINDOW_TITLE" \
+    --timeout 10 --dump-on-fail \
+    || { echo "Could not select the $tab tab." >&2; exit 1; }
   sleep 1
   SETTINGS_ID="$(window_id "$APP_PID" 0)" || { echo "Lost the settings window." >&2; exit 1; }
   screencapture -o -x -l "$SETTINGS_ID" "$out"
 done
+
+# --- 3. enrollment sheet ------------------------------------------------------
+# A second launch, on purpose: the preview default is read ONCE when the
+# Remote hosts pane is constructed, so arming it before the tab loop would have
+# parked the sheet on top of settings-integrations-remote-hosts.png.
+echo "Capturing $ASSETS_DIR/settings-enrollment.png"
+osascript -e "tell application \"$APP_PROCESS\" to quit" >/dev/null 2>&1 || true
+for _ in $(seq 1 10); do pgrep -xq "$APP_PROCESS" || break; sleep 0.5; done
+pkill -x "$APP_PROCESS" >/dev/null 2>&1 || true
+sleep 1
+
+# The sample sheet: a host that is not in the registry, a visibly fake token,
+# and a presentation the model refuses to act on. It cannot write
+# ~/.ssh/config, spawn ssh, or enroll anything. The key lives in the harness
+# suite, which cleanup empties.
+defaults write "$HARNESS_DEFAULTS_SUITE" "debug.enrollment_sheet_preview" -bool true
+lv_open "$APP_PATH" "${LOCALE_ARGS[@]}"
+for _ in $(seq 1 20); do pgrep -xq "$APP_PROCESS" && break; sleep 0.5; done
+APP_PID="$(pgrep -xn "$APP_PROCESS")"
+sleep 2
+
+open_status_menu
+osascript >/dev/null <<OSA
+tell application "System Events" to tell process "$APP_PROCESS"
+  click menu item "Settings…" of menu 1 of menu bar item 1 of menu bar 2
+end tell
+OSA
+ENROLLMENT_SHOT="$ASSETS_DIR/settings-enrollment.png"
+rm -f "$ENROLLMENT_SHOT"
+if SETTINGS_ID="$(wait_for_window "$APP_PID" 0 10)"; then
+  sleep 1
+  if swift "$AX_PROBE" "$APP_PID" --press "settings.tab.integrations.remote" --title "Remote hosts" \
+       --timeout 10 --dump-on-fail; then
+    # The sheet is its own CGWindow and animates in, so wait for a layer-0
+    # window that is NOT the settings window.
+    if SHEET_ID="$(wait_for_window "$APP_PID" 0 10 "$SETTINGS_ID")"; then
+      sleep 0.5
+      screencapture -o -x -l "$SHEET_ID" "$ENROLLMENT_SHOT" || true
+    else
+      echo "ERROR: the enrollment sheet never appeared." >&2
+    fi
+  else
+    echo "ERROR: could not select the Remote hosts tab for the enrollment sheet." >&2
+  fi
+else
+  echo "ERROR: Settings never reopened for the enrollment sheet." >&2
+fi
+
+# Fail LOUDLY rather than leaving a stale (or absent) asset behind. A capture
+# script that warns and exits 0 is how a run "succeeds" with nothing to show
+# for it — the missing shot is only noticed by whoever needed it.
+if [[ ! -s "$ENROLLMENT_SHOT" ]]; then
+  echo "$ENROLLMENT_SHOT was expected but not produced." >&2
+  exit 1
+fi
 
 osascript -e "tell application \"$APP_PROCESS\" to quit" >/dev/null 2>&1 || true
 CAPTURE_COMPLETED=1

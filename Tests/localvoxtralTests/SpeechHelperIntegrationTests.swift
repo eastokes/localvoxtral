@@ -104,10 +104,14 @@ final class SpeechHelperIntegrationTests: XCTestCase {
             "models--" + repoID.replacingOccurrences(of: "/", with: "--")
         )
         let snapshotsDir = repoDir.appendingPathComponent("snapshots")
-        let pinnedRevision = SpeechModelCatalog.option(forRepoID: repoID)?.revision
+        let catalogOption = SpeechModelCatalog.option(forRepoID: repoID)
+        let pinnedRevision = catalogOption?.revision
+        let engine = catalogOption?.engine ?? .voxtral
 
         if let pinnedRevision {
-            if Self.snapshotIsProvisioned(snapshotsDir.appendingPathComponent(pinnedRevision)) {
+            if Self.snapshotIsProvisioned(
+                snapshotsDir.appendingPathComponent(pinnedRevision), engine: engine
+            ) {
                 return
             }
         } else if let revision = try? String(
@@ -116,7 +120,9 @@ final class SpeechHelperIntegrationTests: XCTestCase {
         )
         .trimmingCharacters(in: .whitespacesAndNewlines),
             !revision.isEmpty,
-            Self.snapshotIsProvisioned(snapshotsDir.appendingPathComponent(revision))
+            Self.snapshotIsProvisioned(
+                snapshotsDir.appendingPathComponent(revision), engine: engine
+            )
         {
             return
         }
@@ -173,7 +179,7 @@ final class SpeechHelperIntegrationTests: XCTestCase {
             guard (response as? HTTPURLResponse)?.statusCode == 200 else {
                 throw ModelProvisioningError(description: "download failed for \(name): \(response)")
             }
-            try FileManager.default.moveItem(at: temporary, to: destination)
+            try SharedCacheFile.publish(temporary, at: destination)
         }
 
         if pinnedRevision == nil {
@@ -187,13 +193,21 @@ final class SpeechHelperIntegrationTests: XCTestCase {
 
     static let provisionedSentinel = ".localvoxtral-provisioned"
 
-    static func snapshotIsProvisioned(_ snapshot: URL) -> Bool {
+    /// Nemotron checkpoints carry their vocabulary inside `config.json`; only the
+    /// Voxtral loader needs the separate `tekken.json` tokenizer.
+    static func snapshotIsProvisioned(
+        _ snapshot: URL,
+        engine: SpeechEngineKind = .voxtral
+    ) -> Bool {
         let fileManager = FileManager.default
-        let hasRequiredMetadata = fileManager.fileExists(
+        var hasRequiredMetadata = fileManager.fileExists(
             atPath: snapshot.appendingPathComponent(provisionedSentinel).path
         )
             && fileManager.fileExists(atPath: snapshot.appendingPathComponent("config.json").path)
-            && fileManager.fileExists(atPath: snapshot.appendingPathComponent("tekken.json").path)
+        if engine == .voxtral {
+            hasRequiredMetadata = hasRequiredMetadata
+                && fileManager.fileExists(atPath: snapshot.appendingPathComponent("tekken.json").path)
+        }
         guard hasRequiredMetadata else { return false }
         if fileManager.fileExists(atPath: snapshot.appendingPathComponent("model.safetensors").path) {
             return true
@@ -239,6 +253,19 @@ final class SpeechHelperIntegrationTests: XCTestCase {
         }
 
         XCTAssertFalse(Self.snapshotIsProvisioned(snapshot))
+    }
+
+    func testSnapshotProvisioningSentinelDoesNotDemandVoxtralsTokenizerFromNemotron() throws {
+        let snapshot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("speechd-nemotron-snapshot-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: snapshot) }
+        try FileManager.default.createDirectory(at: snapshot, withIntermediateDirectories: true)
+        for name in [Self.provisionedSentinel, "config.json", "model.safetensors"] {
+            try Data().write(to: snapshot.appendingPathComponent(name))
+        }
+
+        XCTAssertTrue(Self.snapshotIsProvisioned(snapshot, engine: .nemotron))
+        XCTAssertFalse(Self.snapshotIsProvisioned(snapshot, engine: .voxtral))
     }
 
     private func launchHelper(
@@ -328,7 +355,7 @@ final class SpeechHelperIntegrationTests: XCTestCase {
             "the websocket client sends pcm sixteen audio at sixteen kilohertz in sequential chunks.",
             "if this transcript is non empty, end to end processing is confirmed.",
         ].joined(separator: " ")
-        let pcm16 = try makeSpokenPCM16Data(phrase: expected)
+        let pcm16 = try IntegrationTestSupport.makeSpokenPCM16Data(phrase: expected)
         XCTAssertGreaterThan(pcm16.count, 100_000)
         let chunks = IntegrationTestSupport.splitPCM16IntoChunks(pcm16, chunkSizeBytes: 3_200)
 
@@ -344,7 +371,7 @@ final class SpeechHelperIntegrationTests: XCTestCase {
         let realtimeError = expectation(description: "realtime error")
         realtimeError.isInverted = true
 
-        client.setEventHandler { event in
+        client.setEventHandler { event, _ in
             switch event {
             case .connected:
                 connected.fulfill()
@@ -364,10 +391,12 @@ final class SpeechHelperIntegrationTests: XCTestCase {
                 finalTranscript.fulfill()
             case .transcriptionFinalized:
                 transcriptionFinalized.fulfill()
-            case .error:
+            case .error, .transcriptionStopped:
                 realtimeError.fulfill()
             case .disconnected:
                 disconnected.fulfill()
+            case .sessionRolledOver:
+                break
             }
         }
 
@@ -421,6 +450,227 @@ final class SpeechHelperIntegrationTests: XCTestCase {
         process.terminate()
     }
 
+    /// #314: the engine stops decoding once an utterance reaches its token cap and returns
+    /// nothing from every later step. Before the fix the helper never noticed, so a long
+    /// dictation simply stopped producing text with no error anywhere. A short limit here
+    /// stands in for the real one: the stop must arrive as exactly one realtime error event
+    /// naming the limit, and as one line in the helper's log.
+    func testUtteranceLimitStopIsReportedOnceInsteadOfSilently() async throws {
+        let (binary, model) = try helperConfiguration()
+        try await ensureModelCached(model)
+        let limitSeconds = 3
+        let (process, stderrLog) = try await launchHelper(
+            binary: binary,
+            model: model,
+            extraArguments: ["--max-utterance-seconds", "\(limitSeconds)"]
+        )
+
+        // The cap must cross while audio is still streaming (a crossing at the commit is
+        // `testLimitCrossedByTheCommitRemainderIsReported`), so the speech has to outlast
+        // the budget with room to spare. Voxtral's
+        // cap is the widest: ceil(limit x 12.5) + 64 finish-padding tokens, with decoded
+        // tokens trailing the audio by up to the 30-token maximum transcription delay.
+        // Nemotron caps on the audio itself, so it stops at the limit — well inside this.
+        let maxDecodedTokens = Int((Double(limitSeconds) * 12.5).rounded(.up)) + 64
+        let secondsToCrossCap = Double(maxDecodedTokens + 30) / 12.5
+        let phrase = [
+            "this is a longer synthetic audio passage for integration testing.",
+            "we are verifying that the realtime server reports when an utterance reaches its limit.",
+            "the websocket client sends pcm sixteen audio at sixteen kilohertz in sequential chunks.",
+            "every chunk after the limit must stay quiet instead of repeating the same report.",
+        ].joined(separator: " ")
+        let pcm16 = try IntegrationTestSupport.makeSpokenPCM16Data(phrase: phrase)
+        let spokenSeconds = Double(pcm16.count) / 32_000
+        XCTAssertGreaterThan(
+            spokenSeconds,
+            secondsToCrossCap + 3,
+            "the TTS audio is too short to cross the cap while streaming"
+        )
+        let chunks = IntegrationTestSupport.splitPCM16IntoChunks(pcm16, chunkSizeBytes: 3_200)
+
+        let client = RealtimeAPIWebSocketClient()
+        let transcript = TranscriptCapture()
+        let stops = TranscriptCapture()
+        let errors = TranscriptCapture()
+        let connected = expectation(description: "connected")
+        let finalTranscript = expectation(description: "final transcript")
+        finalTranscript.assertForOverFulfill = false
+        let disconnected = expectation(description: "disconnected")
+
+        client.setEventHandler { event, _ in
+            switch event {
+            case .connected:
+                connected.fulfill()
+                for chunk in chunks {
+                    client.sendAudioChunk(chunk)
+                }
+                client.sendCommit(final: true)
+            case .partialTranscript(let delta):
+                transcript.append(delta: delta)
+            case .finalTranscript(let text):
+                transcript.append(doneText: text)
+                finalTranscript.fulfill()
+            case .transcriptionStopped(let message):
+                stops.append(delta: message)
+            case .error(let message):
+                errors.append(delta: message)
+            case .disconnected:
+                disconnected.fulfill()
+            case .status, .transcriptionFinalized, .sessionRolledOver:
+                break
+            }
+        }
+
+        try client.connect(configuration: RealtimeSessionConfiguration(
+            endpoint: URL(string: "ws://127.0.0.1:\(Self.testPort)/v1/realtime")!,
+            apiKey: "",
+            model: model
+        ))
+        await fulfillment(of: [connected, finalTranscript], timeout: 180)
+        client.disconnect()
+        await fulfillment(of: [disconnected], timeout: 5)
+
+        XCTAssertEqual(
+            stops.snapshot().deltas,
+            ["\(limitSeconds)-second limit reached; start again."],
+            "the limit stop must reach the client exactly once, as a transcription stop"
+        )
+        XCTAssertEqual(errors.snapshot().deltas, [], "no generic realtime error")
+        let logTail = stderrLog.tail(50)
+        XCTAssertTrue(
+            logTail.contains("utterance reached the \(limitSeconds)s limit"),
+            "the limit stop must be logged by the helper: \(logTail)"
+        )
+        // The transcript still ends cleanly with what was decoded before the stop.
+        let doneText = try XCTUnwrap(transcript.snapshot().doneTexts.only)
+        print(
+            "speechd limit test: \(String(format: "%.1f", spokenSeconds))s spoken, "
+                + "transcript: \(doneText)"
+        )
+        XCTAssertTrue(process.isRunning)
+        process.terminate()
+    }
+
+    /// The limit can be crossed by the last sub-step fragment of audio, which the helper
+    /// only feeds to the engine on the final commit. 3.05 s under a 3 s limit does exactly
+    /// that at the default 100 ms step: thirty full steps fill the limit and the 50 ms
+    /// remainder arrives with the commit. Nemotron caps the audio it accepts, so it drops
+    /// that remainder and must say so; Voxtral caps decoded tokens, which 3 s of speech
+    /// never reaches, so it must stay quiet.
+    func testLimitCrossedByTheCommitRemainderIsReported() async throws {
+        let (binary, model) = try helperConfiguration()
+        try await ensureModelCached(model)
+        let engine = SpeechModelCatalog.option(forRepoID: model)?.engine ?? .voxtral
+        let limitSeconds = 3
+        let (process, stderrLog) = try await launchHelper(
+            binary: binary,
+            model: model,
+            extraArguments: ["--max-utterance-seconds", "\(limitSeconds)"]
+        )
+
+        let spoken = try IntegrationTestSupport.makeSpokenPCM16Data(
+            phrase: "this passage runs a little past the limit, so its last fragment "
+                + "arrives with the final commit instead of with a streaming step."
+        )
+        let byteCount = (limitSeconds * 16_000 + 800) * 2
+        XCTAssertGreaterThanOrEqual(spoken.count, byteCount, "the TTS audio is too short")
+        let chunks = IntegrationTestSupport.splitPCM16IntoChunks(
+            Data(spoken.prefix(byteCount)), chunkSizeBytes: 3_200
+        )
+
+        let client = RealtimeAPIWebSocketClient()
+        let stops = TranscriptCapture()
+        let connected = expectation(description: "connected")
+        let finalTranscript = expectation(description: "final transcript")
+        finalTranscript.assertForOverFulfill = false
+        let disconnected = expectation(description: "disconnected")
+
+        client.setEventHandler { event, _ in
+            switch event {
+            case .connected:
+                connected.fulfill()
+                for chunk in chunks {
+                    client.sendAudioChunk(chunk)
+                }
+                client.sendCommit(final: true)
+            case .finalTranscript:
+                finalTranscript.fulfill()
+            case .transcriptionStopped(let message):
+                stops.append(delta: message)
+            case .disconnected:
+                disconnected.fulfill()
+            case .partialTranscript, .error, .status, .transcriptionFinalized, .sessionRolledOver:
+                break
+            }
+        }
+
+        try client.connect(configuration: RealtimeSessionConfiguration(
+            endpoint: URL(string: "ws://127.0.0.1:\(Self.testPort)/v1/realtime")!,
+            apiKey: "",
+            model: model
+        ))
+        await fulfillment(of: [connected, finalTranscript], timeout: 120)
+        client.disconnect()
+        await fulfillment(of: [disconnected], timeout: 5)
+
+        switch engine {
+        case .nemotron:
+            XCTAssertEqual(
+                stops.snapshot().deltas,
+                ["\(limitSeconds)-second limit reached; start again."],
+                "audio dropped at the commit must be reported, once"
+            )
+            XCTAssertTrue(
+                stderrLog.tail(50).contains("utterance reached the \(limitSeconds)s limit"),
+                "the helper must log the stop: \(stderrLog.tail(50))"
+            )
+        case .voxtral:
+            XCTAssertEqual(stops.snapshot().deltas, [], "3 s of speech is under Voxtral's token cap")
+        }
+        print("speechd commit-remainder test (\(engine)): stops \(stops.snapshot().deltas)")
+        XCTAssertTrue(process.isRunning)
+        process.terminate()
+    }
+
+    /// The real helper's /health names the pid the supervisor launched, so
+    /// the owner check (#1760) accepts it and the backend runs.
+    func testSupervisorAcceptsTheHelpersOwnReadiness() async throws {
+        let (binary, model) = try helperConfiguration()
+        try await ensureModelCached(model)
+
+        var arguments = ["--model", model, "--port", "\(Self.testPort)"]
+        if let revision = SpeechModelCatalog.option(forRepoID: model)?.revision {
+            arguments.append(contentsOf: ["--model-revision", revision])
+        }
+        let supervisor = BackendProcessSupervisor(
+            configuration: BackendProcessConfiguration(
+                name: "speechd-integration",
+                executableURL: binary,
+                arguments: arguments,
+                environment: ProcessInfo.processInfo.environment,
+                readinessURL: URL(string: "http://127.0.0.1:\(Self.testPort)/health")!,
+                readinessTimeout: .seconds(Int64(Self.readyTimeout)),
+                maxConsecutiveRestartFailures: 1,
+                readinessReportsOwnerPID: true
+            )
+        )
+        let updates = supervisor.stateUpdates
+        await supervisor.start()
+
+        var settled: BackendProcessSupervisor.State?
+        for await state in updates {
+            switch state {
+            case .running, .failed, .stopped:
+                settled = state
+            default:
+                continue
+            }
+            break
+        }
+        await supervisor.stop()
+        XCTAssertEqual(settled, .running, "recent output: \(supervisor.recentOutput.suffix(20))")
+    }
+
     func testHelperExitsWhenParentPIDDies() async throws {
         let (binary, model) = try helperConfiguration()
         try await ensureModelCached(model)
@@ -446,32 +696,6 @@ final class SpeechHelperIntegrationTests: XCTestCase {
         decoyParent.terminate()
         await fulfillment(of: [helperExited], timeout: 30)
         XCTAssertFalse(helper.isRunning)
-    }
-
-    private func makeSpokenPCM16Data(phrase: String) throws -> Data {
-        let tempURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("speechd-tts-\(UUID().uuidString)")
-            .appendingPathExtension("wav")
-        defer { try? FileManager.default.removeItem(at: tempURL) }
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/say")
-        process.arguments = [
-            "-o", tempURL.path,
-            "--file-format=WAVE",
-            "--data-format=LEI16@16000",
-            phrase,
-        ]
-        do {
-            try process.run()
-        } catch {
-            throw XCTSkip("Failed to execute /usr/bin/say: \(error.localizedDescription)")
-        }
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else {
-            throw XCTSkip("System TTS failed with status \(process.terminationStatus)")
-        }
-        return try IntegrationTestSupport.extractPCMDataFromWAV(at: tempURL)
     }
 }
 

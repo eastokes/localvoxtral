@@ -41,9 +41,14 @@ public struct UnixSocketPublisher: Sendable {
     /// this runs inline in a Claude Code hook, and being late is worse than
     /// being absent.
     public var timeout: TimeInterval
+    /// A hook's receipt is one small JSON object, and anything larger is not
+    /// ours. The `localvoxtral` command's answers carry history, so it raises
+    /// this.
+    public var maxReplyBytes: Int
 
-    public init(timeout: TimeInterval = 0.25) {
+    public init(timeout: TimeInterval = 0.25, maxReplyBytes: Int = 4 * 1024) {
         self.timeout = timeout
+        self.maxReplyBytes = maxReplyBytes
     }
 
     /// Publish a line and read the broker's reply.
@@ -63,8 +68,26 @@ public struct UnixSocketPublisher: Sendable {
             if let failure = writeAll(fd: fd, data: line) { return .failure(failure) }
             // Half-close so the broker sees EOF and stops waiting for more
             // records; it can still write its reply back to us.
-            shutdown(fd, SHUT_WR)
+            // Int32(...): Glibc imports SHUT_WR as an Int, Darwin as Int32.
+            shutdown(fd, Int32(SHUT_WR))
             return .success(readReply(fd: fd))
+        }
+    }
+
+    /// Connects, writes `line`, and hands the open descriptor to the caller,
+    /// who reads the broker's answers and closes it. The descriptor is
+    /// non-blocking: read it through `poll`.
+    public func openStream(sending line: Data, to socketPath: String) -> Result<Int32, ClaudeHookPublishFailure> {
+        guard !socketPath.isEmpty else { return .failure(.noSocketPath) }
+        switch openConnection(to: socketPath) {
+        case .failure(let failure):
+            return .failure(failure)
+        case .success(let fd):
+            if let failure = writeAll(fd: fd, data: line) {
+                close(fd)
+                return .failure(failure)
+            }
+            return .success(fd)
         }
     }
 
@@ -105,7 +128,12 @@ public struct UnixSocketPublisher: Sendable {
 
         // O_NONBLOCK via fcntl rather than a SOCK_NONBLOCK socket type: that
         // flag is a Linux extension and does not exist on Darwin.
+        #if canImport(Glibc)
+        // Glibc imports SOCK_STREAM as the `__socket_type` enum, not an Int32.
+        let fd = socket(AF_UNIX, Int32(SOCK_STREAM.rawValue), 0)
+        #else
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        #endif
         guard fd >= 0 else { return .failure(.socketUnavailable) }
 
         configureNoSIGPIPE(fd)
@@ -191,11 +219,11 @@ public struct UnixSocketPublisher: Sendable {
     ///
     /// Returns nil for absolutely everything unexpected. A missing or malformed
     /// reply is not an error worth surfacing: the record was already delivered,
-    /// and the only consequence is that we emit no marker.
+    /// and there is no consequence at all: the hook prints nothing either way.
     private func readReply(fd: Int32) -> Data? {
         let deadline = monotonicNow() + timeout
         var buffer = Data()
-        var chunk = [UInt8](repeating: 0, count: 4 * 1024)
+        var chunk = [UInt8](repeating: 0, count: 64 * 1024)
 
         while buffer.count <= maxReplyBytes {
             let remaining = deadline - monotonicNow()
@@ -215,16 +243,14 @@ public struct UnixSocketPublisher: Sendable {
                 return nil
             }
             if count == 0 { break } // EOF.
-            buffer.append(contentsOf: chunk[0..<count])
-            if let newline = buffer.firstIndex(of: 0x0A) {
-                return Data(buffer[buffer.startIndex..<newline])
+            if let newline = chunk[0..<count].firstIndex(of: 0x0A) {
+                buffer.append(contentsOf: chunk[0..<newline])
+                return buffer.count <= maxReplyBytes ? buffer : nil
             }
+            buffer.append(contentsOf: chunk[0..<count])
         }
         return nil
     }
-
-    /// A reply is one small JSON object; anything larger is not ours.
-    private var maxReplyBytes: Int { 4 * 1024 }
 
     private func makeNonBlocking(_ fd: Int32) {
         let flags = fcntl(fd, F_GETFL, 0)

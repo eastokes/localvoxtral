@@ -51,25 +51,19 @@ public struct ClaudeHookPublisher: Sendable {
         }
     }
 
-    /// What a run did, and what (if anything) to print.
+    /// What a run did.
     ///
-    /// `stdout` is nil on every path except a successful marker roundtrip. That
-    /// is the fail-open contract in one field: silence is always a valid hook
-    /// result.
+    /// Deliberately carries no "and print this" case. A hook run prints
+    /// NOTHING on every path — the outcome exists for tests and for the
+    /// unified log, never for stdout. That is the fail-open contract stated as
+    /// a type: silence is always a valid hook result, and there is no shape of
+    /// broker reply that can make this binary write to the user's terminal.
     public enum Outcome: Equatable, Sendable {
-        /// Published, and the broker returned a marker to emit.
-        case publishedWithMarker(String)
-        /// Published, but no usable marker came back — nothing to print.
+        /// Published; whatever the broker replied changes nothing we do.
         case published
         case droppedUnparseable
         case droppedNoSocketPath
         case droppedTransport(ClaudeHookPublishFailure)
-
-        /// The exact bytes for stdout, or nil to print nothing at all.
-        public var stdout: Data? {
-            guard case .publishedWithMarker(let marker) = self else { return nil }
-            return ClaudeHookOutput.markerOutputLine(marker: marker)
-        }
     }
 
     public var environment: Environment
@@ -110,19 +104,118 @@ public struct ClaudeHookPublisher: Sendable {
         switch publisher.publishAndReadReply(line: line, to: socketPath) {
         case .failure(let failure):
             return .droppedTransport(failure)
+        case .success:
+            // The reply is read (and discarded) rather than skipped: the
+            // socket is request/response, and a publisher that wrote its line
+            // and walked away would leave the broker writing into a closed
+            // peer. Nothing in the reply steers this path — a hook run has one
+            // observable effect, and it is on the app's registry.
+            return .published
+        }
+    }
+
+    // MARK: - Status line
+
+    /// What a `--statusline` run learned. Distinct from `Outcome` because the
+    /// contract is inverted: a hook must stay silent on failure, while a
+    /// status line EXISTS to render failure. Every case maps to one fixed
+    /// output string (or none) in `statusLineText(for:)` — nothing read off
+    /// the wire is ever echoed.
+    public enum StatusOutcome: Equatable, Sendable {
+        /// The broker answered: the session is live in the registry.
+        case connected
+        /// The broker answered: it has no live session by that id — the app
+        /// runs but this session's hooks are not reaching it (plugin not
+        /// installed, or the app started after the session's last event).
+        case sessionUnknown
+        /// Nothing answered on the socket: the app is not running (or this
+        /// environment has no resolvable socket path at all).
+        case appUnreachable
+        /// stdin was not a status-line payload with a usable `session_id`.
+        /// Rendered as nothing: a claim about a session we could not even
+        /// identify would be a guess, and the status line must never guess.
+        case unparseablePayload
+    }
+
+    /// Read the status-line payload Claude Code pipes in, ask the broker
+    /// whether that session is live, and say which of the four worlds we are
+    /// in. Never throws, never blocks past the socket deadline — the status
+    /// line re-runs constantly and a slow command stalls its refresh.
+    public func runStatusQuery(stdin: Data) -> StatusOutcome {
+        guard let sessionID = Self.statusLineSessionID(payload: stdin, limits: limits) else {
+            return .unparseablePayload
+        }
+        let record = ClaudeHookRecord(
+            event: .statusQuery,
+            sessionID: sessionID,
+            timestamp: environment.now()
+        )
+        guard let line = ClaudeHookWireCodec.encodeLine(record, limits: limits),
+              let socketPath = ClaudeHookSocketPath.resolve(environment: environment.variables)
+        else {
+            return .appUnreachable
+        }
+        switch publisher.publishAndReadReply(line: line, to: socketPath) {
+        case .failure:
+            return .appUnreachable
         case .success(let reply):
-            // Every step from here is "or emit nothing": a missing reply,
-            // an undecodable one, an absent marker, or a marker we would not
-            // put in a terminal all land on `.published`.
+            // A listener that answers but does not say `accepted: true` — an
+            // older app dropping the unknown event, a missing or undecodable
+            // reply — lands on "not connected": something owns the socket,
+            // but it did not vouch for this session.
             guard let reply,
                   let response = ClaudeBrokerResponse.decodeLine(reply, limits: limits),
-                  let marker = response.marker,
-                  ClaudeMarkerSequence.isValidMarker(marker)
+                  response.accepted == true
             else {
-                return .published
+                return .sessionUnknown
             }
-            return .publishedWithMarker(marker)
+            return .connected
         }
+    }
+
+    /// `session_id` from a Claude Code status-line payload (a JSON object,
+    /// schema owned by Claude Code; `session_id` is documented always-present).
+    /// Bounded exactly like every other identifier that crosses the wire.
+    static func statusLineSessionID(payload: Data, limits: ClaudeHookLimits) -> String? {
+        guard let object = try? JSONSerialization.jsonObject(with: payload),
+              let dictionary = object as? [String: Any],
+              let sessionID = dictionary["session_id"] as? String,
+              !sessionID.isEmpty
+        else {
+            return nil
+        }
+        return ClaudeHookWireCodec.truncate(sessionID, toUTF8Bytes: limits.maxPathBytes)
+    }
+
+    /// The one line to print, or nil for nothing. FIXED strings only, chosen
+    /// by outcome. No wire byte, path, or id is ever interpolated, so nothing
+    /// that crossed a socket can put a byte on the terminal.
+    public static func statusLineText(
+        for outcome: StatusOutcome,
+        useColor: Bool = true
+    ) -> String? {
+        if !useColor {
+            switch outcome {
+            case .connected: return "lvx \u{25CF}"
+            case .sessionUnknown: return "lvx \u{25D0}"
+            case .appUnreachable: return "lvx \u{25CB}"
+            case .unparseablePayload: return nil
+            }
+        }
+        switch outcome {
+        case .connected:
+            return "lvx \u{1B}[32m\u{25CF}\u{1B}[0m"
+        case .sessionUnknown:
+            return "lvx \u{1B}[33m\u{25D0}\u{1B}[0m"
+        case .appUnreachable:
+            return "lvx \u{1B}[90m\u{25CB}\u{1B}[0m"
+        case .unparseablePayload:
+            return nil
+        }
+    }
+
+    public static func statusLineUsesColor(environment: [String: String]) -> Bool {
+        environment["NO_COLOR"] == nil && environment["TERM"]?.lowercased() != "dumb"
     }
 
     /// Safe metadata only: identity and location of the terminal, never its
@@ -135,9 +228,24 @@ public struct ClaudeHookPublisher: Sendable {
     /// the thing this session lives in". None of them is content, and the list
     /// grows only for values that answer that question.
     func processInfo() -> ClaudeHookProcessInfo {
-        // ONE ppid resolution feeds both fields: the published claudePID and
+        processInfo(agentPID: environment.ppid(), claudeSessionHandles: true)
+    }
+
+    /// - Parameter claudeSessionHandles: whether the two Claude-allocated
+    ///   session ids are published. They name a CLAUDE session's browser tab or
+    ///   desktop view, and another agent started from inside a Claude Code
+    ///   session inherits them — publishing them there would let that agent's
+    ///   session join the Claude view it was launched from.
+    /// - Parameter agentStartMicros: the agent process's start time, for an
+    ///   agent whose sessions end by liveness alone.
+    func processInfo(
+        agentPID: Int32,
+        claudeSessionHandles: Bool = false,
+        agentStartMicros: Int64? = nil
+    ) -> ClaudeHookProcessInfo {
+        // ONE pid resolution feeds both fields: the published claudePID and
         // the tty's process-table fallback must describe the same process.
-        let claudePID = environment.ppid()
+        let claudePID = agentPID
         return ClaudeHookProcessInfo(
             hookPID: environment.pid(),
             claudePID: claudePID,
@@ -147,7 +255,9 @@ public struct ClaudeHookPublisher: Sendable {
             herdrSocketPath: nonEmptyVariable("HERDR_SOCKET_PATH"),
             cmuxSurfaceID: nonEmptyVariable("CMUX_SURFACE_ID"),
             cmuxSocketPath: nonEmptyVariable("CMUX_SOCKET_PATH"),
-            bridgeSessionID: nonEmptyVariable("CLAUDE_CODE_BRIDGE_SESSION_ID")
+            bridgeSessionID: claudeSessionHandles ? nonEmptyVariable("CLAUDE_CODE_BRIDGE_SESSION_ID") : nil,
+            desktopSessionID: claudeSessionHandles ? nonEmptyVariable("CLAUDE_CODE_HOST_SESSION_ID") : nil,
+            agentStartMicros: agentStartMicros
         )
     }
 
@@ -196,26 +306,61 @@ public struct ClaudeHookPublisher: Sendable {
     /// process-table read is the true last resort: it reports CLAUDE's terminal
     /// rather than ours, so it answers even for a hook fully detached from the
     /// controlling terminal (setsid), and claude always sits on the pane's tty.
+    ///
+    /// Every step's answer must NAME A DEVICE A PANE CAN CARRY, or it is no
+    /// answer and the next step runs. `ttyname` on the `/dev/tty` fd returns
+    /// the literal `/dev/tty` on Darwin (@eastokes's fork, issue #376): the
+    /// per-process controlling-terminal alias, which no focus probe can ever
+    /// match, and which — being non-nil — used to swallow the process-table
+    /// read underneath it. That is worse than nil in the exact way this path
+    /// is built to avoid: nil is diagnosable and logged, a wrong device
+    /// grounds the dictation in nothing and says nothing.
     public static func controllingTTY(claudePID: Int32? = nil) -> String? {
-        for fd in [Int32(0), 1, 2] where isatty(fd) == 1 {
-            if let name = ttyname(fd) {
+        resolveControllingTTY(
+            claudePID: claudePID,
+            descriptorDevice: { fd in
+                guard isatty(fd) == 1, let name = ttyname(fd) else { return nil }
                 return String(cString: name)
+            },
+            controllingTerminalDevice: {
+                let fd = open("/dev/tty", O_RDONLY | O_NONBLOCK | O_NOCTTY)
+                guard fd >= 0 else { return nil }
+                defer { close(fd) }
+                guard let name = ttyname(fd) else { return nil }
+                return String(cString: name)
+            },
+            processDevice: { ttyDevicePath(forProcess: $0) }
+        )
+    }
+
+    /// `controllingTTY`'s chain with its three syscalls lifted out, so a test
+    /// can hand it what the field hands it.
+    ///
+    /// `claudePID` nil means nobody named the session process, which happens
+    /// only for a publisher invoked directly (tests, manual runs) — the hook's
+    /// own `Environment` always supplies `claudeAncestorPID()`. Our own pid is
+    /// then the right last resort rather than a guess: the step above already
+    /// proved we HAVE a controlling terminal (`/dev/tty` opened) and only
+    /// failed to name it, and a process's own `e_tdev` is that same terminal,
+    /// read off ourselves — no other process's state is trusted. A hook that
+    /// really was detached with `setsid` has no controlling terminal, so this
+    /// reports nothing rather than something wrong.
+    static func resolveControllingTTY(
+        claudePID: Int32?,
+        ownPID: () -> Int32 = { getpid() },
+        descriptorDevice: (Int32) -> String?,
+        controllingTerminalDevice: () -> String?,
+        processDevice: (Int32) -> String?
+    ) -> String? {
+        for fd in [Int32(0), 1, 2] {
+            if let device = concreteTerminalDevice(descriptorDevice(fd)) {
+                return device
             }
         }
-        let fd = open("/dev/tty", O_RDONLY | O_NONBLOCK | O_NOCTTY)
-        if fd >= 0 {
-            defer { close(fd) }
-            if let name = ttyname(fd) {
-                let path = String(cString: name)
-                // Darwin may return the alias itself rather than the concrete
-                // /dev/ttysNNN device. That alias cannot match a terminal pane,
-                // so fall through to the process-table identity instead.
-                if path != "/dev/tty" {
-                    return path
-                }
-            }
+        if let device = concreteTerminalDevice(controllingTerminalDevice()) {
+            return device
         }
-        if let device = ttyDevicePath(forProcess: claudePID ?? getpid()) {
+        if let device = concreteTerminalDevice(processDevice(claudePID ?? ownPID())) {
             return device
         }
         // Outcome-only, never a path or pid: a silent nil here made a broken
@@ -223,20 +368,42 @@ public struct ClaudeHookPublisher: Sendable {
         // field (2026-07-20) — the join's tty half simply never matched and
         // nothing said why. Unified log only; stdout/stderr stay silent per
         // the hook contract.
-        #if canImport(os)
-        Logger(subsystem: "com.localvoxtral", category: "ClaudeHook").info(
-            "controlling tty unresolved: fds piped, /dev/tty unanswering, process table has no device"
-        )
-        #endif
+        log("controlling tty unresolved: fds piped, /dev/tty unanswering, process table has no device")
         return nil
     }
 
+    /// A step's answer, kept only when it is shaped like a device a terminal
+    /// pane reports — the same rule the app applies to a tty a session claims
+    /// (`ClaudeRemoteLocalTTYPath.isAcceptable`), so the two halves of the
+    /// comparison cannot disagree about what a tty is.
+    static func concreteTerminalDevice(_ candidate: String?) -> String? {
+        guard let candidate else { return nil }
+        guard ClaudeRemoteLocalTTYPath.isAcceptable(candidate) else {
+            // Outcome words only, same contract as the unresolved branch: the
+            // refused value is a path and paths do not go in the log.
+            log("controlling tty candidate refused: names no pane device, falling through")
+            return nil
+        }
+        return candidate
+    }
+
+    private static func log(_ message: String) {
+        #if canImport(os)
+        Logger(subsystem: "com.localvoxtral", category: "ClaudeHook").info("\(message, privacy: .public)")
+        #endif
+    }
+
     /// The `/dev/…` path of `pid`'s controlling terminal from the process
-    /// table (`kinfo_proc.kp_eproc.e_tdev`), or nil when the process does not
-    /// exist or has no terminal. Reads metadata about a pid we already hold —
-    /// no fds, no signals, no assumptions about our own session.
+    /// table (`kinfo_proc.kp_eproc.e_tdev`; `tty_nr` in `/proc/<pid>/stat` on
+    /// Linux), or nil when the process does not exist or has no terminal.
+    /// Reads metadata about a pid we already hold — no fds, no signals, no
+    /// assumptions about our own session.
     static func ttyDevicePath(forProcess pid: pid_t) -> String? {
         guard pid > 0 else { return nil }
+        #if os(Linux)
+        guard let stat = LinuxProcStat.read(pid: pid) else { return nil }
+        return LinuxProcStat.ptsPath(ttyNumber: stat.ttyNumber)
+        #elseif canImport(Darwin)
         var info = kinfo_proc()
         var size = MemoryLayout<kinfo_proc>.stride
         var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
@@ -247,6 +414,9 @@ public struct ClaudeHookPublisher: Sendable {
         let tdev = info.kp_eproc.e_tdev
         guard tdev != -1, tdev != 0, let name = devname(tdev, S_IFCHR) else { return nil }
         return "/dev/" + String(cString: name)
+        #else
+        return nil
+        #endif
     }
 
     /// Write to stdout with raw `write(2)`, looping over partial writes.
@@ -255,13 +425,21 @@ public struct ClaudeHookPublisher: Sendable {
     /// uncatchable ObjC exception on descriptor errors and aborts the process
     /// (the PR #60 class of field crash). A hook that crashes is a hook that
     /// breaks the user's turn, which is precisely what all of this exists to
-    /// avoid. A closed or broken stdout here is simply "no marker today".
+    /// avoid. A closed or broken stdout here is simply a status line that does
+    /// not render today.
     public static func writeStdout(_ data: Data) {
+        writeAll(data, toDescriptor: 1)
+    }
+
+    /// Write all of `data` to `descriptor` with raw `write(2)`, looping over
+    /// partial writes and EINTR, and dropping the rest on any other failure
+    /// (EBADF, EPIPE). Shared with the `localvoxtral` command (#1165).
+    public static func writeAll(_ data: Data, toDescriptor descriptor: Int32) {
         data.withUnsafeBytes { raw in
             guard let base = raw.baseAddress else { return }
             var offset = 0
             while offset < raw.count {
-                let written = retryingOnEINTR { write(1, base.advanced(by: offset), raw.count - offset) }
+                let written = retryingOnEINTR { write(descriptor, base.advanced(by: offset), raw.count - offset) }
                 if written <= 0 { return } // EPIPE/EBADF: give up silently.
                 offset += written
             }
@@ -282,16 +460,23 @@ public struct ClaudeHookPublisher: Sendable {
     /// another inline hook phase, and being late is worse than being absent.
     public static let stdinReadTimeout: TimeInterval = 0.25
 
+    /// - Parameter drainsExcess: keep reading (and discarding) past the cap
+    ///   until EOF or the deadline. Off for Claude Code, whose payloads are
+    ///   small. On for Vibe: a `post_tool` payload embeds the tool's whole
+    ///   output, and exiting with megabytes still in the pipe breaks Vibe's
+    ///   write mid-payload. The result is still over the cap, so it still
+    ///   fails to parse; what changes is that the writer finishes.
     public static func readBoundedStdin(
         limits: ClaudeHookLimits = .default,
         descriptor: Int32 = 0,
         timeout: TimeInterval = stdinReadTimeout,
+        drainsExcess: Bool = false,
         uptimeNanos: @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds }
     ) -> Data {
         let deadline = uptimeNanos() &+ UInt64(max(0, timeout) * 1_000_000_000)
         var buffer = Data()
         var chunk = [UInt8](repeating: 0, count: 16 * 1024)
-        while buffer.count <= limits.maxLineBytes {
+        while drainsExcess || buffer.count <= limits.maxLineBytes {
             let current = uptimeNanos()
             guard current < deadline else { break }
             let remainingMillis = (deadline - current) / 1_000_000
@@ -304,7 +489,9 @@ public struct ClaudeHookPublisher: Sendable {
             let count = read(descriptor, &chunk, chunk.count)
             if count < 0, errno == EINTR { continue }
             if count <= 0 { break } // EOF, or an error we treat as EOF.
-            buffer.append(contentsOf: chunk[0..<count])
+            // Past the cap only the first excess chunk is kept, which is what
+            // makes the result unparseable; the rest is read and dropped.
+            if buffer.count <= limits.maxLineBytes { buffer.append(contentsOf: chunk[0..<count]) }
         }
         return buffer
     }

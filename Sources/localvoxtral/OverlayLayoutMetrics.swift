@@ -1,14 +1,19 @@
 import AppKit
+import SwiftUI
 
 /// Layout values shared between `DictationOverlayView` (SwiftUI content) and
 /// `DictationOverlayController` (AppKit panel sizing). The controller measures
-/// text with `NSString.boundingRect` to size the panel, so every font size and
+/// text with `OverlayTextMeasurer` to size the panel, so every font size and
 /// width here MUST match what the view renders — deriving both sides from this
 /// one struct is what keeps them in lockstep (a mismatch clips the last line).
 ///
 /// The whole overlay scales from a single user setting: the body font size
 /// (`SettingsStore.overlayBufferFontSize`). All other fonts and the panel
 /// width scale proportionally so the buffer keeps its shape at any size.
+/// A second setting (`SettingsStore.overlayBufferVisibleLines`) sets how many
+/// body lines show before the text scrolls, and a third
+/// (`SettingsStore.overlayBufferWordHold`) whether the overlay writes its own
+/// line breaks to keep a word still being dictated on its line.
 struct OverlayLayoutMetrics: Equatable {
     /// The body font size the fixed-size overlay historically used; scale 1.0.
     static let baseBodyFontSize: CGFloat = 13
@@ -16,21 +21,47 @@ struct OverlayLayoutMetrics: Equatable {
     static let minimumBodyFontSize: Double = 10
     static let maximumBodyFontSize: Double = 24
 
-    let bodyFontSize: CGFloat
+    static let defaultVisibleLines = 4
+    static let minimumVisibleLines = 2
+    static let maximumVisibleLines = 12
 
-    init(bodyFontSize: Double) {
+    let bodyFontSize: CGFloat
+    let visibleLines: Int
+    let wordHold: OverlayWordHold
+
+    init(
+        bodyFontSize: Double,
+        visibleLines: Int = defaultVisibleLines,
+        wordHold: OverlayWordHold = .off
+    ) {
         self.bodyFontSize = CGFloat(Self.clampedBodyFontSize(bodyFontSize))
+        self.visibleLines = Self.clampedVisibleLines(visibleLines)
+        self.wordHold = wordHold
     }
 
     static func clampedBodyFontSize(_ size: Double) -> Double {
         min(max(size, minimumBodyFontSize), maximumBodyFontSize)
     }
 
+    static func clampedVisibleLines(_ lines: Int) -> Int {
+        min(max(lines, minimumVisibleLines), maximumVisibleLines)
+    }
+
     var scale: CGFloat { bodyFontSize / Self.baseBodyFontSize }
 
-    // Fonts (11pt title/error at the base 13pt body).
+    // Fonts (11pt title/error, 10pt badge at the base 13pt body).
     var titleFontSize: CGFloat { 11 * scale }
     var errorFontSize: CGFloat { 11 * scale }
+    /// The header's trailing pills ("Polished", the Claude join badge). Scaled
+    /// like every other font here: a fixed 10pt overflowed `headerHeight` at
+    /// the smallest body size (which is `ceil(16 * scale)`, so it shrinks while
+    /// an unscaled pill did not) and shrank to a speck at the largest.
+    var badgeFontSize: CGFloat { 10 * scale }
+    /// Pill chrome, scaled with the pill's own text — unlike `contentPadding`,
+    /// which is deliberately fixed because it frames the panel rather than a
+    /// piece of scaling text.
+    var badgeHorizontalPadding: CGFloat { 6 * scale }
+    var badgeVerticalPadding: CGFloat { 1 * scale }
 
     // Panel geometry (400/420/540 at scale 1.0).
     var panelMinWidth: CGFloat { 400 * scale }
@@ -43,13 +74,49 @@ struct OverlayLayoutMetrics: Equatable {
     // weight; only referenced here because the height math needs them.
     static let contentPadding: CGFloat = 10
     static let stackSpacing: CGFloat = 8
-    /// Slack added to the 4-line scroll cap. Same value as `stackSpacing`
-    /// today, but a distinct knob: tuning the VStack gap must not silently
-    /// change when scrolling kicks in.
-    static let bodyScrollSlack: CGFloat = 8
 
     /// Width available to text: panel width minus horizontal padding.
     var textMeasurementWidth: CGFloat { panelWidth - Self.contentPadding * 2 }
+
+    /// Width of `text` in the body font, as AppKit measures it.
+    ///
+    /// Used by `OverlayStableLineWrapper` to place line breaks. Widths — unlike
+    /// the line heights `OverlayTextMeasurer` exists for — agree closely
+    /// between AppKit and SwiftUI for the same font, and the wrapper holds a
+    /// safety margin back for what is left.
+    func bodyTextWidth(of text: String) -> CGFloat {
+        (text as NSString).size(withAttributes: [.font: NSFont.systemFont(ofSize: bodyFontSize)]).width
+    }
+
+    /// Room a word still being streamed needs to start a line mid-way through
+    /// it: `letters` lowercase letters, the length the user chose in
+    /// `OverlayWordHold`. The ragged right edge it costs is up to that wide.
+    func liveWordReserveWidth(letters: Int) -> CGFloat {
+        let alphabet = "abcdefghijklmnopqrstuvwxyz"
+        return bodyTextWidth(of: String(alphabet.prefix(letters)))
+    }
+
+    /// Width the body text gets once the buffer scrolls. The body's
+    /// `ScrollView` then takes a scroller's width off its content, even with
+    /// overlay scrollers (measured: 497pt of text width at 16pt body, 480pt
+    /// once scrolling). Lines broken for the full width would be wrapped again
+    /// by SwiftUI there, which pushes the last two words of a line down onto a
+    /// line of their own. Breaking at this width holds in both states.
+    var bodyTextWrapWidth: CGFloat {
+        textMeasurementWidth - NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy)
+    }
+
+    /// A wrapper that breaks lines at `bodyTextWrapWidth` — see
+    /// `OverlayStableLineWrapper` for why the overlay can wrap its own text.
+    /// Nil when `wordHold` is off: SwiftUI then wraps at the full width.
+    func makeStableLineWrapper() -> OverlayStableLineWrapper? {
+        guard let letters = wordHold.letters else { return nil }
+        return OverlayStableLineWrapper(
+            availableWidth: bodyTextWrapWidth,
+            reserveWidth: liveWordReserveWidth(letters: letters),
+            widthOf: bodyTextWidth(of:)
+        )
+    }
 
     var bodyLineHeight: CGFloat {
         let font = NSFont.systemFont(ofSize: bodyFontSize)
@@ -57,37 +124,44 @@ struct OverlayLayoutMetrics: Equatable {
     }
 
     /// Maximum height the body text area can grow to before scrolling kicks
-    /// in: ~4 lines of body text plus some line spacing.
+    /// in: exactly `visibleLines` rendered lines plus the scroll-to-bottom
+    /// anchor under them, so a scrolled buffer shows that many whole lines and
+    /// no sliver of the one above. Measured, not `bodyLineHeight * n`: SwiftUI's
+    /// line height differs from the font metrics at many sizes.
+    @MainActor
     var maxScrollableBodyHeight: CGFloat {
-        bodyLineHeight * 4 + Self.bodyScrollSlack
+        let lines = Array(repeating: "Xg", count: visibleLines).joined(separator: "\n")
+        return OverlayTextMeasurer.height(
+            of: lines, fontSize: bodyFontSize, width: textMeasurementWidth)
+            + OverlayBodyScrollContent.bottomAnchorHeight
     }
 
     /// Height of the body text as rendered at `textMeasurementWidth`, floored
     /// to one line and capped at `maxScrollableBodyHeight`.
+    @MainActor
     func bodyTextHeight(for text: String) -> CGFloat {
         min(unclampedBodyTextHeight(for: text), maxScrollableBodyHeight)
     }
 
     /// Uncapped variant — the view compares this against
     /// `maxScrollableBodyHeight` to decide whether scrolling is needed.
+    @MainActor
     func unclampedBodyTextHeight(for text: String) -> CGFloat {
         guard !text.isEmpty else { return bodyLineHeight }
-        let rect = (text as NSString).boundingRect(
-            with: CGSize(width: textMeasurementWidth, height: .greatestFiniteMagnitude),
-            options: [.usesLineFragmentOrigin, .usesFontLeading],
-            attributes: [.font: NSFont.systemFont(ofSize: bodyFontSize)]
-        )
-        return max(ceil(rect.height), bodyLineHeight)
+        return max(
+            OverlayTextMeasurer.height(of: text, fontSize: bodyFontSize, width: textMeasurementWidth),
+            bodyLineHeight)
     }
 
     /// Full panel content height: header + spacing + body + optional error +
     /// padding. Mirrors `DictationOverlayView.body` exactly.
-    ///
-    /// Measures text with `NSString.boundingRect` rather than the hosting
-    /// view's `fittingSize` / `sizeThatFits`, which both try to minimise the
-    /// overall size and can widen the view to avoid a line wrap, returning a
-    /// height that is one line too short.
-    func contentHeight(text: String, errorMessage: String?) -> CGFloat {
+    @MainActor
+    func contentHeight(
+        text: String,
+        errorMessage: String?,
+        draftReview: QuickCaptureDraftSnapshot? = nil,
+        destinations: OverlayDestinationStrip? = nil
+    ) -> CGFloat {
         let displayText = text.trimmed.isEmpty ? "" : text
 
         var total = Self.contentPadding * 2
@@ -95,17 +169,79 @@ struct OverlayLayoutMetrics: Equatable {
             + Self.stackSpacing
             + bodyTextHeight(for: displayText)
 
+        if let draftReview {
+            total += Self.stackSpacing + draftReviewHeight(draftReview)
+        } else if let destinations, destinations.isOpen {
+            total += Self.stackSpacing + destinationListHeight(rows: destinations.items.count)
+        }
+
         if let errorMessage, !errorMessage.trimmed.isEmpty {
-            let errorFont = NSFont.systemFont(ofSize: errorFontSize)
-            let errorRect = (errorMessage as NSString).boundingRect(
-                with: CGSize(width: textMeasurementWidth, height: .greatestFiniteMagnitude),
-                options: [.usesLineFragmentOrigin, .usesFontLeading],
-                attributes: [.font: errorFont]
-            )
-            total += Self.stackSpacing + ceil(errorRect.height)
+            total += Self.stackSpacing
+                + OverlayTextMeasurer.height(
+                    of: errorMessage, fontSize: errorFontSize, width: textMeasurementWidth)
         }
 
         return total
+    }
+}
+
+extension OverlayLayoutMetrics {
+    /// The open destination list (#1015) shows this many rows, then scrolls.
+    static let maximumVisibleDestinationRows = 6
+    static let destinationRowSpacing: CGFloat = 2
+
+    /// One destination row: a pill's text plus its padding.
+    var destinationRowHeight: CGFloat { ceil(16 * scale) }
+
+    /// The open destination list, as `DictationOverlayView` draws it.
+    func destinationListHeight(rows: Int) -> CGFloat {
+        let visible = CGFloat(min(max(rows, 1), Self.maximumVisibleDestinationRows))
+        return visible * destinationRowHeight + (visible - 1) * Self.destinationRowSpacing
+    }
+
+    /// Spacing between the draft's title, excerpt and hint.
+    static let draftReviewSpacing: CGFloat = 2
+    static let draftReviewHint = "Say \u{201C}file it\u{201D}, \u{201C}drop it\u{201D}, or a change"
+
+    /// The draft block of a review (#927): title, excerpt and hint, as
+    /// `DictationOverlayView.draftReviewBlock` lays them out.
+    @MainActor
+    func draftReviewHeight(_ draft: QuickCaptureDraftSnapshot) -> CGFloat {
+        var total = OverlayTextMeasurer.height(
+            of: draft.title, fontSize: bodyFontSize, weight: .semibold, width: textMeasurementWidth)
+        let excerpt = draft.bodyExcerpt
+        if !excerpt.isEmpty {
+            total += Self.draftReviewSpacing
+                + OverlayTextMeasurer.height(of: excerpt, fontSize: errorFontSize, width: textMeasurementWidth)
+        }
+        total += Self.draftReviewSpacing
+            + OverlayTextMeasurer.height(of: Self.draftReviewHint, fontSize: badgeFontSize, width: textMeasurementWidth)
+        return total
+    }
+}
+
+/// Measures wrapped overlay text with SwiftUI, the engine that draws it.
+///
+/// `NSString.boundingRect` disagrees with SwiftUI's line heights at many font
+/// sizes (3 lines of 16pt: 54pt measured, 57pt drawn), and the panel sized
+/// from it clipped the last line's descenders. The hosting view's own
+/// `fittingSize` / `sizeThatFits` is no substitute either: both minimise the
+/// overall size and can widen the view to avoid a wrap. A lone `Text` at a
+/// fixed width has no such freedom, so its height is what the row renders.
+@MainActor
+private enum OverlayTextMeasurer {
+    private static let host = NSHostingController(rootView: AnyView(EmptyView()))
+
+    static func height(of text: String, fontSize: CGFloat, weight: Font.Weight = .regular, width: CGFloat) -> CGFloat {
+        // Same font and wrapping modifiers as the body and error rows in
+        // `DictationOverlayView`.
+        host.rootView = AnyView(
+            Text(text)
+                .font(.system(size: fontSize, weight: weight))
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(width: width, alignment: .topLeading)
+        )
+        return ceil(host.sizeThatFits(in: CGSize(width: width, height: .greatestFiniteMagnitude)).height)
     }
 }
 
@@ -117,20 +253,20 @@ struct OverlayLayoutMetrics: Equatable {
 /// A font-size change mid-dictation would violate it: the next render would
 /// keep the stale locked X while the panel widens, pushing the right edge
 /// off-screen. So the metrics are locked alongside: the first render of a
-/// session snapshots the font size, and a settings change applies to the next
-/// session (`unlock()` on hide).
+/// session snapshots the settings, and a change applies to the next session
+/// (`unlock()` on hide).
 struct OverlaySessionMetricsLock {
     private var locked: OverlayLayoutMetrics?
 
-    /// The session's metrics, locking `currentFontSize` on first call.
-    mutating func metrics(currentFontSize: Double) -> OverlayLayoutMetrics {
+    /// The session's metrics, locking `current` on first call.
+    mutating func metrics(current: () -> OverlayLayoutMetrics) -> OverlayLayoutMetrics {
         if let locked { return locked }
-        let metrics = OverlayLayoutMetrics(bodyFontSize: currentFontSize)
+        let metrics = current()
         locked = metrics
         return metrics
     }
 
-    /// Ends the session: the next `metrics(currentFontSize:)` re-reads the size.
+    /// Ends the session: the next `metrics(current:)` re-reads the settings.
     mutating func unlock() {
         locked = nil
     }

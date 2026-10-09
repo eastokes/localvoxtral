@@ -33,18 +33,93 @@ final class AccessibilityTrustManagerTests: XCTestCase {
         XCTAssertTrue(manager.isTrusted)
     }
 
-    func testRequestPermission_promptsEveryCall() {
-        var promptCount = 0
+    func testRefresh_whenTrustBecomesGranted_clearsErrorAndNotifies() {
+        var trusted = false
+        var trustChangedCount = 0
         let manager = AccessibilityTrustManager(
-            trustChecker: { false },
-            permissionPrompter: { promptCount += 1 },
+            trustChecker: { trusted },
+            permissionPrompter: {},
             pollingTimeoutSeconds: 0
         )
+        manager.onTrustChanged = {
+            trustChangedCount += 1
+        }
+        manager.lastError = AccessibilityTrustManager.errorMessage
 
-        manager.requestPermission()
-        manager.requestPermission()
+        manager.refresh()
+        XCTAssertFalse(manager.isTrusted)
+        XCTAssertEqual(manager.lastError, AccessibilityTrustManager.errorMessage)
 
-        XCTAssertEqual(promptCount, 2)
+        trusted = true
+        manager.refresh()
+
+        XCTAssertTrue(manager.isTrusted)
+        XCTAssertNil(manager.lastError)
+        XCTAssertEqual(trustChangedCount, 1)
+    }
+
+    func testPromptIfNeeded_pollingRefreshesUntilTrusted() async {
+        var trusted = false
+        var currentDate = Date(timeIntervalSince1970: 1_000)
+        var sleepCalls = 0
+
+        let manager = AccessibilityTrustManager(
+            trustChecker: { trusted },
+            permissionPrompter: {},
+            sleepFor: { _ in
+                sleepCalls += 1
+                trusted = true
+                currentDate.addTimeInterval(0.05)
+            },
+            now: { currentDate },
+            pollingInterval: .milliseconds(1),
+            pollingTimeoutSeconds: 1
+        )
+
+        // The polling task's refresh is the write this waits for.
+        await awaitNextWrite(of: { manager.isTrusted }) {
+            manager.promptIfNeeded()
+        }
+
+        XCTAssertTrue(manager.isTrusted)
+        XCTAssertGreaterThanOrEqual(sleepCalls, 1)
+    }
+
+    // MARK: - XCTest-pinned defaults (live TCC sampling must never reach tests)
+
+    func testDefaultTrustCheckerIsPinnedTrustedUnderXCTest() {
+        // Before the pin this sampled the HOST's live AXIsProcessTrusted() —
+        // the whole unit suite went red when a runner auto-update swapped the
+        // bundled node binary and invalidated its Accessibility grant
+        // (2026-07-24). Deterministic on every host by construction now.
+        XCTAssertTrue(AccessibilityTrustManager.defaultTrustChecker())
+    }
+
+    func testDefaultInitializedManagerIsTrustedUnderXCTest() {
+        // A manager built with the production defaults (no injected checker,
+        // the path DictationViewModel takes) must resolve trusted under
+        // XCTest so session-start warnings stay deterministic; tests that
+        // exercise the untrusted paths pin debugSetTrustOverride(false).
+        let manager = AccessibilityTrustManager(pollingTimeoutSeconds: 0)
+
+        manager.refresh()
+
+        XCTAssertTrue(manager.isTrusted)
+        XCTAssertNil(manager.lastError)
+    }
+
+    func testResetPermission_failurePreservesCurrentTrustState() {
+        let manager = AccessibilityTrustManager(
+            trustChecker: { true },
+            permissionPrompter: {},
+            permissionResetter: { _ in false },
+            pollingTimeoutSeconds: 0
+        )
+        manager.refresh()
+
+        XCTAssertFalse(manager.resetPermission(bundleIdentifier: "com.localvoxtral.app"))
+        XCTAssertTrue(manager.isTrusted)
+        XCTAssertFalse(manager.requiresRestartAfterReset)
     }
 
     func testResetPermission_requiresRestartAndDoesNotReprompt() {
@@ -72,22 +147,6 @@ final class AccessibilityTrustManagerTests: XCTestCase {
         XCTAssertTrue(manager.requiresRestartAfterReset)
     }
 
-    func testResetPermission_withoutBundleIdentifierFailsWithoutResetting() {
-        var resetCount = 0
-        let manager = AccessibilityTrustManager(
-            trustChecker: { false },
-            permissionPrompter: {},
-            permissionResetter: { _ in
-                resetCount += 1
-                return true
-            },
-            pollingTimeoutSeconds: 0
-        )
-
-        XCTAssertFalse(manager.resetPermission(bundleIdentifier: nil))
-        XCTAssertEqual(resetCount, 0)
-    }
-
     func testResetPermission_successForcesUntrustedWithoutReReadingCachedTCCState() {
         var trustCheckCount = 0
         let manager = AccessibilityTrustManager(
@@ -110,91 +169,19 @@ final class AccessibilityTrustManagerTests: XCTestCase {
         XCTAssertEqual(trustCheckCount, 1)
     }
 
-    func testResetPermission_failurePreservesCurrentTrustState() {
+    func testResetPermission_withoutBundleIdentifierFailsWithoutResetting() {
+        var resetCount = 0
         let manager = AccessibilityTrustManager(
-            trustChecker: { true },
+            trustChecker: { false },
             permissionPrompter: {},
-            permissionResetter: { _ in false },
-            pollingTimeoutSeconds: 0
-        )
-        manager.refresh()
-
-        XCTAssertFalse(manager.resetPermission(bundleIdentifier: "com.localvoxtral.app"))
-        XCTAssertTrue(manager.isTrusted)
-        XCTAssertFalse(manager.requiresRestartAfterReset)
-    }
-
-    func testRefresh_whenTrustBecomesGranted_clearsErrorAndNotifies() {
-        var trusted = false
-        var trustChangedCount = 0
-        let manager = AccessibilityTrustManager(
-            trustChecker: { trusted },
-            permissionPrompter: {},
-            pollingTimeoutSeconds: 0
-        )
-        manager.onTrustChanged = {
-            trustChangedCount += 1
-        }
-        manager.lastError = AccessibilityTrustManager.errorMessage
-
-        manager.refresh()
-        XCTAssertFalse(manager.isTrusted)
-        XCTAssertEqual(manager.lastError, AccessibilityTrustManager.errorMessage)
-
-        trusted = true
-        manager.refresh()
-
-        XCTAssertTrue(manager.isTrusted)
-        XCTAssertNil(manager.lastError)
-        XCTAssertEqual(trustChangedCount, 1)
-    }
-
-    func testRequestPermission_pollingRefreshesUntilTrusted() async {
-        var trusted = false
-        var currentDate = Date(timeIntervalSince1970: 1_000)
-        var sleepCalls = 0
-
-        let manager = AccessibilityTrustManager(
-            trustChecker: { trusted },
-            permissionPrompter: {},
-            sleepFor: { _ in
-                sleepCalls += 1
-                trusted = true
-                currentDate.addTimeInterval(0.05)
+            permissionResetter: { _ in
+                resetCount += 1
+                return true
             },
-            now: { currentDate },
-            pollingInterval: .milliseconds(1),
-            pollingTimeoutSeconds: 1
+            pollingTimeoutSeconds: 0
         )
 
-        manager.requestPermission()
-        await Task.yield()
-        await Task.yield()
-
-        XCTAssertTrue(manager.isTrusted)
-        XCTAssertGreaterThanOrEqual(sleepCalls, 1)
-    }
-
-    // MARK: - XCTest-pinned defaults (live TCC sampling must never reach tests)
-
-    func testDefaultTrustCheckerIsPinnedTrustedUnderXCTest() {
-        // Before the pin this sampled the HOST's live AXIsProcessTrusted() —
-        // the whole unit suite went red when a runner auto-update swapped the
-        // bundled node binary and invalidated its Accessibility grant
-        // (2026-07-24). Deterministic on every host by construction now.
-        XCTAssertTrue(AccessibilityTrustManager.defaultTrustChecker())
-    }
-
-    func testDefaultInitializedManagerIsTrustedUnderXCTest() {
-        // A manager built with the production defaults (no injected checker,
-        // the path DictationViewModel takes) must resolve trusted under
-        // XCTest so session-start warnings stay deterministic; tests that
-        // exercise the untrusted paths pin debugSetTrustOverride(false).
-        let manager = AccessibilityTrustManager(pollingTimeoutSeconds: 0)
-
-        manager.refresh()
-
-        XCTAssertTrue(manager.isTrusted)
-        XCTAssertNil(manager.lastError)
+        XCTAssertFalse(manager.resetPermission(bundleIdentifier: nil))
+        XCTAssertEqual(resetCount, 0)
     }
 }

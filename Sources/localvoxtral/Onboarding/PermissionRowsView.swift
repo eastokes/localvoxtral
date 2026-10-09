@@ -8,6 +8,7 @@ import SwiftUI
 /// mirroring the popover's refresh pattern.
 struct PermissionRowsView: View {
     var viewModel: DictationViewModel
+    var accessibilityPane: AccessibilitySettingsPane = .current
 
     private static let accessibilitySettingsURL =
         "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
@@ -44,7 +45,7 @@ struct PermissionRowsView: View {
 
     private var accessibilityRow: some View {
         PermissionRow(
-            title: "Accessibility",
+            title: accessibilityPane.name,
             subtitle: "Lets localvoxtral type transcribed text into other apps.",
             isGranted: viewModel.isAccessibilityTrusted,
             statusText: accessibilityStatusText,
@@ -55,11 +56,11 @@ struct PermissionRowsView: View {
     // MARK: - Microphone state
 
     private var microphoneGranted: Bool {
-        viewModel.microphoneAuthorizationStatus == .authorized
+        viewModel.permissions.microphoneAuthorizationStatus == .authorized
     }
 
     private var microphoneStatusText: String {
-        switch viewModel.microphoneAuthorizationStatus {
+        switch viewModel.permissions.microphoneAuthorizationStatus {
         case .authorized: return "Granted"
         case .denied: return "Denied"
         case .restricted: return "Restricted"
@@ -68,12 +69,12 @@ struct PermissionRowsView: View {
     }
 
     private var microphoneAction: PermissionRow.Action? {
-        switch viewModel.microphoneAuthorizationStatus {
+        switch viewModel.permissions.microphoneAuthorizationStatus {
         case .authorized:
             return nil
         case .notDetermined:
-            return PermissionRow.Action(label: "Allow Microphone…") {
-                viewModel.requestMicrophonePermission()
+            return PermissionRow.Action(label: "Allow microphone…") {
+                viewModel.permissions.requestMicrophonePermission()
             }
         case .denied, .restricted:
             return PermissionRow.Action(label: "Open System Settings") {
@@ -90,20 +91,16 @@ struct PermissionRowsView: View {
     }
 
     private var accessibilityAction: PermissionRow.Action? {
-        guard !viewModel.isAccessibilityTrusted,
-              !viewModel.isAccessibilityRestartRequired
-        else {
-            return nil
-        }
-        return PermissionRow.Action(label: "Grant Access") {
-            viewModel.requestAccessibilityPermission()
+        guard !viewModel.isAccessibilityTrusted, !viewModel.isAccessibilityRestartRequired else { return nil }
+        return PermissionRow.Action(label: "Grant access") {
+            viewModel.permissions.requestAccessibilityPermission()
             Self.openSettings(Self.accessibilitySettingsURL)
         }
     }
 
     private func refresh() {
-        viewModel.refreshAccessibilityTrustState()
-        viewModel.refreshMicrophonePermissionState()
+        viewModel.permissions.refreshAccessibilityTrustState()
+        viewModel.permissions.refreshMicrophonePermissionState()
     }
 
     private static func openSettings(_ urlString: String) {

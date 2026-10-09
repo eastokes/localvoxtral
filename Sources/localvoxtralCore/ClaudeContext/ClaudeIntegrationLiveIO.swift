@@ -1,0 +1,453 @@
+import Foundation
+
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+
+/// Live file systems for the Integrations pane's two installers, with the
+/// same discipline as the ssh-config and shell-rc writers
+/// (`ClaudeRemoteEnrollmentLiveIO.swift`): `lstat` so a symlink is seen as
+/// one, `O_NOFOLLOW` on the temp file, an atomic rename, symlink refusal on
+/// every path component from home, and "unreadable" reported distinctly from
+/// "absent" so a confirmed install can never blank a file it could not read.
+///
+/// The two structs stay separate despite their shape: `~/.claude` and
+/// `~/.config/opencode` have different owners of trust (Claude Code's own
+/// settings vs a third harness's config), and merging them would let one
+/// path's rules apply where they do not belong — the same reason the
+/// ssh-config and rc writers were never merged.
+package enum ClaudeIntegrationLiveIO {
+    /// Temp-write + rename into the destination directory, so the rename is
+    /// same-filesystem and atomic. Mirrors the two existing writers syscall
+    /// for syscall (`O_EXCL | O_NOFOLLOW`, `fchmod`, full write with EINTR
+    /// retry, `fsync`, `rename`, unlink-on-failure).
+    ///
+    /// With `replacing`, the rename happens only while the destination still
+    /// holds those bytes (`.some(nil)`: no file), the ones the caller read;
+    /// otherwise nothing is written and `ChangedOnDisk` is thrown (#1726).
+    package static func atomicWrite(
+        _ data: Data, to destinationURL: URL, permissions: UInt16, replacing expected: Data?? = nil
+    ) throws {
+        let directoryURL = destinationURL.deletingLastPathComponent()
+        let temporaryURL = directoryURL.appendingPathComponent(
+            ".localvoxtral-install.\(UUID().uuidString)", isDirectory: false
+        )
+        struct POSIXFailure: Error, CustomStringConvertible {
+            var operation: String
+            var code: Int32
+            var description: String { "\(operation) failed with errno \(code)" }
+        }
+        let descriptor = temporaryURL.path.withCString {
+            open($0, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)
+        }
+        guard descriptor >= 0 else { throw POSIXFailure(operation: "open", code: errno) }
+        var renamed = false
+        defer {
+            close(descriptor)
+            if !renamed { _ = temporaryURL.path.withCString { unlink($0) } }
+        }
+        guard fchmod(descriptor, mode_t(permissions)) == 0 else {
+            throw POSIXFailure(operation: "fchmod", code: errno)
+        }
+        try data.withUnsafeBytes { raw in
+            guard let baseAddress = raw.baseAddress else { return }
+            var offset = 0
+            while offset < raw.count {
+                let written = LibC.write(
+                    descriptor, baseAddress.advanced(by: offset), raw.count - offset
+                )
+                if written == -1, errno == EINTR { continue }
+                guard written > 0 else {
+                    throw POSIXFailure(operation: "write", code: errno)
+                }
+                offset += written
+            }
+        }
+        guard fsync(descriptor) == 0 else { throw POSIXFailure(operation: "fsync", code: errno) }
+        if let expected, !leaf(at: destinationURL, holds: expected) { throw ChangedOnDisk() }
+        let moved = temporaryURL.path.withCString { source in
+            destinationURL.path.withCString { destination in rename(source, destination) }
+        }
+        guard moved == 0 else { throw POSIXFailure(operation: "rename", code: errno) }
+        renamed = true
+    }
+
+    /// The destination no longer holds what the caller read: another
+    /// program saved it in between.
+    package struct ChangedOnDisk: Error {}
+
+    /// Whether the leaf at `url` holds `expected`, nil meaning no file. A
+    /// symlink or a failed read holds nothing a caller read.
+    package static func leaf(at url: URL, holds expected: Data?) -> Bool {
+        let current = readLeaf(at: url)
+        guard current.exists else { return expected == nil }
+        return !current.isSymlink && current.data != nil && current.data == expected
+    }
+
+    /// Read-or-absent for a leaf file: nil data with `exists == true` means
+    /// "exists but could not be read" — the services turn that into a
+    /// refusal, never into an empty file.
+    package static func readLeaf(at url: URL) -> (exists: Bool, isSymlink: Bool, data: Data?, permissions: UInt16?) {
+        let metadata = ClaudeSocketGuard.metadata(ofPath: url.path)
+        guard let metadata else { return (false, false, nil, nil) }
+        guard !metadata.isSymlink else { return (true, true, nil, nil) }
+        // NOT `try!` and not defaulted: an unreadable file must reach the
+        // writer as "unreadable", never as empty (rc writer finding M2).
+        let data = try? Data(contentsOf: url)
+        var permissions: UInt16?
+        if data != nil,
+           let number = try? FileManager.default
+               .attributesOfItem(atPath: url.path)[.posixPermissions] as? NSNumber {
+            permissions = number.uint16Value
+        }
+        return (true, false, data, permissions)
+    }
+}
+
+/// `~/.claude/settings.json`, live.
+package struct LiveClaudeStatuslineFileSystem: ClaudeStatuslineFileSystem {
+    package static let settingsRelativePath = ".claude/settings.json"
+
+    private let homeURL: URL
+    private let relativePath: String
+    private let fileURL: URL
+    private let directoryURL: URL
+
+    /// `relativePath` defaults to the settings file; Combine's script uses
+    /// the same discipline at `ClaudeStatuslineCombine.scriptRelativePath`.
+    package init(
+        relativePath: String = Self.settingsRelativePath,
+        homeDirectoryURL: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) {
+        homeURL = homeDirectoryURL
+        self.relativePath = relativePath
+        fileURL = homeDirectoryURL.appendingPathComponent(relativePath, isDirectory: false)
+        directoryURL = fileURL.deletingLastPathComponent()
+    }
+
+    package func readState() throws -> ClaudeStatuslineState {
+        let leaf = ClaudeIntegrationLiveIO.readLeaf(at: fileURL)
+        let intermediateIsSymlink = LiveClaudeShellRCFileSystem.anyComponentIsSymlink(
+            under: homeURL, relativePath: relativePath
+        )
+        return ClaudeStatuslineState(
+            fileExists: leaf.exists,
+            fileIsSymlink: leaf.isSymlink,
+            directoryExists: ClaudeSocketGuard.metadata(ofPath: directoryURL.path)?.isDirectory == true,
+            directoryIsSymlink: intermediateIsSymlink,
+            // A file behind a symlinked component reads as absent-with-data-nil
+            // only when nothing exists; when the leaf itself exists but the
+            // path is untrusted, report it as existing-but-unreadable so the
+            // writer refuses on the symlink gate rather than treating it as
+            // a fresh install.
+            data: intermediateIsSymlink ? nil : leaf.data,
+            permissions: intermediateIsSymlink ? nil : leaf.permissions
+        )
+    }
+
+    package func createDirectory(permissions: UInt16) throws {
+        try FileManager.default.createDirectory(
+            at: directoryURL,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: NSNumber(value: permissions)]
+        )
+    }
+
+    package func atomicWrite(_ data: Data, permissions: UInt16) throws {
+        try ClaudeIntegrationLiveIO.atomicWrite(data, to: fileURL, permissions: permissions)
+    }
+
+    package func deleteFile() throws {
+        if FileManager.default.fileExists(atPath: fileURL.path) {
+            try FileManager.default.removeItem(at: fileURL)
+        }
+    }
+}
+
+/// `~/.config/opencode/plugins/localvoxtral.js` + `~/.config/opencode/tui.json`, live.
+package struct LiveOpencodePluginFileSystem: OpencodePluginFileSystem {
+    package static let pluginsRelativePath = ".config/opencode/plugins/\(ClaudePluginAssets.opencodePluginFileName)"
+    package static let tuiRelativePath = ".config/opencode/tui.json"
+    package static let pluginsDirectoryRelativePath = ".config/opencode/plugins"
+    package static let configDirectoryRelativePath = ".config/opencode"
+
+    private let homeURL: URL
+    private let pluginURL: URL
+    private let pluginsDirectoryURL: URL
+    private let tuiURL: URL
+    private let configDirectoryURL: URL
+
+    package init(homeDirectoryURL: URL = FileManager.default.homeDirectoryForCurrentUser) {
+        homeURL = homeDirectoryURL
+        pluginURL = homeDirectoryURL.appendingPathComponent(Self.pluginsRelativePath, isDirectory: false)
+        pluginsDirectoryURL = homeDirectoryURL.appendingPathComponent(
+            Self.pluginsDirectoryRelativePath, isDirectory: true
+        )
+        tuiURL = homeDirectoryURL.appendingPathComponent(Self.tuiRelativePath, isDirectory: false)
+        configDirectoryURL = homeDirectoryURL.appendingPathComponent(
+            Self.configDirectoryRelativePath, isDirectory: true
+        )
+    }
+
+    package func readState() throws -> OpencodePluginState {
+        let pluginIntermediateIsSymlink = LiveClaudeShellRCFileSystem.anyComponentIsSymlink(
+            under: homeURL, relativePath: Self.pluginsRelativePath
+        )
+        let tuiIntermediateIsSymlink = LiveClaudeShellRCFileSystem.anyComponentIsSymlink(
+            under: homeURL, relativePath: Self.tuiRelativePath
+        )
+        let pluginLeaf = ClaudeIntegrationLiveIO.readLeaf(at: pluginURL)
+        let tuiLeaf = ClaudeIntegrationLiveIO.readLeaf(at: tuiURL)
+        return OpencodePluginState(
+            pluginFileExists: pluginLeaf.exists,
+            pluginFileIsSymlink: pluginLeaf.isSymlink,
+            pluginData: pluginIntermediateIsSymlink ? nil : pluginLeaf.data,
+            pluginPermissions: pluginIntermediateIsSymlink ? nil : pluginLeaf.permissions,
+            pluginsDirExists: ClaudeSocketGuard.metadata(ofPath: pluginsDirectoryURL.path)?.isDirectory == true,
+            pluginsDirIsSymlink: pluginIntermediateIsSymlink,
+            tuiFileExists: tuiLeaf.exists,
+            tuiFileIsSymlink: tuiLeaf.isSymlink,
+            tuiData: tuiIntermediateIsSymlink ? nil : tuiLeaf.data,
+            tuiPermissions: tuiIntermediateIsSymlink ? nil : tuiLeaf.permissions,
+            configDirExists: ClaudeSocketGuard.metadata(ofPath: configDirectoryURL.path)?.isDirectory == true,
+            configDirIsSymlink: tuiIntermediateIsSymlink
+        )
+    }
+
+    package func createPluginsDirectory(permissions: UInt16) throws {
+        try FileManager.default.createDirectory(
+            at: pluginsDirectoryURL,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: NSNumber(value: permissions)]
+        )
+    }
+
+    package func createConfigDirectory(permissions: UInt16) throws {
+        try FileManager.default.createDirectory(
+            at: configDirectoryURL,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: NSNumber(value: permissions)]
+        )
+    }
+
+    package func atomicWritePlugin(_ data: Data, permissions: UInt16, replacing expected: Data?) throws {
+        try Self.refusingAChangedFile {
+            try ClaudeIntegrationLiveIO.atomicWrite(data, to: pluginURL, permissions: permissions, replacing: expected)
+        }
+    }
+
+    package func atomicWriteTUI(_ data: Data, permissions: UInt16, replacing expected: Data?) throws {
+        try Self.refusingAChangedFile {
+            try ClaudeIntegrationLiveIO.atomicWrite(data, to: tuiURL, permissions: permissions, replacing: expected)
+        }
+    }
+
+    package func deletePlugin() throws {
+        if FileManager.default.fileExists(atPath: pluginURL.path) {
+            try FileManager.default.removeItem(at: pluginURL)
+        }
+    }
+
+    package func deleteTUI(replacing expected: Data) throws {
+        guard ClaudeIntegrationLiveIO.leaf(at: tuiURL, holds: expected) else {
+            throw OpencodePluginInstallService.ServiceError.changedOnDisk
+        }
+        try FileManager.default.removeItem(at: tuiURL)
+    }
+
+    private static func refusingAChangedFile(_ body: () throws -> Void) throws {
+        do {
+            try body()
+        } catch is ClaudeIntegrationLiveIO.ChangedOnDisk {
+            throw OpencodePluginInstallService.ServiceError.changedOnDisk
+        }
+    }
+}
+
+/// `~/.vibe/localvoxtral/publish.sh` + `~/.vibe/hooks.toml`, live.
+package struct LiveVibeHooksFileSystem: VibeHooksFileSystem {
+    package static let shimDirectoryRelativePath = ".vibe/localvoxtral"
+    package static let shimRelativePath = "\(shimDirectoryRelativePath)/\(ClaudePluginAssets.vibeShimFileName)"
+    package static let hooksRelativePath = ".vibe/hooks.toml"
+
+    private let homeURL: URL
+    private let shimURL: URL
+    private let shimDirectoryURL: URL
+    private let hooksURL: URL
+
+    package init(homeDirectoryURL: URL = FileManager.default.homeDirectoryForCurrentUser) {
+        homeURL = homeDirectoryURL
+        shimURL = homeDirectoryURL.appendingPathComponent(Self.shimRelativePath, isDirectory: false)
+        shimDirectoryURL = homeDirectoryURL.appendingPathComponent(
+            Self.shimDirectoryRelativePath, isDirectory: true
+        )
+        hooksURL = homeDirectoryURL.appendingPathComponent(Self.hooksRelativePath, isDirectory: false)
+    }
+
+    package func readState() throws -> VibeHooksState {
+        let shimIntermediateIsSymlink = LiveClaudeShellRCFileSystem.anyComponentIsSymlink(
+            under: homeURL, relativePath: Self.shimRelativePath
+        )
+        let hooksIntermediateIsSymlink = LiveClaudeShellRCFileSystem.anyComponentIsSymlink(
+            under: homeURL, relativePath: Self.hooksRelativePath
+        )
+        let shimLeaf = ClaudeIntegrationLiveIO.readLeaf(at: shimURL)
+        let hooksLeaf = ClaudeIntegrationLiveIO.readLeaf(at: hooksURL)
+        return VibeHooksState(
+            shimFileExists: shimLeaf.exists,
+            shimFileIsSymlink: shimLeaf.isSymlink,
+            shimData: shimIntermediateIsSymlink ? nil : shimLeaf.data,
+            shimPermissions: shimIntermediateIsSymlink ? nil : shimLeaf.permissions,
+            shimDirExists: ClaudeSocketGuard.metadata(ofPath: shimDirectoryURL.path)?.isDirectory == true,
+            shimDirIsSymlink: shimIntermediateIsSymlink,
+            hooksFileExists: hooksLeaf.exists,
+            hooksFileIsSymlink: hooksLeaf.isSymlink,
+            hooksData: hooksIntermediateIsSymlink ? nil : hooksLeaf.data,
+            hooksPermissions: hooksIntermediateIsSymlink ? nil : hooksLeaf.permissions,
+            vibeDirIsSymlink: hooksIntermediateIsSymlink
+        )
+    }
+
+    package func createShimDirectory(permissions: UInt16) throws {
+        try FileManager.default.createDirectory(
+            at: shimDirectoryURL,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: NSNumber(value: permissions)]
+        )
+    }
+
+    package func atomicWriteShim(_ data: Data, permissions: UInt16) throws {
+        try ClaudeIntegrationLiveIO.atomicWrite(data, to: shimURL, permissions: permissions)
+    }
+
+    package func atomicWriteHooks(_ data: Data, permissions: UInt16) throws {
+        try ClaudeIntegrationLiveIO.atomicWrite(data, to: hooksURL, permissions: permissions)
+    }
+
+    package func deleteShim() throws {
+        if FileManager.default.fileExists(atPath: shimURL.path) {
+            try FileManager.default.removeItem(at: shimURL)
+        }
+        // `rmdir` only removes an empty directory, so a file the user put
+        // there keeps it.
+        _ = rmdir(shimDirectoryURL.path)
+    }
+
+    package func deleteHooks() throws {
+        if FileManager.default.fileExists(atPath: hooksURL.path) {
+            try FileManager.default.removeItem(at: hooksURL)
+        }
+    }
+}
+
+/// The agents' user-level instructions files for the dictation note, and
+/// their skills directories for the doctor skill, live.
+/// Every path is under home; a symlinked file or directory on the way reads
+/// as a symlink, which the service refuses.
+package struct LiveDictationNoteFileSystem: DictationNoteFileSystem {
+    private let homeURL: URL
+
+    package init(homeDirectoryURL: URL = FileManager.default.homeDirectoryForCurrentUser) {
+        homeURL = homeDirectoryURL
+    }
+
+    private func url(_ relativePath: String) -> URL {
+        homeURL.appendingPathComponent(relativePath, isDirectory: false)
+    }
+
+    package func readFile(relativePath: String) -> DictationNoteFile {
+        let leaf = ClaudeIntegrationLiveIO.readLeaf(at: url(relativePath))
+        guard leaf.exists else { return DictationNoteFile() }
+        let intermediateIsSymlink = LiveClaudeShellRCFileSystem.anyComponentIsSymlink(
+            under: homeURL, relativePath: relativePath
+        )
+        if leaf.isSymlink || intermediateIsSymlink {
+            return DictationNoteFile(exists: true, isSymlink: true)
+        }
+        return DictationNoteFile(exists: true, data: leaf.data, permissions: leaf.permissions)
+    }
+
+    package func createParentDirectory(of relativePath: String, permissions: UInt16) throws {
+        guard !LiveClaudeShellRCFileSystem.anyComponentIsSymlink(under: homeURL, relativePath: relativePath)
+        else { throw DictationNoteInstallService.ServiceError.refused(path: relativePath, .symlink) }
+        try FileManager.default.createDirectory(
+            at: url(relativePath).deletingLastPathComponent(),
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: NSNumber(value: permissions)]
+        )
+    }
+
+    package func atomicWrite(_ data: Data, relativePath: String, permissions: UInt16) throws {
+        try ClaudeIntegrationLiveIO.atomicWrite(data, to: url(relativePath), permissions: permissions)
+    }
+
+    package func delete(relativePath: String) throws {
+        let fileURL = url(relativePath)
+        if FileManager.default.fileExists(atPath: fileURL.path) {
+            try FileManager.default.removeItem(at: fileURL)
+        }
+    }
+
+    package func removeDirectoryIfEmpty(relativePath: String) {
+        // `rmdir` only removes an empty directory, so a file the user put
+        // there keeps it.
+        _ = rmdir(homeURL.appendingPathComponent(relativePath, isDirectory: true).path)
+    }
+}
+
+/// Whether a `herdr` binary is reachable on this Mac.
+///
+/// A GUI app's PATH is `/usr/bin:/bin:/usr/sbin:/sbin`, not the user's shell
+/// PATH, so the directories herdr installs into are probed explicitly after
+/// PATH: `~/.local/bin` (herdr's own install script), Homebrew on Apple
+/// silicon and Intel, and the Nix profiles — the same list herdr probes on a
+/// remote Mac (`src/remote/attach.rs`, 0.9.0). A Homebrew herdr used to read
+/// "Not found." in the Integrations pane (field finding, 2026-09-15). Pure
+/// over its inputs so the probe order is testable without depending on the
+/// machine's own PATH.
+package enum ClaudeHerdrAvailability {
+    /// - Parameters:
+    ///   - environment: process environment (`PATH`, `HOME`).
+    ///   - isExecutable: injected so tests pin the ordering without depending
+    ///     on whether the build host happens to have herdr installed.
+    package static func isHerdrBinaryAvailable(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        isExecutable: (String) -> Bool = { FileManager.default.isExecutableFile(atPath: $0) }
+    ) -> Bool {
+        for candidate in herdrCandidates(environment: environment) where isExecutable(candidate) {
+            return true
+        }
+        return false
+    }
+
+    /// Install directories probed after PATH, in herdr's own order. A
+    /// directory already on PATH is probed once, in its PATH position.
+    package static func herdrCandidates(environment: [String: String]) -> [String] {
+        var directories: [String] = []
+        if let path = environment["PATH"] {
+            for directory in path.split(separator: ":") where !directory.isEmpty {
+                directories.append(String(directory))
+            }
+        }
+        let home = environment["HOME"].flatMap { $0.isEmpty ? nil : $0 }
+        if let home {
+            directories.append("\(home)/.local/bin")
+        }
+        directories.append("/opt/homebrew/bin")
+        directories.append("/usr/local/bin")
+        if let home {
+            directories.append("\(home)/.nix-profile/bin")
+        }
+        directories.append("/nix/var/nix/profiles/default/bin")
+        directories.append("/run/current-system/sw/bin")
+
+        var seen = Set<String>()
+        var candidates: [String] = []
+        for directory in directories where seen.insert(directory).inserted {
+            candidates.append("\(directory)/herdr")
+        }
+        return candidates
+    }
+}

@@ -23,7 +23,7 @@ final class SpeechdLaunchOptionsTests: XCTestCase {
     func testStepCadenceDefaultsToModelNativeCadence() throws {
         let options = try SpeechdOptionParser.parse(["--model", "example/model"])
 
-        XCTAssertEqual(options.stepMilliseconds, 100)
+        XCTAssertEqual(options.stepMilliseconds, 80)
     }
 
     func testStepCadenceAllowsSmallPositiveValues() throws {
@@ -46,10 +46,36 @@ final class SpeechdLaunchOptionsTests: XCTestCase {
         }
     }
 
+    func testUtteranceLimitDefaultsAndParses() throws {
+        XCTAssertEqual(
+            try SpeechdOptionParser.parse(["--model", "example/model"]).utteranceLimit,
+            UtteranceLimit(seconds: UtteranceLimit.defaultSeconds)
+        )
+        XCTAssertEqual(
+            try SpeechdOptionParser.parse([
+                "--model", "example/model", "--max-utterance-seconds", "900",
+            ]).utteranceLimit,
+            UtteranceLimit(seconds: 900)
+        )
+    }
+
+    func testUtteranceLimitRejectsNonPositiveAndNonNumericValues() {
+        for value in ["0", "-5", "ten"] {
+            XCTAssertThrowsError(
+                try SpeechdOptionParser.parse([
+                    "--model", "example/model", "--max-utterance-seconds", value,
+                ])
+            ) { error in
+                XCTAssertEqual(error as? SpeechdOptionError, .invalidValue("--max-utterance-seconds"))
+            }
+        }
+    }
+
     func testParsesBenchmarkOptions() throws {
         let options = try SpeechdOptionParser.parse([
             "--model", "example/model",
-            "--bench", "--seconds", "60", "--cadence-ms", "100",
+            "--bench", "--seconds", "60", "--cadence-ms", "100", "--phase-ms", "10",
+            "--mic-buffer-us", "10667",
             "--wav", "/tmp/example.wav",
         ])
 
@@ -58,6 +84,8 @@ final class SpeechdLaunchOptionsTests: XCTestCase {
             SpeechdBenchmarkOptions(
                 seconds: 60,
                 cadenceMilliseconds: 100,
+                phaseMilliseconds: 10,
+                micBufferMicroseconds: 10_667,
                 wavPath: "/tmp/example.wav"
             )
         )
@@ -68,7 +96,7 @@ final class SpeechdLaunchOptionsTests: XCTestCase {
             "--model", "example/model", "--bench", "--seconds", "5",
         ])
 
-        XCTAssertEqual(options.benchmark?.cadenceMilliseconds, 100)
+        XCTAssertEqual(options.benchmark?.cadenceMilliseconds, 80)
     }
 
     func testBenchmarkRequiresPositiveSeconds() {
@@ -126,6 +154,19 @@ final class SpeechdLaunchOptionsTests: XCTestCase {
                 cacheRoot: cacheRoot
             )
         )
+    }
+
+    func testEngineFlagNamesTheEngine() throws {
+        XCTAssertNil(try SpeechdOptionParser.parse(["--model", "example/model"]).engine)
+        XCTAssertEqual(
+            try SpeechdOptionParser.parse(["--model", "example/model", "--engine", "nemotron"]).engine,
+            .nemotron
+        )
+        XCTAssertThrowsError(
+            try SpeechdOptionParser.parse(["--model", "example/model", "--engine", "whisper"])
+        ) { error in
+            XCTAssertEqual(error as? SpeechdOptionError, .invalidValue("--engine"))
+        }
     }
 
     func testModelAndModelDirectoryAreMutuallyExclusive() throws {

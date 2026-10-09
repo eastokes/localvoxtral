@@ -1,0 +1,406 @@
+# shellcheck shell=bash
+# Sourced. Runs the unit suite as N xctest processes at once (#442).
+#
+# `swift test --parallel` forks one xctest per test METHOD, about 4,000 spawns,
+# and is slower than a serial run. This splits by test CLASS instead: one
+# build, one listing, then N `swift test --skip-build --ignore-lock --filter …`
+# runs side by side, each running whole classes in xctest's usual order. The
+# classes are dealt to shards heaviest first, by the seconds in
+# scripts/ci/unit-suite-seconds.txt (a class missing from it is weighed by its
+# test count), so the slowest shard ends close to the others.
+#
+# Both callers use this: `remote-build.sh test` (each swift command goes over
+# the build gate's ssh, which only admits `swift build …` and `swift test …`)
+# and the hosted `build-test` step (scripts/ci/run-unit-shards.sh, local). The
+# caller defines `lv_shard_swift ARGS…`, which runs `swift ARGS…` where the
+# package lives, and calls `lv_run_unit_shards`.
+#
+# Written for bash 3.2 (the hosted macOS image's /bin/bash): no `wait -n`, no
+# associative arrays, no mapfile.
+#
+# Stale weights only unbalance the shards. To refresh them after a full
+# `LV_ALLOW_HEAVY_MAC_RUN=1 ./scripts/remote-build.sh test` on a quiet Mac:
+#   bash -c '. scripts/lib/unit-test-shards.sh
+#     lv_unit_suite_seconds .build/last-remote.log' >scripts/ci/unit-suite-seconds.txt
+
+LV_SHARD_ROOT="${LV_SHARD_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+LV_SHARD_WEIGHTS="${LV_SHARD_WEIGHTS:-$LV_SHARD_ROOT/scripts/ci/unit-suite-seconds.txt}"
+
+# Per-class seconds from an XCTest log, heaviest first: "<seconds> <class>".
+lv_unit_suite_seconds() {
+  awk '
+    /^Test Suite .* (passed|failed) at / {
+      name = $0
+      sub(/^Test Suite \047/, "", name)
+      sub(/\047 .*/, "", name)
+      pending = name
+      next
+    }
+    pending != "" && /Executed [0-9]+ tests?, with/ {
+      if (pending !~ /^(All tests|Selected tests|.*\.xctest)$/) {
+        line = $0
+        sub(/.* in [0-9.]+ \(/, "", line)
+        sub(/\) seconds.*/, "", line)
+        printf "%.3f %s\n", line, pending
+      }
+      pending = ""
+    }
+  ' "$@" | sort -k1,1rn -k2,2
+}
+
+# Reads `swift test list` output on stdin ("Module.Class/testMethod", one per
+# line) and prints one line per shard: "<test count> <class> <class> …".
+# Lines matching any extended regex in LV_SHARD_SKIP_PATTERNS (space
+# separated, the same names the run passes to --skip) are dropped first.
+# Any other line holding a "/" is a test id the shards cannot count (a Swift
+# Testing test: a free function, a nested suite, "name()"), so the plan fails
+# naming it rather than leave that test out.
+#   $1  number of shards
+#   $2  weights file ("<seconds> <class>" per line); may be missing
+lv_plan_unit_shards() {
+  local shards="$1" weights="$2"
+  awk -v shards="$shards" -v skips="${LV_SHARD_SKIP_PATTERNS:-}" -v weights="$weights" '
+    BEGIN {
+      skip_count = split(skips, skip, " ")
+      while ((getline line < weights) > 0) {
+        if (split(line, field, " ") == 2) { seconds[field[2]] = field[1] + 0; known_total += field[1] }
+      }
+    }
+    /\// {
+      for (i = 1; i <= skip_count; i++) {
+        if (skip[i] != "" && $0 ~ skip[i]) next
+      }
+      if ($0 !~ /^[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*\/[A-Za-z_][A-Za-z0-9_]*$/) {
+        print "not an XCTest test id, which the shards cannot run and count: " $0 > "/dev/stderr"
+        failed = 1
+        exit 4
+      }
+      # A class is planned as "Module.Class": the package has more than one
+      # test module (localvoxtralTests, localvoxtralCoreTests), and each
+      # shard filter has to name the module its class lives in. The weights
+      # file is keyed by the bare class name.
+      split($0, parts, "/")
+      class = parts[1]
+      bare[class] = class
+      sub(/^[^.]*\./, "", bare[class])
+      if (!(class in tests)) { order[++class_count] = class }
+      tests[class]++
+      test_total++
+    }
+    END {
+      if (failed) exit 4
+      if (class_count == 0) exit 3
+      # A class the weights file does not know yet is weighed at the known
+      # classes average cost per test.
+      known_tests = 0
+      for (c in tests) if (bare[c] in seconds) known_tests += tests[c]
+      per_test = (known_tests > 0) ? known_total / known_tests : 0.01
+      if (per_test <= 0) per_test = 0.01
+      for (i = 1; i <= class_count; i++) {
+        c = order[i]
+        weight[c] = (bare[c] in seconds) ? seconds[bare[c]] : tests[c] * per_test
+      }
+      # Heaviest first, ties by name, each to the lightest shard so far
+      # (lowest index on a tie): the same input always gives the same plan.
+      for (i = 1; i <= class_count; i++) sorted[i] = order[i]
+      for (i = 2; i <= class_count; i++) {
+        c = sorted[i]
+        j = i - 1
+        while (j >= 1 && (weight[sorted[j]] < weight[c] || \
+            (weight[sorted[j]] == weight[c] && sorted[j] > c))) {
+          sorted[j + 1] = sorted[j]
+          j--
+        }
+        sorted[j + 1] = c
+      }
+      for (s = 1; s <= shards; s++) { load[s] = 0; count[s] = 0; members[s] = "" }
+      for (i = 1; i <= class_count; i++) {
+        c = sorted[i]
+        best = 1
+        for (s = 2; s <= shards; s++) if (load[s] < load[best]) best = s
+        load[best] += weight[c]
+        count[best] += tests[c]
+        members[best] = members[best] " " c
+      }
+      for (s = 1; s <= shards; s++) {
+        if (members[s] != "") print count[s] members[s]
+      }
+    }
+  '
+}
+
+# Tests an XCTest log says it ran: the sum of the run-level totals, the
+# "Executed N tests" line under each "Selected tests" / "All tests" suite.
+# Swift 6.4 (Xcode 27) runs each test bundle as its own run, so a shard
+# prints one total per bundle and the last is only the last bundle's. A log
+# with no run-level total falls back to its last "Executed" line. Prints 0
+# when there is none (a crash before the end).
+lv_executed_test_count() {
+  awk '
+    /^Test Suite \047(Selected tests|All tests)\047 (passed|failed) at / { top = 1; next }
+    /Executed [0-9]+ tests?, with/ {
+      n = $0; sub(/.*Executed /, "", n); sub(/ .*/, "", n)
+      last = n
+      if (top) { sum += n; runs++ }
+      top = 0
+      next
+    }
+    { top = 0 }
+    END { print (runs > 0 ? sum : (last == "" ? 0 : last)) }' "$1"
+}
+
+
+# lv_run_unit_shards <shards> <log> <skip-name>… [-- <extra swift test args>…]
+#
+# Builds, lists, plans and runs the shards, and writes ONE log: the build
+# output, then each shard's whole output in shard order, then a summary line.
+# Stdout gets the same lines, each shard's block once that shard and the
+# ones before it have ended. Exit status is non-zero when the build or any shard fails,
+# or when the shards together ran fewer tests than the listing holds (a class
+# no --filter matched, a crash).
+#
+# LV_SHARD_BUILD_ARGS adds words to the build command (--enable-code-coverage).
+lv_run_unit_shards() {
+  local shards="$1" log="$2"
+  shift 2
+  local -a skip_args=() extra_args=()
+  local skip_names=""
+  while [[ $# -gt 0 && "$1" != "--" ]]; do
+    skip_args+=(--skip "$1")
+    skip_names+="$1 "
+    shift
+  done
+  [[ "${1:-}" == "--" ]] && shift
+  extra_args=("$@")
+
+  local work
+  work="$(mktemp -d "${TMPDIR:-/tmp}/lv-unit-shards.XXXXXX")" || return 1
+  mkdir -p "$(dirname "$log")"
+  : >"$log"
+
+  local started=$SECONDS build_status
+  echo "==> Building the tests" | tee -a "$log"
+  # shellcheck disable=SC2086  # a word list on purpose
+  lv_shard_swift build --build-tests ${LV_SHARD_BUILD_ARGS:-} 2>&1 | tee -a "$log"
+  build_status="${PIPESTATUS[0]}"
+  if [[ "$build_status" != "0" ]]; then
+    echo "==> Build failed (exit $build_status)" | tee -a "$log"
+    rm -rf "$work"
+    return 1
+  fi
+  local build_seconds=$((SECONDS - started))
+
+  if ! lv_shard_swift test list --skip-build >"$work/list" 2>"$work/list.err"; then
+    { cat "$work/list.err" "$work/list"; echo "==> Listing the tests failed"; } | tee -a "$log"
+    rm -rf "$work"
+    return 1
+  fi
+  if ! LV_SHARD_SKIP_PATTERNS="$skip_names" lv_plan_unit_shards "$shards" "$LV_SHARD_WEIGHTS" \
+      <"$work/list" >"$work/plan" 2>"$work/plan.err"; then
+    { echo "==> No shard plan from this listing:"; cat "$work/plan.err" "$work/list"; } | tee -a "$log"
+    rm -rf "$work"
+    return 1
+  fi
+  local expected=0 planned count
+  planned="$(wc -l <"$work/plan" | tr -d ' ')"
+  while read -r count _; do expected=$((expected + count)); done <"$work/plan"
+  echo "==> $expected tests in $planned shards (build ${build_seconds} s)" | tee -a "$log"
+
+  # Ctrl-C or the CI supervisor's timeout still leaves every shard's output so
+  # far in the log, so a hang names the test it hung in; the caller's own
+  # handlers run afterwards. Armed before the first shard starts, and the
+  # handler reads LV_SHARD_* at signal time, so no signal finds it missing.
+  LV_SHARD_WORK="$work" LV_SHARD_LOG="$log" LV_SHARD_PLANNED="$planned"
+  LV_SHARD_PIDS=()
+  LV_SHARD_SAVED_TRAPS="$(trap -p INT TERM HUP)"
+  trap 'lv_interrupt_unit_shards INT' INT
+  trap 'lv_interrupt_unit_shards TERM' TERM
+  trap 'lv_interrupt_unit_shards HUP' HUP
+
+  local index=0 line class
+  while read -r line; do
+    index=$((index + 1))
+    local -a filter_args=()
+    for class in ${line#* }; do
+      # "Module.Class/" matches that class's methods and no other class's:
+      # the module name pins the start and the slash the end, without the
+      # regex metacharacters the build gate refuses.
+      filter_args+=(--filter "$class/")
+    done
+    lv_run_one_unit_shard "$work" "$index" "${line%% *}" \
+      ${skip_args[@]+"${skip_args[@]}"} "${filter_args[@]}" \
+      ${extra_args[@]+"${extra_args[@]}"} &
+    LV_SHARD_PIDS+=($!)
+  done <"$work/plan"
+
+  local ran=0 status=0 shard_status seconds executed classes runner_status recap=""
+  for index in $(seq 1 "$planned"); do
+    runner_status=0
+    wait "${LV_SHARD_PIDS[$((index - 1))]}" 2>/dev/null || runner_status=$?
+    if ! read -r shard_status seconds 2>/dev/null <"$work/$index.status"; then
+      echo "==> Shard $index: its runner ended with status $runner_status and wrote no exit status" \
+        >>"$work/$index.log"
+      shard_status=1
+      seconds="?"
+    fi
+    executed="$(lv_executed_test_count "$work/$index.log")"
+    ran=$((ran + executed))
+    classes="$(sed -n "${index}p" "$work/plan" | awk '{ print NF - 1 }')"
+    {
+      echo "==> Shard $index/$planned: $classes classes"
+      cat "$work/$index.log"
+      echo "==> Shard $index/$planned: exit $shard_status, $executed tests, ${seconds} s"
+    } | tee -a "$log"
+    recap+="${recap:+; }$index/$planned exit $shard_status, $executed tests, ${seconds} s"
+    : >"$work/$index.logged"
+    [[ "$shard_status" == "0" ]] || status=1
+  done
+  trap - INT TERM HUP
+  eval "$LV_SHARD_SAVED_TRAPS"
+
+  # Again, together, right above the summary: a failed step prints only the
+  # log's last lines, which hold the last shard's tests and none of the
+  # other shards' exit lines (#1084).
+  echo "==> Shard exits: $recap" | tee -a "$log"
+
+  echo "==> Unit shards: $ran of $expected tests ran in $planned shards, $((SECONDS - started)) s (build ${build_seconds} s)" \
+    | tee -a "$log"
+  if (( ran != expected )); then
+    echo "==> FAILED: the shards ran $ran tests; the listing holds $expected" | tee -a "$log"
+    status=1
+  fi
+  rm -rf "$work"
+  return "$status"
+}
+
+# Exit 0 when a shard's `swift test` output shows it failed only on SwiftPM's
+# locked build database: exactly the expected number of tests ran, no test
+# failed, and the lock is its only "error:" line. Under the native build
+# system (Xcode 27) the lock no longer stops the run: xctest runs every test
+# and only swift test's exit status carries the error (#543).
+#   $1  the shard's output   $2  its exit status   $3  the tests it should run
+lv_shard_failed_only_on_lock() {
+  local output="$1" status="$2" expected="$3"
+  [[ "$status" == "1" ]] || return 1
+  grep -q "database is locked" "$output" || return 1
+  [[ "$(lv_executed_test_count "$output")" == "$expected" ]] || return 1
+  # SwiftPM joins messages without a newline, so the lock diagnostic is cut
+  # out of its line and any other "error:" left there still counts.
+  awk '
+    {
+      gsub(/error: unable to attach DB: error: accessing build database "[^"]*": database is locked/, "")
+      if (/error:/) bad = 1
+    }
+    /^Test Case .* failed/ { bad = 1 }
+    /✘/ { bad = 1 }
+    /Executed [0-9]+ tests?, with/ {
+      n = $0; sub(/.*, with /, "", n); sub(/ .*/, "", n)
+      if (n != "0") bad = 1
+    }
+    END { exit bad }' "$output"
+}
+
+# Background job: one shard's `swift test`, its output and "<exit> <seconds>".
+# A TERM reaches `swift test` too: `lv_shard_swift &` is a subshell, so the
+# swift process is its child, which killing the subshell alone would orphan.
+#
+# --skip-build still opens SwiftPM's build database, and a sibling shard can
+# hold it at that moment ("database is locked"). The old build system then
+# exited before running any test: that case is retried, up to twice. The
+# native one runs every test anyway and exits 1: that shard passes when
+# lv_shard_failed_only_on_lock says the lock was its only fault.
+#   $3  the number of tests the shard's filters select
+lv_run_one_unit_shard() {
+  local work="$1" index="$2" expected="$3" child="" shard_status shard_started=$SECONDS attempt
+  shift 3
+  : >"$work/$index.log"
+  # Armed before the first swift process starts, so no signal finds the
+  # shard without them; the handler reads `child` at signal time.
+  trap 'lv_stop_unit_shard TERM' TERM
+  trap 'lv_stop_unit_shard INT' INT
+  trap 'lv_stop_unit_shard HUP' HUP
+  for attempt in 1 2 3; do
+    lv_shard_swift test --skip-build --ignore-lock "$@" >"$work/$index.attempt" 2>&1 &
+    child=$!
+    wait "$child"
+    shard_status=$?
+    cat "$work/$index.attempt" >>"$work/$index.log"
+    if (( shard_status == 0 || attempt == 3 )) \
+        || ! grep -q "database is locked" "$work/$index.attempt" \
+        || [[ "$(lv_executed_test_count "$work/$index.attempt")" != "0" ]]; then
+      break
+    fi
+    echo "==> Shard $index: SwiftPM's build database was locked by another shard; retrying" \
+      >>"$work/$index.log"
+    sleep 1
+  done
+  if lv_shard_failed_only_on_lock "$work/$index.attempt" "$shard_status" "$expected"; then
+    echo "==> Shard $index: all $expected tests passed; exit 1 came only from SwiftPM's locked build database" \
+      >>"$work/$index.log"
+    shard_status=0
+  fi
+  echo "$shard_status $((SECONDS - shard_started))" >"$work/$index.status"
+  : >"$work/$index.ended"
+}
+
+# Signal handler of lv_run_one_unit_shard, run in its subshell with its
+# locals: stop the swift process, keep what it printed, say
+# which signal ended the shard. It writes no exit status, so the shard fails.
+#
+# `set +e` first: callers run with errexit, and `wait` on the swift process it
+# just killed returns 143, which would end the handler before it logs.
+lv_stop_unit_shard() {
+  set +e
+  local signal="$1"
+  if [[ -n "${child:-}" ]]; then
+    # Its swift process, then the subshell that runs it, which ends once that
+    # process does and has reaped it by then; the subshell itself only when
+    # it has no child to stop.
+    pkill -TERM -P "$child" 2>/dev/null || kill "$child" 2>/dev/null
+    wait "$child" 2>/dev/null
+    cat "$work/$index.attempt" >>"$work/$index.log" 2>/dev/null
+  fi
+  echo "==> Shard $index: stopped by SIG$signal" >>"$work/$index.log"
+  : >"$work/$index.ended"
+  exit 143
+}
+
+# Signal handler of lv_run_unit_shards: stop the shards, log what they printed,
+# then restore the caller's handlers and deliver the signal again to them.
+#
+# A shard's log is read only once its `.ended` marker exists, the last thing
+# the shard writes: on hosted macOS this `wait` returned before shard 1's
+# handler had logged its signal (#1210). Five seconds caps the poll; a shard
+# the signal kept from starting is not waited for.
+lv_interrupt_unit_shards() {
+  local signal="$1" index polls
+  trap '' INT TERM HUP
+  if (( ${#LV_SHARD_PIDS[@]} > 0 )); then
+    kill "${LV_SHARD_PIDS[@]}" 2>/dev/null
+    wait "${LV_SHARD_PIDS[@]}" 2>/dev/null
+  fi
+  for index in $(seq 1 "$LV_SHARD_PLANNED"); do
+    [[ -f "$LV_SHARD_WORK/$index.logged" ]] && continue
+    polls=0
+    while (( index <= ${#LV_SHARD_PIDS[@]} )) && [[ ! -f "$LV_SHARD_WORK/$index.ended" ]] \
+        && (( polls++ < 50 )); do
+      sleep 0.1
+    done
+    {
+      echo "==> Shard $index/$LV_SHARD_PLANNED: INTERRUPTED; its output so far:"
+      cat "$LV_SHARD_WORK/$index.log" 2>/dev/null
+      [[ -f "$LV_SHARD_WORK/$index.ended" ]] || (( index > ${#LV_SHARD_PIDS[@]} )) \
+        || echo "==> Shard $index: still stopping after 5 s; its output may be cut short"
+    } | tee -a "$LV_SHARD_LOG"
+  done
+  rm -rf "$LV_SHARD_WORK"
+  trap - INT TERM HUP
+  eval "$LV_SHARD_SAVED_TRAPS"
+  kill -s "$signal" $$
+  # Reached only when the caller's handler returned instead of exiting.
+  case "$signal" in
+    HUP) exit 129 ;;
+    INT) exit 130 ;;
+    *) exit 143 ;;
+  esac
+}

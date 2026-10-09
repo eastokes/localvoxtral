@@ -1,0 +1,457 @@
+import Foundation
+import os
+
+/// The spoken send trigger (#318): dictation that ends in a send phrase
+/// ("send it" or "send now" unless the user set their own, #839) is inserted without those words, then Return is pressed in the
+/// app the text went to. Opt-in per output mode, only in an app on
+/// `ReturnSubmitsAppList` (by bundle ID), never under Secure Keyboard Entry. Logs say what was decided and
+/// never what was said.
+/// How an Overlay Buffer commit is sent once it landed.
+enum OverlaySpokenSend: Equatable {
+    /// Return, pressed in this app while it is frontmost.
+    case returnKey(pid_t)
+    /// The opencode prompt relay's submit, after its append (#719).
+    case promptRelaySubmit
+    /// The joined Claude Code session's mod fills and submits (#1644): no
+    /// key, so neither focus nor Secure Keyboard Entry matters. A refusal
+    /// falls back to typing and Return under the `returnKey` gates.
+    case modSubmit
+}
+
+extension DictationSessionController {
+    // MARK: - Overlay Buffer
+
+    /// What the commit would do with the dictation as it reads now: send
+    /// it (and how, with the text left once the phrase is cut), or keep
+    /// it as dictated, with why. Changes nothing, so the voice stop asks it
+    /// on every change and only the stop acts on it.
+    enum OverlaySpokenSendPlan: Equatable {
+        case send(OverlaySpokenSend, remainder: String)
+        /// The dictation ends in a send phrase, but it would stay text.
+        case keep(reason: String)
+        /// Off, or no send phrase at the end.
+        case noTrigger
+    }
+
+    /// `join` is the dictation's join: the context's while it runs, the
+    /// stop sample's once a polished stop took it from the context.
+    func planOverlaySpokenSend(for text: String, join: ClaudeSessionJoin? = nil) -> OverlaySpokenSendPlan {
+        guard settings.overlaySpokenSendEnabled else { return .noTrigger }
+        let remainder: String
+        switch SendNowCommandParser.parse(text, triggerPhrases: settings.spokenSendTriggerPhrases) {
+        case .pressReturn:
+            remainder = ""
+        case .insertTextAndPressReturn(let text):
+            remainder = text
+        case .insertText, .none:
+            return .noTrigger
+        }
+        if textInsertion.promptRelayTakesText {
+            return .send(.promptRelaySubmit, remainder: remainder)
+        }
+        if modChannelSessionID(join: join ?? context.claudeSessionJoin) != nil {
+            return .send(.modSubmit, remainder: remainder)
+        }
+        return keyboardSpokenSendPlan(remainder: remainder)
+    }
+
+    /// The spoken send by keys: Return in the commit's target app, only
+    /// where Return submits and never under Secure Keyboard Entry.
+    func keyboardSpokenSendPlan(remainder: String) -> OverlaySpokenSendPlan {
+        guard let pid = overlayBufferCoordinator.commitTargetAppPID else {
+            return .keep(reason: "no target app")
+        }
+        guard returnSubmitsPrompt(inPID: pid) else {
+            return .keep(reason: "Return does not submit in the target app")
+        }
+        guard !TerminalTargetDetector.isSecureKeyboardEntryEnabled() else {
+            return .keep(reason: "Secure Keyboard Entry is on")
+        }
+        return .send(.returnKey(pid), remainder: remainder)
+    }
+
+    /// Runs at stop, before the dictionary and the polisher see the text.
+    /// When the dictation ends in a send phrase and every gate passes, the
+    /// phrase is cut from the dictation event and how to send is returned.
+    /// Otherwise the text is left as dictated and nil returned. With a
+    /// healthy prompt relay the commit goes to the pane's prompt, so no
+    /// frontmost-app or Secure Keyboard Entry gate applies.
+    func stripOverlaySpokenSendTrigger(join: ClaudeSessionJoin?) -> OverlaySpokenSend? {
+        switch planOverlaySpokenSend(for: transcript.currentDictationEventText, join: join) {
+        case .noTrigger:
+            return nil
+        case .keep(let reason):
+            Log.dictation.notice("spoken send: \(reason, privacy: .public); trigger kept as text")
+            return nil
+        case .send(let spokenSend, let remainder):
+            transcript.currentDictationEventText = remainder
+            refreshOverlayBufferSession()
+            switch spokenSend {
+            case .promptRelaySubmit:
+                Log.dictation.notice(
+                    "spoken send: trigger removed before commit; the prompt relay submits text_empty=\(remainder.isEmpty, privacy: .public)"
+                )
+            case .modSubmit:
+                Log.dictation.notice(
+                    "spoken send: trigger removed before commit; the session's mod submits text_empty=\(remainder.isEmpty, privacy: .public)"
+                )
+            case .returnKey(let pid):
+                Log.dictation.notice(
+                    "spoken send: trigger removed before commit; Return follows in pid=\(pid, privacy: .public) text_empty=\(remainder.isEmpty, privacy: .public)"
+                )
+            }
+            return spokenSend
+        }
+    }
+
+    /// After the overlay commit: send only when the text landed. A
+    /// clipboard fallback or a failed insert means the prompt is not in the
+    /// target app, and a Return would submit whatever is. The relay's submit
+    /// queues behind its append, and is dropped if that append fails.
+    func sendOverlaySpokenSendIfNeeded(
+        _ spokenSend: OverlaySpokenSend?,
+        commit: StopCommitCoordinator.CommitResult
+    ) {
+        guard let spokenSend else { return }
+        guard commit.outcome == .succeeded else {
+            Log.dictation.notice("spoken send: commit did not insert the text; no Return")
+            return
+        }
+        switch spokenSend {
+        case .returnKey(let pid):
+            _ = pressSpokenSendReturn(pid: pid)
+        case .promptRelaySubmit:
+            textInsertion.promptRelaySink?.submit()
+            Log.dictation.notice("spoken send: submit handed to the prompt relay")
+        case .modSubmit:
+            // The mod's committer submits, or presses Return itself after a
+            // refusal it typed.
+            break
+        }
+    }
+
+    /// The spoken send for a commit into `join`: a mod submit planned at
+    /// the stop whose channel is gone by the commit becomes the keyboard's,
+    /// judged now.
+    func spokenSendForCommit(_ spokenSend: OverlaySpokenSend?, join: ClaudeSessionJoin?) -> OverlaySpokenSend? {
+        guard spokenSend == .modSubmit, modChannelSessionID(join: join) == nil else { return spokenSend }
+        switch keyboardSpokenSendPlan(remainder: "") {
+        case .send(let keyboard, _):
+            Log.dictation.notice("spoken send: the session's mod went away before the commit; Return instead")
+            return keyboard
+        case .keep(let reason):
+            Log.dictation.notice(
+                "spoken send: the session's mod went away before the commit; \(reason, privacy: .public); no Return"
+            )
+            return nil
+        case .noTrigger:
+            return nil
+        }
+    }
+
+    // MARK: - Live Auto-Paste
+    //
+    // Every decision is taken when it is needed, from the app frontmost at
+    // that moment: nothing captured at session start or connect time takes
+    // part. A segment's partials are withheld only while an app where Return
+    // submits is frontmost; only a non-empty backend final can trigger; the
+    // Return goes to that frontmost app, and only when every live insertion
+    // since the last Return sent (or the session start) landed in it.
+
+    /// Session start: nothing carries over from the previous dictation.
+    func resetLiveSpokenSendForSession() {
+        spokenSendLatch.reset()
+        liveSpokenSendTypedSinceReturn = false
+        liveSpokenSendReturnPressed = false
+        liveSpokenSendTypedWord = ""
+        liveSpokenSendSegmentMode = .undecided
+        liveSpokenSendBlockLogged = false
+        liveSpokenSendPaneLeft = false
+        textInsertion.clearLiveInsertionTargetPIDs()
+    }
+
+    /// Whether the current segment's text is held back until its final. Taken
+    /// at the segment's first insertion and kept for the rest of it: a segment
+    /// half typed live cannot have its trigger removed, and one half withheld
+    /// must be typed whole at its final.
+    func liveSpokenSendWithholdsSegment() -> Bool {
+        if liveSpokenSendSegmentMode == .undecided {
+            let withholds = settings.sendNowCommandEnabled
+                ? frontmostReturnSubmitsPID() != nil
+                : settings.liveSpokenSendEnabled
+                    && (textInsertion.promptRelayTakesText || frontmostReturnSubmitsPID() != nil)
+            liveSpokenSendSegmentMode = withholds ? .withheld : .typedLive
+        }
+        return liveSpokenSendSegmentMode == .withheld
+    }
+
+    /// A final of a withheld segment. Only the backend's non-empty final can
+    /// trigger: the accumulator's merge keeps partial words the final dropped
+    /// and glues a disagreeing partial onto it, so it is typed as text and
+    /// never parsed. The cost: when the final is not empty, words only a
+    /// partial had are not typed.
+    func deliverLiveSpokenSendFinal(_ finalText: String, merged: String, startsMidWord: Bool) {
+        liveSpokenSendSegmentMode = .undecided
+        let final = finalText.trimmed
+        guard !final.isEmpty else {
+            spokenSendLatch.noteNonSubmittingFinal()
+            typeLiveSpokenSendText(merged, startsMidWord: startsMidWord)
+            return
+        }
+        let phrases = settings.sendNowCommandEnabled
+            ? [settings.effectiveSendNowTriggerPhrase] : settings.spokenSendTriggerPhrases
+        let action = SendNowCommandParser.parse(final, triggerPhrases: phrases)
+        switch action {
+        case .none:
+            return
+        case .insertText(let text):
+            spokenSendLatch.noteNonSubmittingFinal()
+            typeLiveSpokenSendText(text, startsMidWord: startsMidWord)
+        case .pressReturn, .insertTextAndPressReturn:
+            // Claimed before anything is typed or pressed: a repeated final
+            // must not do either a second time.
+            guard spokenSendLatch.claimSubmission(of: final) else {
+                Log.dictation.notice("spoken send: repeated final ignored")
+                return
+            }
+            // The personal command remains restricted to the selected frontmost apps.
+            if settings.sendNowCommandEnabled, frontmostReturnSubmitsPID() == nil {
+                typeLiveSpokenSendText(final, startsMidWord: startsMidWord)
+                return
+            }
+            // The relay puts the text in the pane's prompt whatever is
+            // frontmost, and its submit follows the appends in order.
+            if textInsertion.promptRelayTakesText {
+                if case .insertTextAndPressReturn(let text) = action {
+                    typeLiveSpokenSendText(text, startsMidWord: startsMidWord)
+                }
+                submitLiveSpokenSendThroughPromptRelay()
+                return
+            }
+            // The Return is decided before anything is typed: the trigger is
+            // cut only when it will be sent. Otherwise the final is typed
+            // whole, and no spoken word is lost.
+            guard let pid = liveSpokenSendReturnTarget() else {
+                typeLiveSpokenSendText(final, startsMidWord: startsMidWord)
+                return
+            }
+            let remainder: String? = if case .insertTextAndPressReturn(let text) = action { text } else { nil }
+            guard let paneSessionID = liveSpokenSendPaneSessionID(),
+                  let navigator = sessionNavigator,
+                  let bundleID = dependencies.bundleIdentifier(pid)
+            else {
+                sendLiveSpokenSendFinal(remainder, in: pid, startsMidWord: startsMidWord)
+                return
+            }
+            // Tabs of one terminal, and Claude Desktop's sessions, share a
+            // pid: only the pane read back tells the session's prompt from
+            // another one. Later segments wait, as behind a go-to.
+            liveGoToTask = Task { @MainActor [weak self] in
+                let shows = await navigator.focusedPaneShows(sessionID: paneSessionID, bundleID: bundleID)
+                guard let self, !Task.isCancelled else { return }
+                if self.wasCancelled {
+                    // A cancel during the read-back throws the words away,
+                    // as it does the segments behind a go-to (#1656).
+                    Log.dictation.notice("spoken send: cancelled during the pane read-back; nothing typed")
+                } else if shows {
+                    self.sendLiveSpokenSendFinal(remainder, in: pid, startsMidWord: startsMidWord)
+                } else {
+                    Log.dictation.notice(
+                        "spoken send: the session's pane is no longer focused; no Return for the rest of this dictation"
+                    )
+                    self.liveSpokenSendPaneLeft = true
+                    self.typeLiveSpokenSendText(final, startsMidWord: startsMidWord)
+                }
+                self.liveGoToTask = nil
+                self.drainLiveGoToQueue()
+            }
+        }
+    }
+
+    private func sendLiveSpokenSendFinal(_ remainder: String?, in pid: pid_t, startsMidWord: Bool) {
+        if let remainder {
+            typeLiveSpokenSendText(remainder, startsMidWord: startsMidWord)
+        }
+        pressLiveSpokenSendReturn(in: pid)
+    }
+
+    /// The session whose pane the words are for, when its pane can be read
+    /// back: the one a go-to brought forward, or else the one the dictation
+    /// joined. Nil when there is none, or its pane cannot be read back (a
+    /// plain ssh or cmux session); the pid check alone then applies.
+    private func liveSpokenSendPaneSessionID() -> String? {
+        switch liveGoToLanding {
+        case .verified(let sessionID)?:
+            return sessionID
+        case .unverified?:
+            return nil
+        case nil:
+            guard let snapshot = context.claudeSessionJoin?.snapshot else { return nil }
+            if case .unsupported = SessionPaneFocusRoute.of(snapshot) { return nil }
+            return snapshot.sessionID
+        }
+    }
+
+    /// A withheld segment promoted without a final (stop, dropped socket):
+    /// typed as text, never a trigger.
+    func deliverPromotedLiveSpokenSendSegment(_ segment: String, startsMidWord: Bool) {
+        let mode = liveSpokenSendSegmentMode
+        liveSpokenSendSegmentMode = .undecided
+        guard mode == .withheld else { return }
+        spokenSendLatch.noteNonSubmittingFinal()
+        typeLiveSpokenSendText(segment, startsMidWord: startsMidWord)
+    }
+
+    /// Live text was typed: the next withheld segment needs a space before
+    /// it, unless it finishes the word this text ends on.
+    func noteLiveTextTyped(_ text: String) {
+        liveSpokenSendTypedSinceReturn = true
+        if let lastSpace = text.lastIndex(where: \.isWhitespace) {
+            liveSpokenSendTypedWord = String(text[text.index(after: lastSpace)...])
+        } else {
+            liveSpokenSendTypedWord += text
+        }
+    }
+
+    func typeLiveSpokenSendText(_ text: String, startsMidWord: Bool) {
+        var text = text
+        guard !text.isEmpty else { return }
+        // A space only after text in the same app: the last recorded landing
+        // must be the app in front now. No landing yet (the hold-back stream
+        // still holds it) means that text will land here too. A landing
+        // under Secure Keyboard Entry is nil and never matches.
+        let lastLanding = textInsertion.liveInsertionTargetPIDs.last
+        let sameApp = lastLanding.map { $0 != nil && $0 == textInsertion.frontmostApplicationPID() } ?? true
+        // A segment a new generation started mid-word finishes the word
+        // typed last (#536): "Pleas" + "e help", not "Pleas e help".
+        // A new generation may hear the word's end again ("information" +
+        // "ation overload"); that repeat is dropped, as in the dictation event.
+        let continuesTypedWord = liveSpokenSendTypedSinceReturn && sameApp
+            && startsMidWord && liveSpokenSendTypedWord.last?.isLetter == true
+        if continuesTypedWord {
+            let overlap = TextMergingAlgorithms.joinOverlap(
+                existing: liveSpokenSendTypedWord, incoming: text, incomingStartsMidWord: true)
+            text = String(text.dropFirst(overlap))
+            guard !text.isEmpty else { return }
+        }
+        let separator = liveSpokenSendTypedSinceReturn && sameApp && !continuesTypedWord ? " " : ""
+        textInsertion.enqueueRealtimeInsertion(separator + text)
+        noteLiveTextTyped(text)
+        if let accessibilityError = textInsertion.lastAccessibilityError {
+            lastError = accessibilityError
+        }
+    }
+
+    /// The frontmost app a Return may go to right now, or nil.
+    private func liveSpokenSendReturnTarget() -> pid_t? {
+        guard !TerminalTargetDetector.isSecureKeyboardEntryEnabled() else {
+            Log.dictation.notice("spoken send: Secure Keyboard Entry is on; no Return")
+            return nil
+        }
+        // A go-to whose pane did not read back as the session's may have
+        // brought another prompt forward.
+        if case .unverified? = liveGoToLanding {
+            Log.dictation.notice("spoken send: the last go-to was not verified; no Return")
+            return nil
+        }
+        guard !liveSpokenSendPaneLeft else {
+            Log.dictation.notice("spoken send: the session's pane left the front earlier; no Return")
+            return nil
+        }
+        guard let pid = frontmostReturnSubmitsPID() else {
+            Log.dictation.notice("spoken send: Return does not submit in the frontmost app; no Return")
+            return nil
+        }
+        // The record is cleared only by a Return sent, never by a refusal:
+        // once text has landed elsewhere (or under Secure Keyboard Entry), no
+        // later trigger can submit the app's own prompt in its place.
+        guard textInsertion.liveInsertionTargetPIDs.allSatisfy({ $0 == pid }) else {
+            if !liveSpokenSendBlockLogged {
+                liveSpokenSendBlockLogged = true
+                Log.dictation.notice(
+                    "spoken send: text went to another app; no Return for the rest of this dictation"
+                )
+            }
+            return nil
+        }
+        return pid
+    }
+
+    private func pressLiveSpokenSendReturn(in pid: pid_t) {
+        // The hold-back stream keeps the last word until it knows the word is
+        // complete; the Return must come after it.
+        textInsertion.flushFinalLiveReplacementCorrections()
+        guard !textInsertion.hasPendingInsertionText else {
+            Log.dictation.notice("spoken send: text not delivered yet; no Return")
+            return
+        }
+        // Checked again: the text just typed is in the record now.
+        guard liveSpokenSendReturnTarget() == pid else { return }
+        guard pressSpokenSendReturn(pid: pid) else { return }
+        textInsertion.clearLiveInsertionTargetPIDs()
+        liveSpokenSendTypedSinceReturn = false
+        liveSpokenSendReturnPressed = true
+        liveSpokenSendTypedWord = ""
+    }
+
+    /// The relay's counterpart of `pressLiveSpokenSendReturn`: every word
+    /// released first, then the submit, queued behind the appends. Refused
+    /// when the relay failed on the way, since that text went to the keys.
+    private func submitLiveSpokenSendThroughPromptRelay() {
+        textInsertion.flushFinalLiveReplacementCorrections()
+        guard !textInsertion.hasPendingInsertionText, textInsertion.promptRelayTakesText,
+              let sink = textInsertion.promptRelaySink
+        else {
+            Log.dictation.notice("spoken send: text not handed to the prompt relay; no submit")
+            return
+        }
+        sink.submit()
+        Log.dictation.notice("spoken send: submit handed to the prompt relay")
+        textInsertion.clearLiveInsertionTargetPIDs()
+        liveSpokenSendTypedSinceReturn = false
+        liveSpokenSendReturnPressed = true
+        liveSpokenSendTypedWord = ""
+    }
+
+    /// The frontmost app's PID when it is on `ReturnSubmitsAppList`. Nil
+    /// when it is not, or cannot be read.
+    private func frontmostReturnSubmitsPID() -> pid_t? {
+        guard let pid = textInsertion.frontmostApplicationPID(),
+              returnSubmitsPrompt(inPID: pid)
+        else { return nil }
+        if settings.sendNowCommandEnabled {
+            guard let bundleID = dependencies.bundleIdentifier(pid),
+                  settings.sendNowTargetApp(for: bundleID) != nil
+            else { return nil }
+        }
+        return pid
+    }
+
+    func returnSubmitsPrompt(inPID pid: pid_t) -> Bool {
+        ReturnSubmitsAppList.contains(
+            dependencies.bundleIdentifier(pid),
+            userTerminalBundleIDs: settings.userTerminalAppBundleIDs
+        )
+    }
+
+    // MARK: - Shared
+
+    /// Secure Keyboard Entry is sampled again here: it swallows synthetic
+    /// keys while reporting success, and it may have come on since the text
+    /// was judged.
+    func pressSpokenSendReturn(pid: pid_t) -> Bool {
+        guard !TerminalTargetDetector.isSecureKeyboardEntryEnabled() else {
+            Log.dictation.notice("spoken send: Secure Keyboard Entry is on; no Return")
+            return false
+        }
+        let pressed = textInsertion.pressReturn(inAppPID: pid)
+        if pressed {
+            Log.dictation.notice("spoken send: Return pressed in pid=\(pid, privacy: .public)")
+        } else {
+            Log.dictation.notice(
+                "spoken send: Return not pressed; pid=\(pid, privacy: .public) is not frontmost"
+            )
+        }
+        return pressed
+    }
+}

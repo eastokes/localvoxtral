@@ -50,17 +50,30 @@
 
 import net from "node:net";
 import fs from "node:fs";
+import http from "node:http";
+import crypto from "node:crypto";
 import { isatty } from "node:tty";
 import { isMainThread } from "node:worker_threads";
 
 // Wire constants — must mirror ClaudeHookWire.swift / ClaudeHookLimits. The
 // repo's OpencodePluginManifestTests pin these against the Swift constants.
 const WIRE_VERSION = 2;
+// Bus events that mean the session waits on the user, and the wire's
+// notification_type for each. `permission.updated` is the pre-v2 bus name.
+const WAIT_TYPES = {
+  "permission.asked": "permission_prompt",
+  "permission.updated": "permission_prompt",
+  "question.asked": "elicitation_dialog",
+};
 const AGENT = "opencode";
 const MAX_LINE_BYTES = 64 * 1024;
 const MAX_PROMPT_BYTES = 8 * 1024;
 const MAX_PATH_BYTES = 4 * 1024;
 const MAX_FILES_PER_RECORD = 16;
+const MAX_TITLE_BYTES = 320;
+// opencode names a session "New session - <ISO time>" (a child "Child
+// session - …") until its model titles it. That placeholder names nothing.
+const PLACEHOLDER_TITLE = /^(New|Child) session - \d{4}-\d{2}-\d{2}T/;
 
 // The registry treats a focus declaration as stale after 45 seconds
 // (ClaudeRegistryLimits.defaultFocusDeclarationTTL); a 20-second heartbeat
@@ -271,7 +284,7 @@ function processBlock(tty) {
   return block;
 }
 
-function record(event, sessionID, fields, tty) {
+function record(event, sessionID, fields, tty, relay) {
   // Bounded, not scoped: namespacing ("opencode:…") is applied by the
   // RECEIVER from the agent tag, by design. The plugin sends raw ids.
   const boundedID = truncateBytes(sessionID, MAX_PATH_BYTES);
@@ -292,6 +305,13 @@ function record(event, sessionID, fields, tty) {
   }
   if (fields && typeof fields.toolName === "string" && fields.toolName) {
     result.tool_name = truncateBytes(fields.toolName, MAX_PATH_BYTES);
+  }
+  if (relay) result.prompt_relay = relay;
+  if (fields && typeof fields.notificationType === "string") {
+    result.notification_type = fields.notificationType;
+  }
+  if (fields && typeof fields.title === "string" && fields.title) {
+    result.session_title = truncateBytes(fields.title, MAX_TITLE_BYTES);
   }
   if (fields && Array.isArray(fields.files) && fields.files.length > 0) {
     result.files = fields.files.slice(0, MAX_FILES_PER_RECORD).map((file) => ({
@@ -325,6 +345,10 @@ const ServerHalf = async () => {
   // the bound) stops publishing entirely — dictation abstains for it instead
   // of risking a child session's content grounding someone's prompt.
   const topLevelSessions = new Set();
+  // session id -> opencode's title for it, from session.updated (#1020). It
+  // rides on the session's next records as session_title: a name for the
+  // app to show, bounded like the allowlist above.
+  const titleBySession = new Map();
 
   function rememberTopLevel(sessionID) {
     topLevelSessions.add(sessionID);
@@ -332,11 +356,27 @@ const ServerHalf = async () => {
       const oldest = topLevelSessions.values().next().value;
       topLevelSessions.delete(oldest);
       directoryBySession.delete(oldest);
+      titleBySession.delete(oldest);
     }
   }
 
   function directoryFor(sessionID) {
     return directoryBySession.get(sessionID);
+  }
+
+  // The fields every record of a session carries: its cwd and its title.
+  function sessionFields(sessionID, fields) {
+    const result = Object.assign({ cwd: directoryFor(sessionID) }, fields);
+    const title = titleBySession.get(sessionID);
+    if (title) result.title = title;
+    return result;
+  }
+
+  function rememberTitle(info) {
+    if (!info.id || !topLevelSessions.has(info.id)) return;
+    const title = typeof info.title === "string" ? info.title.trim() : "";
+    if (!title || PLACEHOLDER_TITLE.test(title)) return;
+    titleBySession.set(info.id, title);
   }
 
   return {
@@ -352,21 +392,38 @@ const ServerHalf = async () => {
           if (typeof info.directory === "string" && info.directory) {
             directoryBySession.set(info.id, info.directory);
           }
-          publish(record("SessionStart", info.id, { cwd: directoryFor(info.id) }));
+          rememberTitle(info);
+          publish(record("SessionStart", info.id, sessionFields(info.id)));
+          return;
+        }
+        if (type === "session.updated") {
+          rememberTitle(properties.info || {});
           return;
         }
         if (type === "session.deleted") {
           const info = properties.info || {};
           if (!info.id) return;
           if (!topLevelSessions.delete(info.id)) return;
-          publish(record("SessionEnd", info.id, { cwd: directoryFor(info.id) }));
+          publish(record("SessionEnd", info.id, sessionFields(info.id)));
           directoryBySession.delete(info.id);
+          titleBySession.delete(info.id);
           return;
         }
         if (type === "session.idle") {
           const sessionID = properties.sessionID;
           if (!sessionID || !topLevelSessions.has(sessionID)) return;
-          publish(record("Stop", sessionID, { cwd: directoryFor(sessionID) }));
+          publish(record("Stop", sessionID, sessionFields(sessionID)));
+          return;
+        }
+        // The session waits on the user (#717): a permission or a question.
+        // Only the kind crosses; what it asks stays here.
+        const waitsFor = WAIT_TYPES[type];
+        if (waitsFor) {
+          const sessionID = properties.sessionID;
+          if (!sessionID || !topLevelSessions.has(sessionID)) return;
+          publish(record("Notification", sessionID, sessionFields(sessionID, {
+            notificationType: waitsFor,
+          })));
         }
       } catch {}
     },
@@ -383,10 +440,7 @@ const ServerHalf = async () => {
           .map((part) => part.text)
           .join("\n");
         publish(
-          record("UserPromptSubmit", sessionID, {
-            prompt,
-            cwd: directoryFor(sessionID),
-          })
+          record("UserPromptSubmit", sessionID, sessionFields(sessionID, { prompt }))
         );
       } catch {}
     },
@@ -405,11 +459,10 @@ const ServerHalf = async () => {
         const filePath = input.args && typeof input.args.filePath === "string" ? input.args.filePath : undefined;
         if (!filePath) return;
         publish(
-          record("PostToolUse", sessionID, {
+          record("PostToolUse", sessionID, sessionFields(sessionID, {
             toolName: tool,
             files: [{ path: filePath, kind }],
-            cwd: directoryFor(sessionID),
-          })
+          }))
         );
       } catch {}
     },
@@ -449,6 +502,84 @@ function ownTTY() {
   return undefined;
 }
 
+// ---------------------------------------------------------------------------
+// Prompt relay (TUI half): the one way the app writes into opencode (#719).
+// A plain `opencode` has no HTTP server (its TUI talks to its worker over
+// RPC), so the TUI half listens itself: 127.0.0.1, port 0, a random token.
+// Port and token ride only in FocusChanged, over the peer-checked socket. It
+// takes two calls, append and submit, for the session the pane displays when
+// the call arrives, and forwards them through the TUI's in-process client.
+// Anything else, or any doubt, is refused and the app types as before.
+
+const MAX_RELAY_BODY_BYTES = 64 * 1024;
+
+function startPromptRelay(api, displayedSession, onListening) {
+  try {
+    const tui = api.client && api.client.tui;
+    if (!tui) return undefined;
+    const token = crypto.randomBytes(32).toString("hex");
+    const expected = Buffer.from("Bearer " + token);
+    const relay = { address: undefined };
+    const server = http.createServer((request, response) => {
+      const reply = (status) => {
+        try {
+          response.writeHead(status, { "content-type": "application/json", connection: "close" });
+          response.end(status === 200 ? "true" : "false");
+        } catch {}
+      };
+      try {
+        const route = { "/tui/append-prompt": "append", "/tui/submit-prompt": "submit" }[request.url];
+        const given = Buffer.from(String(request.headers.authorization || ""));
+        const port = relay.address && relay.address.port;
+        if (request.method !== "POST" || !route) return reply(404);
+        if (given.length !== expected.length || !crypto.timingSafeEqual(given, expected)) return reply(401);
+        if (request.headers.host !== "127.0.0.1:" + port) return reply(403);
+        // Bytes, decoded once at the end: a chunk can split a UTF-8 sequence.
+        const chunks = [];
+        let bytes = 0;
+        request.on("data", (chunk) => {
+          const data = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+          bytes += data.length;
+          if (bytes > MAX_RELAY_BODY_BYTES) {
+            reply(413);
+            request.destroy();
+          } else chunks.push(data);
+        });
+        request.on("end", () => {
+          try {
+            const call = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+            if (!call || call.session_id !== displayedSession()) return reply(409);
+            if (route === "append" && (typeof call.text !== "string" || !call.text)) return reply(400);
+            const sent = route === "append" ? tui.appendPrompt({ text: call.text }) : tui.submitPrompt({});
+            Promise.resolve(sent).then(
+              (result) => reply(result && !result.error ? 200 : 502),
+              () => reply(502)
+            );
+          } catch {
+            reply(400);
+          }
+        });
+      } catch {
+        reply(500);
+      }
+    });
+    server.on("error", () => {
+      relay.address = undefined;
+    });
+    server.listen(0, "127.0.0.1", () => {
+      try {
+        relay.address = { port: server.address().port, token };
+        onListening();
+      } catch {}
+    });
+    server.unref();
+    relay.close = () => server.close();
+    return relay;
+  } catch {
+    return undefined;
+  }
+}
+
 const TuiHalf = async (api) => {
   const tty = ownTTY();
   if (!tty) return; // No pane evidence, nothing to declare. Ever.
@@ -485,13 +616,21 @@ const TuiHalf = async (api) => {
   let lastSentAt = 0;
   let inflight = false;
 
+  function displayedSession() {
+    const route = api.route && api.route.current;
+    return route && route.name === "session" && route.params && typeof route.params.sessionID === "string"
+      ? route.params.sessionID
+      : undefined;
+  }
+
+  // Once it listens, the next sample re-declares with its address.
+  const relay = startPromptRelay(api, displayedSession, () => {
+    lastSentAt = 0;
+  });
+
   function sample() {
     try {
-      const route = api.route && api.route.current;
-      const sessionID =
-        route && route.name === "session" && route.params && typeof route.params.sessionID === "string"
-          ? route.params.sessionID
-          : undefined;
+      const sessionID = displayedSession();
       if (inflight) return;
       const nowMillis = Date.now();
       if (!sessionID) {
@@ -507,7 +646,8 @@ const TuiHalf = async (api) => {
         return;
       }
       if (sessionID === lastSession && nowMillis - lastSentAt < FOCUS_HEARTBEAT_MS) return;
-      inflight = publish(record("FocusChanged", sessionID, undefined, tty), (replied) => {
+      const declared = record("FocusChanged", sessionID, undefined, tty, relay && relay.address);
+      inflight = publish(declared, (replied) => {
         inflight = false;
         if (replied) {
           lastSession = sessionID;
@@ -541,6 +681,7 @@ const TuiHalf = async (api) => {
     api.lifecycle.onDispose(() => {
       try {
         clearInterval(timer);
+        if (relay) relay.close();
         for (const unsubscribe of unsubscribes) {
           try {
             unsubscribe();

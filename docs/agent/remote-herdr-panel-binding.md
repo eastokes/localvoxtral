@@ -1,0 +1,447 @@
+# Remote herdr join: agents-panel binding (design)
+
+Status: approved by owner 2026-08-09 (token UX = live mic indicator;
+enrollment = enroll-time offer; fallback = the argv path). Supersedes the argv
+invocation signal as the PRIMARY binding for `.remoteHerdrPane` joins; the argv
+path (#228/#229) remains as fallback.
+
+AMENDED 2026-09-08: herdr 0.9.0 federates several machines into one client,
+which changes what a rendered token proves and where the row config lives. The
+mechanism and the trust argument below describe a surface that displays ONE
+server, which is still what the `.remoteHerdrPane` arm probes. Read the herdr
+0.9.0 section at the end before extending any of it.
+
+AMENDED 2026-09-05: the window-title marker mechanism was removed from the app
+entirely (owner decision). Two things in this document changed with it — the
+"Title-marker arm suppression" section is gone, and the pane-level confirmation
+in step 5 below no longer includes a broker marker. The trust argument for the
+panel binding is untouched: it never rested on the marker, and the marker never
+said anything about the local surface. See `invariants.md` for what the
+confirmation set now is and for the honest statement of what its fourth member
+used to buy.
+
+## Problem
+
+The remote herdr join must prove that the FOCUSED LOCAL terminal surface is
+displaying a whole-view client of a specific remote herdr server before
+grounding a dictation in that server's focused pane. Until now the only
+evidence was the local ssh process table: argv classification of the surface's
+ssh, a machine-wide competing-view scan, and a trusted-executable list. That
+inference fails closed in many innocent configurations (Ghostty's
+shell-integration ssh wrapper injects `-o` options; the manual flow — `ssh
+host`, then typing `herdr` — carries no argv signal at all; cross-uid ssh
+processes are unreadable and abstain everything).
+
+A window-title nonce probe was considered and REJECTED by the owner: title
+flicker is unacceptable UX.
+
+## Mechanism
+
+herdr (verified in source at v0.8.x, checkout `../herdr`) provides everything
+needed with no upstream change:
+
+1. **Write channel** — `pane.report_metadata` (handler
+   `src/app/api/panes.rs:1260`) sets arbitrary custom tokens on a pane:
+   `{"method":"pane.report_metadata","params":{"pane_id":"…",
+   "source":"localvoxtral","tokens":{"lvmark":"<token>"},"ttl_ms":8000}}`.
+   Constraints (`src/app/api_helpers.rs:205-282`): key
+   `^[A-Za-z0-9_-]{1,32}$`, value ≤80 chars with control chars stripped,
+   TTL 1..86_400_000 ms, self-clearing on expiry; empty or null value clears
+   (verified: `normalize_metadata_tokens` treats both as a clear).
+   Token patches ignore agent guards; no official herdr integration writes
+   custom tokens, so a private key is uncontested.
+2. **Render** — the bottom-left agents panel (`src/ui/sidebar.rs:1423`)
+   renders configured rows per agent-bearing pane. Custom tokens render ONLY
+   when the user's herdr config adds a row for them:
+
+   ```toml
+   [ui.sidebar.agents]
+   rows = [["state_icon", "workspace", "tab"], ["agent"], [{ token = "$lvmark", dim = true }]]
+   ```
+
+   A row whose tokens are all absent is elided entirely
+   (`src/ui/sidebar/tokens.rs:84-86`), so the row is invisible except while we
+   set it. Applied live via `herdr server reload-config`.
+3. **Read channel** — the existing local screen capture route
+   (`TerminalScreenAXReader`; Ghostty's single-AXTextArea grid, iTerm2 /
+   Terminal.app capture equivalents) reads the rendered TUI text of the
+   focused surface, agents panel included. This is a one-shot read at join
+   time to locate the token — NOT a screen-context attachment; the existing
+   refusal of raw AX attachment for `.remoteHerdrPane` joins stands.
+
+## The trust argument
+
+Why a grid match is sufficient evidence, to the standard of review rounds 1–7:
+
+- **App-mode discriminator.** The server's render loop
+  (`src/server/headless.rs:4074-4190`) paints the full UI (sidebar included)
+  for every App-mode client and ONLY the raw terminal for
+  `terminal_attach`/`terminal_observe` clients. A surface whose grid shows the
+  panel token is therefore a WHOLE-VIEW client of the server that owns the
+  socket we stamped — single-pane attaches and observers structurally cannot
+  match. This is the discriminator #229 approximated with argv
+  classification, obtained directly.
+- **Server-global focus makes client identity irrelevant.** All App-mode
+  clients mirror one shared `AppState`; per-client divergence is size and
+  scroll only (`tests/multi_client.rs`). Two local surfaces showing the same
+  server would render the same token, and joining either is the same join —
+  the #229 insight, unchanged. We read only the FOCUSED surface's grid, so
+  the dictation grounds where the user is looking.
+- **Nonce freshness bounds forgery.** The token value is a fresh random nonce
+  per join attempt (≥40 bits, ASCII `[a-z0-9]`, full rendered string ≤20
+  chars including a fixed `lv-` prefix), transmitted only over the forwarded
+  unix socket (mode-checked, owner-checked — existing `HerdrSocketClient`
+  guards). A process that merely prints plausible-looking panel text cannot
+  know the nonce. An observer who CAN see the nonce is an attached client of
+  that server or a reader of its socket — already inside the trust boundary
+  this join accepts (it is about to ground dictation in that server's focused
+  pane). Remote-influenceable grid text is therefore not a forgeable
+  authorization input: matching requires knowledge only trusted parties have,
+  within an ~8 s TTL window.
+- **Failure direction.** Every failure mode is a NO-MATCH → abstain → argv
+  fallback: sidebar collapsed (collapsed-compact renders 4 cols, no text),
+  client width ≤ 64 (mobile layout, no sidebar), panel row not configured,
+  the token cut to the row's column budget, entry scrolled out of or too tall
+  for the panel body at this client's height, modal overlay painted over the
+  sidebar, AX read unavailable. The probe can only fail to join; it can never
+  join a surface that is not displaying the stamped server.
+
+  **RESIDUAL, and it is a diagnosability one, not a safety one: this side
+  cannot tell those causes apart.** Only the column-budget case has its own
+  answer (`row-truncated`, since the rendered prefix is right there in the
+  grid); every other cause collapses into `row-not-rendered`. herdr exposes no
+  client introspection and no config read, so a discriminator would have to be
+  a threshold over remote-influenceable grid text — the kind of confidently
+  wrong diagnostic this area has already paid for. Measured on the owner's Mac
+  2026-09-05, same herdr config, same server, three outcomes: a 133x50 Ghostty
+  client MATCHED; an 80x24 Terminal.app client abstained because six agent
+  entries of six rows each do not fit a 24-row sidebar; and a
+  `sidebar_width = 20` client abstained because 17 columns do not fit a
+  16-column continuation row. So the log reports the GRID GEOMETRY it read
+  (two counts, no content) and names the candidates rather than asserting one.
+  Note the practical trap for anyone verifying this unattended: the UI gate's
+  `term open terminal lv-attach` opens Terminal.app at its 80x24 default,
+  which is structurally too small for the panel binding — such a run lands on
+  the argv fallback and proves nothing about the panel path.
+
+## Join-time sequence (replaces argv classification + competing-view for the primary path)
+
+1. Determine candidate hosts. If the surface's ssh argv is readable, its
+   destination selects the enrolled host as today — this includes the manual
+   flow (`ssh host`, then typing `herdr`: the argv is a plain readable ssh).
+   If an ssh IS present but unreadable (a wrapper the parser refuses), fall
+   back to SPECULATIVE candidates: every enrolled host that has live remote
+   sessions reporting a herdr pane (registry), bounded to ≤3 hosts, tried
+   sequentially. This bound is a guideline the implementer may tighten,
+   never widen. A surface with NO ssh at all NEVER probes (amended
+   2026-08-09 over the original draft): a local shell is the overwhelmingly
+   common dictation target, and probing it would pay cold-forward latency
+   per candidate and flash nonces in remote panels the user is not looking
+   at. The accepted cost: an inner ssh on another pty (tmux nesting) stays
+   unjoinable until a warm-forward-only speculative mode exists (recorded
+   follow-up).
+2. Per candidate host: iterate its live herdr SOCKETS (sorted, ≤3 — the
+   single-socket abstention is lifted HERE and only here, because each
+   socket gets its own fresh nonce and only the displayed server can render
+   its token; a stale socket from a previous herdr boot fails its forward
+   and is skipped — field abstention 2026-08-09; the argv fallback keeps
+   the single-socket abstention, having no way to tell servers apart). Per
+   socket: open the forward, query `pane_current`, find the unique
+   candidate session of THAT socket claiming the focused pane. First
+   rendered match ends the socket loop (one grid renders one server, and
+   the per-host forward service would tear down the matched forward if a
+   further socket were opened); the cross-host double-match abstention
+   stays.
+3. Stamp: `pane.report_metadata` on that pane with `tokens:{lvmark:
+   "lv-<nonce>"}`, `source:"localvoxtral"`, `ttl_ms:8000`.
+4. Read the focused surface's grid once; require the exact rendered token as
+   a contiguous string. Allow a short bounded settle (herdr must paint, the
+   terminal must render; ≤2 polls with injected clock — NO wall-clock sleeps
+   in tests, use the `now:`/`sleepFor:` seam pattern of
+   `OverlayBufferSessionCoordinator`).
+5. On match: proceed with the downstream confirmations — exactly one live
+   candidate of that socket claims the focused pane id, `agent_session` claim
+   agreement, foreground process check. (Until 2026-09-05 there was a fourth:
+   a broker-allocated marker in the pane's captured `terminal_title`. The
+   `terminal_title` field is not decoded any more.) The panel token
+   AUTHORIZES the surface binding; it does not replace pane-level session
+   confirmation.
+6. Two candidate hosts matching in one grid (distinct nonces both present):
+   abstain. Should be impossible; abstention is the correct posture.
+7. On no-match after the bounded settle: fall through to the argv path with
+   #228/#229 semantics exactly. When THAT declines too, the dictation gets no
+   join — there is nothing under it since the title arm was removed.
+
+## Live mic indicator (owner decision)
+
+After a successful join, keep the token alive for the dictation as a visible
+mic indicator: refresh `pane.report_metadata` with the SAME token every ~4 s
+(`ttl_ms:8000` — TTL is the backstop, refresh keeps it lit), and clear
+explicitly (empty or null value) on dictation stop, session end, or join teardown.
+The rendered value may carry a short static prefix so the row reads as a mic
+indicator rather than line noise (`lv-mic-<10 base36 digits>`, 17 columns).
+Refresh timers must be injected-clock, never wall-clock, and must not outlive
+the session (see PR #66 timer debt — do not add more armed wall-clock timers).
+
+**The 26-column sidebar this section originally assumed is not a given, and
+the match is on the rendered PREFIX because of it.** herdr renders every
+agents-panel row through `truncate_end(text, budget)` (`src/ui/text.rs`) with
+`budget = sidebar body width − 1` for an entry's FIRST row and `− 3` for every
+continuation row (`src/ui/sidebar.rs`, agent panel render), the body losing one
+more column to a scrollbar. `sidebar_width` defaults to 26 but is drag-resizable
+and persisted per session, down to `sidebar_min_width` (18). FIELD MEASUREMENT
+(owner's Mac, 2026-09-05, herdr 0.8.2, `sidebar_width = 20`): the same session
+matched when `$lvmark` was the entry's ONLY row and abstained
+`row-not-rendered` the moment it became a continuation row — 17 columns did not
+fit a 16-column budget and herdr rendered `lv-mic-<8 digits>…`. So the probe
+matches the longest rendered prefix, floored at 8 nonce digits
+(log2(36^8) ≈ 41.4 bits, keeping the "more than 40 random bits" bound), and a
+shorter run is refused with its own `row-truncated` cause rather than being
+reported as an unconfigured row — the opposite diagnosis.
+
+## Enrollment-time config offer (owner decision)
+
+- Enrollment (and a re-check offered when a join fails with "panel row not
+  configured" symptoms — i.e. stamp succeeded, everything else healthy, grid
+  shows no token) detects the missing row and OFFERS to patch the remote
+  herdr config over the enrollment ssh channel, with explicit user consent in
+  Settings — never silently.
+- Patch rule, conservative: if the remote config has NO `[ui.sidebar.agents]`
+  table, append the three-row block above verbatim, then
+  `herdr server reload-config`. If the table (or a `rows` key) EXISTS, do NOT
+  edit it — show the snippet and instructions instead (Settings detail +
+  log; popover gets one short sentence per the owner rule, never config
+  text).
+- Detection of "row missing" from the Mac side is inferential (no config-read
+  API): treat stamp-succeeded + grid-no-match as "likely not configured" in
+  the diagnostics string, not as a proven fact — and only for
+  DESTINATION-KNOWN probes. A speculative candidate's token not rendering
+  usually means the user is not looking at that server; diagnosing the row
+  from it would nag correctly configured hosts.
+
+## Diagnosability
+
+Every abstention names its cause in `Log.claudeContext` and the diagnostic
+join-abstention string, following #228's `SSHProbeIndeterminacy` pattern:
+distinct content-free categories for at least — row-not-rendered (no token in
+grid), AX-read-unavailable, forward-unavailable-for-speculative-candidate,
+stamp-refused (API error), multi-host-double-match, federated-client,
+settle-timeout. Backend
+paths stay loud (`Log.backends` convention).
+
+## Invariants doc duties (same PR)
+
+- `docs/agent/invariants.md`: state the panel binding as the primary surface
+  authorization for `.remoteHerdrPane`, with the App-mode-render and
+  nonce-freshness arguments and their EXTERNAL-ASSUMPTION bounds (herdr
+  upgrade obligation: re-verify that attach/observe clients still render no
+  sidebar and that the panel renders identically on all App clients —
+  `src/server/headless.rs` render loop, `tests/multi_client.rs`).
+- Update the "manual flow gets no herdr join" accepted-cost paragraph: it is
+  now closed by the panel binding when the panel is visible; the residual is
+  restated (collapsed sidebar / narrow client / unconfigured row fall back to
+  argv, where the manual flow still gets no join).
+
+## Pinned against a live server
+
+Everything above was read out of herdr's source and is therefore an EXTERNAL
+assumption: true of the version that was read, not guaranteed of the next one.
+The `integration-herdr` lane (`HerdrIntegrationTests`,
+`scripts/herdr-integration-fixture.sh`, `remote-build.sh integration-herdr`)
+holds the checkable half of it to a running herdr — a real server, a real
+pane, a real `ssh -L` forward, and a real whole-view client on a pty whose
+rendered text is the surface the probe reads. Each assumption has its own
+named test, so an upgrade that changes one fails with a message naming it.
+
+Measured against herdr 0.8.2 (protocol 20) while writing that lane:
+
+- A whole-view App client renders the `$lvmark` row; a
+  `herdr terminal attach <pane>` client of the SAME pane never does. This is
+  the discriminator the trust argument rests on and it holds.
+- The agents panel renders per AGENT-BEARING pane, so a pane with no reported
+  agent renders no row and therefore no token at all. A join targets a pane
+  running an agent, so this is the shape that matters — but it means "the row
+  is configured" is not sufficient for a token to appear.
+- `pane.report_metadata` clears on BOTH a JSON `null` and an empty string, as
+  `normalize_metadata_tokens` promised. The production teardown sends null.
+- `ttl_ms` is enforced at exactly 1…86_400_000; 0 and 86_400_001 are refused
+  with `invalid_metadata_ttl`.
+- CORRECTION to the constraints above: an 81-character token VALUE is
+  ACCEPTED, not refused. Nothing may be built on a length refusal. The
+  production token is 17 characters, well inside whatever bound exists.
+- `pane.current` did NOT carry an `agent_session` field for a pane whose
+  agent session id was reported through `herdr pane report-agent[-session]`,
+  so `claimedClaudeSessionID` came back nil. The join's "herdr's own claim
+  must not disagree" cross-check is therefore vacuous for panes in that
+  state — it can still catch a disagreement, but absence is the common case,
+  and since the broker-marker confirmation was removed (2026-09-05) the pane-id
+  match and the FOREGROUND PROCESS check are what carry the weight there. That
+   makes re-verifying this field on herdr upgrades more valuable than it was,
+   not less.
+
+Measured against herdr 0.9.0 (scratch rig 2026-09-13; the lane pins the same
+against the Mac fixture):
+
+- `machine list --json` reports `selected: true` exactly when
+  `endpoint-selection.json` names that profile, and no selection for Local
+  (null). The lane pins exactly these two states — enabled profile selected,
+  Local via null — and the production reader resolves the same answer for
+  both. Scratch-measured only (not lane-pinned): a file naming a disabled
+  profile or an absent file also falls back to the catalog copy, then Local.
+- DELIBERATE DIVERGENCE, unit-pinned, do not "fix": a selection file that
+  exists but cannot be decoded (malformed JSON, wrong version) makes herdr
+  warn and show Local, while the production reader abstains (`unreadable`).
+  Failing closed is the design (`HerdrMachineFederationTests` pins
+  `testUndecodableSelectionAbstains` / `testUnknownSelectionVersionAbstains`);
+  the lane pins parity for the two states above only.
+- A starting client honors the selection file; a RUNNING client never re-reads
+  it (only the profile list is polled, every 1 s) — so the fixture writes the
+  file before starting a surface, mirroring what a UI switch persists.
+- `machine add` needs the alias in the config the `ssh` on herdr's PATH reads
+  (the federated bridges spawn it too). The fixture puts a `-F` wrapper first
+  on that PATH (#1029) and sets `[remote] manage_ssh_config = false`: by
+  default herdr adds a `-F` of its own that includes only `~/.ssh/config`,
+  and ssh keeps the last `-F`. `machine add` daemon-starts the remote server itself (a
+  directly-started server is refused as not ready), and must run with stdin
+  closed (an open stdin parked it past 120 s on an approval prompt). The lane
+  federates the DEFAULT remote session at an explicit short socket: a named
+  session's socket does not fit macOS's 104-byte sun_path under the lane's
+  workdir layout, while `herdr --session <name>` ignores HERDR_SOCKET_PATH
+  anyway (explicit session wins over the env).
+- An unfocused agent-bearing pane still gets an agents-panel row; no
+  presenting client on the remote side is needed for federated rows to render.
+- A runner living inside a herdr pane exports `HERDR_PANE_ID`, which retargets
+  every `pane current` the fixture runs — the fixture scrubs the herdr session
+  variables for every process it spawns.
+
+Unpinnable from the Mac side, and still documented hopes: that all App-mode
+clients share one server-global focus (a second whole-view client on the same
+socket disturbed the fixture's own pane rather than mirroring it, so the lane
+does not assert it), and that `terminal_observe` behaves like
+`terminal_attach`.
+
+CORRECTED 2026-09-08: the second one is pinnable and was never unpinnable. The
+CLI does expose an observer, `herdr terminal session observe <target> [--cols N]
+[--rows N]`, already present at tag v0.8.2 (`src/cli.rs:43`), printing
+newline-delimited `terminal.frame` records. The lane asserts that an observer
+of a stamped pane renders no panel token, the same way it already asserts it for
+`terminal attach` — measured 2026-09-13 against herdr 0.9.0: three frame
+records decoded from base64 `bytes`, the pane's prompt and typed text present,
+the stamped token absent.
+
+## herdr 0.9.0: what federation changes here
+
+Measured against a running herdr 0.9.0 on 2026-09-13 (scratch server, client,
+and loopback sshd on Linux; the lane pins the same behaviors on the Mac).
+Source references are to tag v0.9.0.
+
+A 0.9 client can attach several machines at once (`herdr machine add`, saved in
+`<state_dir>/client/endpoints.json`, the viewed one in
+`client/endpoint-selection.json`, rewritten on every switch at
+`src/client/mod.rs:1192`, and printed by `herdr machine list --json` without a
+running server). Federation lives in the CLIENT: each machine gets its own
+connection bridged over `ssh -T <target> herdr remote-client-bridge`
+(`src/remote/saved.rs:15`), which carries the CLIENT protocol to the remote's
+`herdr-client.sock` and serves one connection at a time. It is not a route to
+the JSON API socket this document's write and read channels use, so the `ssh -L`
+forward stays.
+
+Three consequences for the mechanism above:
+
+1. The App-mode discriminator no longer separates machines. The client composes
+   the agents panel from every federated machine at once
+   (`src/client/shell/endpoint_agents.rs`), and marks the active machine by
+   background color, which a text grid read cannot see. On a 0.9 client a
+   rendered token proves that the surface federates that server, not that it
+   displays it. The machine has to come from herdr's selection state instead.
+   Measured 2026-09-13: distinct tokens stamped on the local and the remote
+   pane both render while the machine is displayed AND while Local is
+   displayed, each in its endpoint's row (textually identical rows — the
+   machine distinction is color-only). The lane pins both directions.
+2. The row config moves to the LOCAL machine. A client shell renders those rows
+   from its own config (`ClientShellConfig::from_config` reads
+   `config.ui.sidebar.agents`), so the enrollment-time offer to patch a remote
+   `[ui.sidebar.agents]` over ssh does not apply to a federated client. The
+   equivalent offer is a local file edit. The new built-in `machine` token can
+   sit in the same row as `$lvmark`. Measured 2026-09-13: with the agents
+   table configured locally and absent on the remote side, a token stamped on
+   the remote pane renders on a Local-viewing surface. The lane pins it.
+3. A server can hold focus while presenting to nobody, through the new
+   `client_shell.surface.set` method and the `surface_interest` and
+   `health_check` capabilities (`src/api/schema/server.rs`). `pane.current`
+   still answers for such a server, so a focused pane is no longer evidence
+   that anyone is looking at it. Issue #286 is the local arm's version of this.
+   Measured 2026-09-13: with a machine selected, the local server answers
+   `pane.current` with its own focused pane. The lane pins it.
+4. The federating client can run on the far side of ssh: `ssh builder herdr`,
+   where builder's client federates a machine B. Builder's token then renders
+   while B is shown, and the `.remoteHerdrPane` arm, which probes only
+   builder, would join builder's focused pane. A federated client draws
+   herdr's ` machines` header at the top of its expanded sidebar, and a token
+   renders only there, so the arm refuses a match in a grid that shows the
+   header (`federated-client`) and skips the argv fallback. The lane pins
+   that a federated frame shows the header and a plain one does not. The
+   residual: with the sidebar collapsed or hidden no token renders, and the
+   argv fallback cannot see the federation.
+
+## Federated arm: `.federatedHerdrPane`
+
+Implemented for issue #288, Part B. This arm runs only after a surface TTY
+positively binds to a local herdr client and herdr's selection state names a
+remote machine. It replaces the #290 `.showingMachine` abstention with a
+deterministic resolution; there is no surface ssh here, so the argv-based
+`.remoteHerdrPane` arm cannot apply. The shared pane-confirmation helper is a
+behavior- and string-preserving refactor into `confirmRemoteHerdrPane` with no
+argv semantics changed.
+
+The fail-closed sequence is:
+
+1. Require one herdr client surface. The selection is per user, not per
+   client.
+2. Resolve the profile target to exactly one non-revoked enrolled host with an
+   alias: exact alias equality first, then `ssh -G` canonicalization. Saved
+   `ssh://user@host:port` targets are accepted at the canonicalizer, which
+   still lets `ssh -G` do the parsing.
+3. Keep only live sessions whose socket path has the shape of the profile's
+   herdr session: the default session is `<dir>/herdr.sock` with no
+   `sessions/` component; a named session ends in
+   `/sessions/<name>/herdr.sock`. Exactly one distinct socket path may remain.
+4. Open the app-managed forward with the stored alias, then apply the shared
+   over-the-forward confirmations: exactly one candidate claims the focused
+   pane, herdr's `agent_session` claim does not disagree, and the registered
+   agent is foreground.
+5. Stamp that one pane once and require the fresh token in the focused grid.
+   The token proves a whole-view client federates the stamped server; it does
+   not select the machine, and it does not prove the selection is fresh — a
+   token stamped on machine B renders while the surface shows A, so a lagging
+   selection file still joins B (the #286 wrong-join shape). That lag is
+   bounded by the lone-surface rule and herdr's own selection writes (every
+   switch and every `machine remove/disable` rewrite the selection file; a
+   failed write is only a warning); closing it needs an upstream
+   active-endpoint report on the socket. On a match,
+   the join carries the forward and mic-indicator lease. On a miss, the arm
+   clears the token, closes the forward, and abstains with its own
+   content-free `federated-herdr` cause.
+
+Diagnosability mirrors the remote arm. The probe's own `remoteHerdrPanel:`
+cause is still tapped, while the arm adds `federated-herdr:
+federated-panel-not-rendered (<probe cause>)`. Only a settle timeout logs the
+not-configured hint, and it points at the LOCAL config: a federated client
+renders rows from this Mac's `~/.config/herdr/config.toml` (`herdr-dev` for a
+dev build). The local offer appends the same three-row block only when no
+`[ui.sidebar.agents]` table or `rows` key exists, and refuses otherwise. It
+does not run `herdr server reload-config` because the app cannot reliably
+locate the user's herdr binary; the Settings row says to reload config in
+herdr. That reload gap is the residual.
+
+Mechanism handling follows the remote arm: `pane.read` of exactly the joined
+pane, no raw AX attachment, forward/indicator ownership in the view model, and
+`federatedHerdrPane` in `ClaudeSessionJoinSummary` for the diagnostic record and
+`--probe-surface`.
+
+## Out of scope (recorded follow-ups)
+
+- Per-socket distinct nonces to lift the single-socket-per-host abstention.
+- Persistent per-host forwards (separate PR, in flight).
+- Any upstream herdr change (`client.list` branch stays parked;
+  Discussions-only upstream).

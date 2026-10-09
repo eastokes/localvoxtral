@@ -1,0 +1,679 @@
+import ClaudeContextWire
+#if canImport(Darwin)
+import Darwin
+#else
+import Glibc
+#endif
+import Foundation
+import Synchronization
+import XCTest
+@testable import ClaudeHookPublisherCore
+
+// MARK: - Publisher: enrichment and fail-open
+
+final class ClaudeHookPublisherTests: XCTestCase {
+    private func makeEnvironment(
+        variables: [String: String] = ["HOME": "/Users/tester"],
+        tty: String? = "/dev/ttys007"
+    ) -> ClaudeHookPublisher.Environment {
+        ClaudeHookPublisher.Environment(
+            now: { 1_700_000_000 },
+            pid: { 4242 },
+            ppid: { 99 },
+            ttyName: { _ in tty },
+            variables: variables
+        )
+    }
+
+    private func publisher(
+        variables: [String: String] = ["HOME": "/Users/tester"],
+        tty: String? = "/dev/ttys007"
+    ) -> ClaudeHookPublisher {
+        ClaudeHookPublisher(environment: makeEnvironment(variables: variables, tty: tty))
+    }
+
+    // MARK: Enrichment — safe metadata only
+
+    func testEnrichesWithProcessAndTTYMetadata() {
+        let info = publisher(
+            variables: ["HOME": "/Users/tester", "TERM_PROGRAM": "ghostty"]
+        ).processInfo()
+        XCTAssertEqual(info.hookPID, 4242)
+        XCTAssertEqual(info.claudePID, 99, "the parent is Claude Code — the shim execs us")
+        XCTAssertEqual(info.tty, "/dev/ttys007")
+        XCTAssertEqual(info.termProgram, "ghostty")
+    }
+
+    func testAbsentTTYAndTermProgramAreNil() {
+        let info = publisher(variables: ["HOME": "/h"], tty: nil).processInfo()
+        XCTAssertNil(info.tty)
+        XCTAssertNil(info.termProgram)
+    }
+
+    func testEmptyTermProgramIsTreatedAsAbsent() {
+        let info = publisher(variables: ["HOME": "/h", "TERM_PROGRAM": ""]).processInfo()
+        XCTAssertNil(info.termProgram)
+    }
+
+    func testHerdrEnvironmentValuesArePublished() {
+        let info = publisher(variables: [
+            "HOME": "/h",
+            "HERDR_PANE_ID": "pane-7",
+            "HERDR_SOCKET_PATH": "/tmp/herdr.sock",
+        ]).processInfo()
+        XCTAssertEqual(info.herdrPaneID, "pane-7")
+        XCTAssertEqual(info.herdrSocketPath, "/tmp/herdr.sock")
+    }
+
+    func testHerdrEnvironmentValuesArePublishedIndependently() {
+        let paneOnly = publisher(variables: ["HERDR_PANE_ID": "pane-7"]).processInfo()
+        XCTAssertEqual(paneOnly.herdrPaneID, "pane-7")
+        XCTAssertNil(paneOnly.herdrSocketPath)
+
+        let socketOnly = publisher(
+            variables: ["HERDR_SOCKET_PATH": "/tmp/herdr.sock"]
+        ).processInfo()
+        XCTAssertNil(socketOnly.herdrPaneID)
+        XCTAssertEqual(socketOnly.herdrSocketPath, "/tmp/herdr.sock")
+    }
+
+    func testEmptyHerdrEnvironmentValuesAreTreatedAsAbsent() {
+        let info = publisher(variables: [
+            "HERDR_PANE_ID": "",
+            "HERDR_SOCKET_PATH": "",
+        ]).processInfo()
+        XCTAssertNil(info.herdrPaneID)
+        XCTAssertNil(info.herdrSocketPath)
+    }
+
+    func testAbsentHerdrEnvironmentValuesAreNil() {
+        let info = publisher(variables: ["HOME": "/h"]).processInfo()
+        XCTAssertNil(info.herdrPaneID)
+        XCTAssertNil(info.herdrSocketPath)
+    }
+
+    func testCmuxAndBridgeEnvironmentValuesArePublished() {
+        // Same class as the herdr pair and the same reason: they name WHERE a
+        // LOCAL session runs, which is the only question a join arm asks. Their
+        // trust is the AF_UNIX peer-UID check, so they may sit in `process`
+        // beside the rest — the remote equivalents deliberately may not.
+        let info = publisher(variables: [
+            "HOME": "/h",
+            "CMUX_SURFACE_ID": "surface-3",
+            "CMUX_SOCKET_PATH": "/tmp/cmux.sock",
+            "CLAUDE_CODE_BRIDGE_SESSION_ID": "bridge-abc",
+        ]).processInfo()
+        XCTAssertEqual(info.cmuxSurfaceID, "surface-3")
+        XCTAssertEqual(info.cmuxSocketPath, "/tmp/cmux.sock")
+        XCTAssertEqual(info.bridgeSessionID, "bridge-abc")
+    }
+
+    func testCmuxAndBridgeEnvironmentValuesArePublishedIndependently() {
+        let surfaceOnly = publisher(variables: ["CMUX_SURFACE_ID": "surface-3"]).processInfo()
+        XCTAssertEqual(surfaceOnly.cmuxSurfaceID, "surface-3")
+        XCTAssertNil(surfaceOnly.cmuxSocketPath)
+        XCTAssertNil(surfaceOnly.bridgeSessionID)
+
+        let bridgeOnly = publisher(
+            variables: ["CLAUDE_CODE_BRIDGE_SESSION_ID": "bridge-abc"]
+        ).processInfo()
+        XCTAssertEqual(bridgeOnly.bridgeSessionID, "bridge-abc")
+        XCTAssertNil(bridgeOnly.cmuxSurfaceID)
+    }
+
+    // Claude Desktop exports its Code-tab session handle into every session it
+    // hosts (measured on 2.2553.1: CLAUDE_CODE_HOST_SESSION_ID=local_<uuid>).
+    // The desktop join arm matches it against the focused web view's address.
+    func testClaudeDesktopSessionIDIsPublished() {
+        let info = publisher(variables: [
+            "CLAUDE_CODE_HOST_SESSION_ID": "local_fb53459c-6a7b-43b1-a326-52258b970501",
+        ]).processInfo()
+        XCTAssertEqual(info.desktopSessionID, "local_fb53459c-6a7b-43b1-a326-52258b970501")
+        XCTAssertNil(info.bridgeSessionID)
+
+        XCTAssertNil(
+            publisher(variables: ["CLAUDE_CODE_HOST_SESSION_ID": ""]).processInfo().desktopSessionID,
+            "exported-but-empty is absent"
+        )
+        XCTAssertNil(publisher(variables: ["HOME": "/h"]).processInfo().desktopSessionID)
+    }
+
+    func testEmptyOrAbsentCmuxAndBridgeValuesAreTreatedAsAbsent() {
+        // An exported-but-empty variable is how a shell says "not in one of
+        // these". Publishing `""` would let a later join arm match two empty
+        // strings and call it the same surface.
+        let empty = publisher(variables: [
+            "CMUX_SURFACE_ID": "",
+            "CMUX_SOCKET_PATH": "",
+            "CLAUDE_CODE_BRIDGE_SESSION_ID": "",
+        ]).processInfo()
+        XCTAssertNil(empty.cmuxSurfaceID)
+        XCTAssertNil(empty.cmuxSocketPath)
+        XCTAssertNil(empty.bridgeSessionID)
+
+        let absent = publisher(variables: ["HOME": "/h"]).processInfo()
+        XCTAssertNil(absent.cmuxSurfaceID)
+        XCTAssertNil(absent.cmuxSocketPath)
+        XCTAssertNil(absent.bridgeSessionID)
+    }
+
+    func testNoEnvironmentVariableOutsideTheAllowlistIsEverPublished() throws {
+        // The publisher reads the environment, so "it only takes the allowlist"
+        // is a property worth asserting against the ENCODED line rather than
+        // field by field: a secret picked up by a future edit would show up
+        // here as a value on the wire.
+        let info = publisher(variables: [
+            "HOME": "/h",
+            "AWS_SECRET_ACCESS_KEY": "super-secret",
+            "GITHUB_TOKEN": "ghp_secret",
+            "PATH": "/usr/bin",
+            "TERM_PROGRAM": "ghostty",
+        ]).processInfo()
+        let encoded = String(decoding: try JSONEncoder().encode(info), as: UTF8.self)
+        for secret in ["super-secret", "ghp_secret", "/usr/bin"] {
+            XCTAssertFalse(encoded.contains(secret), "\(secret) must never be published")
+        }
+        XCTAssertTrue(encoded.contains("ghostty"))
+    }
+
+    // The published claudePID and the tty resolution consume the SAME pid,
+    // from one `ppid()` call: the tty seam receives the pid the ppid seam
+    // yielded, so the two fields can never describe different processes (the
+    // old default re-resolved `claudeAncestorPID()` inside the tty closure,
+    // which let an injected ppid and the published tty silently diverge).
+    func testTTYResolutionConsumesTheSamePIDTheEnvironmentPublishes() {
+        let receivedPIDs = Mutex<[Int32]>([])
+        let environment = ClaudeHookPublisher.Environment(
+            now: { 1_700_000_000 },
+            pid: { 4242 },
+            ppid: { 31_337 },
+            ttyName: { pid in
+                receivedPIDs.withLock { $0.append(pid) }
+                return "/dev/ttys009"
+            },
+            variables: ["HOME": "/h"]
+        )
+        let info = ClaudeHookPublisher(environment: environment).processInfo()
+        XCTAssertEqual(info.claudePID, 31_337)
+        XCTAssertEqual(
+            receivedPIDs.withLock { $0 }, [31_337], "one ppid resolution feeds both fields"
+        )
+        XCTAssertEqual(info.tty, "/dev/ttys009")
+    }
+
+    // MARK: Fail-open
+
+    func testUnparseableStdinIsDroppedNotPublished() {
+        XCTAssertEqual(
+            publisher().run(stdin: Data("garbage".utf8), fallbackEvent: "Stop"),
+            .droppedUnparseable
+        )
+    }
+
+    func testEmptyStdinIsDropped() {
+        XCTAssertEqual(publisher().run(stdin: Data(), fallbackEvent: "Stop"), .droppedUnparseable)
+    }
+
+    func testUnknownEventIsDropped() {
+        let json = #"{"hook_event_name":"PreCompact","session_id":"s1"}"#
+        XCTAssertEqual(publisher().run(stdin: Data(json.utf8), fallbackEvent: nil), .droppedUnparseable)
+    }
+
+    func testMissingHomeAndOverrideYieldsNoSocketPath() {
+        let json = #"{"hook_event_name":"Stop","session_id":"s1"}"#
+        XCTAssertEqual(
+            publisher(variables: [:]).run(stdin: Data(json.utf8), fallbackEvent: nil),
+            .droppedNoSocketPath
+        )
+    }
+
+    func testAbsentBrokerReportsTransportFailureRatherThanThrowing() {
+        // The app-not-running case. `main` maps every outcome to exit 0.
+        let json = #"{"hook_event_name":"Stop","session_id":"s1"}"#
+        let outcome = ClaudeHookPublisher(
+            environment: makeEnvironment(
+                variables: [ClaudeHookSocketPath.environmentKey: "/tmp/definitely-not-a-socket-\(UUID().uuidString)"]
+            )
+        ).run(stdin: Data(json.utf8), fallbackEvent: nil)
+        XCTAssertEqual(outcome, .droppedTransport(.notListening))
+    }
+
+    // MARK: stdout — a hook run has nothing to print, on any path
+
+    func testNoOutcomeCanCarryAnythingToPrint() {
+        // The fail-open contract as a property of the TYPE. Claude Code appends
+        // a UserPromptSubmit hook's non-JSON stdout to the user's prompt, so a
+        // stray byte from any of these paths would land in their context. The
+        // enum having no payload-bearing case is what makes that unreachable
+        // rather than merely unlikely — a case with bytes in it would fail to
+        // compile against this exhaustive switch.
+        let outcomes: [ClaudeHookPublisher.Outcome] = [
+            .published,
+            .droppedUnparseable,
+            .droppedNoSocketPath,
+            .droppedTransport(.notListening),
+            .droppedTransport(.timedOut),
+            .droppedTransport(.writeFailed),
+            .droppedTransport(.socketPathTooLong),
+        ]
+        for outcome in outcomes {
+            switch outcome {
+            case .published, .droppedUnparseable, .droppedNoSocketPath:
+                break
+            case .droppedTransport:
+                break
+            }
+        }
+        XCTAssertEqual(outcomes.count, 7, "every case is represented above")
+    }
+
+    func testAnAcceptedReplyStillProducesTheSilentOutcome() {
+        // The reply the broker sends is a receipt, not a channel: whatever it
+        // says, the run lands on `.published` and the binary prints nothing.
+        // Regression for the marker channel that used to live here — a reply
+        // carrying an extra key must not resurrect it.
+        let publisher = ClaudeHookPublisher(
+            environment: makeEnvironment(
+                variables: [ClaudeHookSocketPath.environmentKey: "/tmp/absent-\(UUID().uuidString).sock"]
+            )
+        )
+        let json = #"{"hook_event_name":"SessionStart","session_id":"s1","cwd":"/repo"}"#
+        XCTAssertEqual(
+            publisher.run(stdin: Data(json.utf8), fallbackEvent: nil),
+            .droppedTransport(.notListening)
+        )
+    }
+
+    func testOverlongSocketPathFailsClosedNotCrashed() {
+        let json = #"{"hook_event_name":"Stop","session_id":"s1"}"#
+        let outcome = ClaudeHookPublisher(
+            environment: makeEnvironment(
+                variables: [ClaudeHookSocketPath.environmentKey: "/tmp/" + String(repeating: "x", count: 300)]
+            )
+        ).run(stdin: Data(json.utf8), fallbackEvent: nil)
+        XCTAssertEqual(outcome, .droppedTransport(.socketPathTooLong))
+    }
+
+    // MARK: Status line mode — `--statusline`
+
+    func testStatusLinePayloadSessionIDIsExtractedAndBounded() {
+        let payload = #"{"session_id":"abc-123","cwd":"/repo","model":{"id":"m"}}"#
+        XCTAssertEqual(
+            ClaudeHookPublisher.statusLineSessionID(payload: Data(payload.utf8), limits: .default),
+            "abc-123"
+        )
+        // Bounded exactly like every wire identifier.
+        let long = String(repeating: "a", count: 9000)
+        let bounded = ClaudeHookPublisher.statusLineSessionID(
+            payload: Data(#"{"session_id":"\#(long)"}"#.utf8), limits: .default
+        )
+        XCTAssertEqual(bounded?.utf8.count, ClaudeHookLimits.default.maxPathBytes)
+    }
+
+    func testStatusLinePayloadWithoutAUsableSessionIDIsUnparseable() {
+        for payload in [
+            "", "not json", "[]", "{}",
+            #"{"session_id":""}"#,
+            #"{"session_id":42}"#,
+        ] {
+            XCTAssertEqual(
+                publisher().runStatusQuery(stdin: Data(payload.utf8)),
+                .unparseablePayload,
+                "\(payload) must not produce a claim about any session"
+            )
+        }
+    }
+
+    func testStatusQueryAgainstAnAbsentBrokerIsAppUnreachable() {
+        let payload = #"{"session_id":"s1"}"#
+        let outcome = ClaudeHookPublisher(
+            environment: makeEnvironment(
+                variables: [ClaudeHookSocketPath.environmentKey: "/tmp/absent-\(UUID().uuidString).sock"]
+            )
+        ).runStatusQuery(stdin: Data(payload.utf8))
+        XCTAssertEqual(outcome, .appUnreachable)
+    }
+
+    func testStatusQueryWithNoResolvableSocketPathIsAppUnreachable() {
+        XCTAssertEqual(
+            publisher(variables: [:]).runStatusQuery(stdin: Data(#"{"session_id":"s1"}"#.utf8)),
+            .appUnreachable
+        )
+    }
+
+    func testStatusLineTextIsFixedStringsOnly() throws {
+        // The whole output contract: four outcomes, three compile-time
+        // strings and one silence. Nothing here interpolates anything.
+        XCTAssertEqual(
+            ClaudeHookPublisher.statusLineText(for: .connected),
+            "lvx \u{1B}[32m\u{25CF}\u{1B}[0m"
+        )
+        XCTAssertEqual(
+            ClaudeHookPublisher.statusLineText(for: .sessionUnknown),
+            "lvx \u{1B}[33m\u{25D0}\u{1B}[0m"
+        )
+        XCTAssertEqual(
+            ClaudeHookPublisher.statusLineText(for: .appUnreachable),
+            "lvx \u{1B}[90m\u{25CB}\u{1B}[0m"
+        )
+        XCTAssertNil(
+            ClaudeHookPublisher.statusLineText(for: .unparseablePayload),
+            "a payload we cannot attribute must render as nothing, not a guess"
+        )
+    }
+
+    func testStatusLinePlainTextFallbackUsesTheSameGlyphs() {
+        XCTAssertEqual(
+            ClaudeHookPublisher.statusLineText(for: .connected, useColor: false), "lvx \u{25CF}"
+        )
+        XCTAssertEqual(
+            ClaudeHookPublisher.statusLineText(for: .sessionUnknown, useColor: false), "lvx \u{25D0}"
+        )
+        XCTAssertEqual(
+            ClaudeHookPublisher.statusLineText(for: .appUnreachable, useColor: false), "lvx \u{25CB}"
+        )
+        XCTAssertFalse(ClaudeHookPublisher.statusLineUsesColor(environment: ["NO_COLOR": ""]))
+        XCTAssertFalse(ClaudeHookPublisher.statusLineUsesColor(environment: ["TERM": "dumb"]))
+        XCTAssertTrue(ClaudeHookPublisher.statusLineUsesColor(environment: ["TERM": "xterm-256color"]))
+    }
+}
+
+// MARK: - Socket path resolution
+
+final class ClaudeHookSocketPathTests: XCTestCase {
+    func testEnvironmentOverrideWins() {
+        let path = ClaudeHookSocketPath.resolve(environment: [
+            "HOME": "/Users/tester",
+            ClaudeHookSocketPath.environmentKey: "/tmp/custom.sock",
+        ])
+        XCTAssertEqual(path, "/tmp/custom.sock")
+    }
+
+    func testEmptyOverrideFallsBackToDefault() {
+        let path = ClaudeHookSocketPath.resolve(environment: [
+            "HOME": "/Users/tester",
+            ClaudeHookSocketPath.environmentKey: "",
+        ])
+        XCTAssertNotEqual(path, "")
+        XCTAssertEqual(path?.hasSuffix("claude-context.sock"), true)
+    }
+
+    func testNoHomeYieldsNoPath() {
+        XCTAssertNil(ClaudeHookSocketPath.resolve(environment: [:]))
+    }
+
+    #if canImport(Darwin)
+    func testDefaultPathIsUnderApplicationSupport() {
+        let path = ClaudeHookSocketPath.resolve(environment: ["HOME": "/Users/tester"])
+        XCTAssertEqual(
+            path,
+            "/Users/tester/Library/Application Support/localvoxtral/run/claude-context.sock"
+        )
+    }
+
+    func testDefaultPathFitsInSockaddrUn() throws {
+        // sun_path is 104 bytes on Darwin. A realistic long username must not
+        // silently push the default path past it.
+        let home = "/Users/" + String(repeating: "u", count: 20)
+        let path = try XCTUnwrap(ClaudeHookSocketPath.resolve(environment: ["HOME": home]))
+        XCTAssertLessThan(path.utf8.count, 104)
+    }
+    #endif
+}
+
+// MARK: - Controlling TTY capture
+
+final class ClaudeHookControllingTTYTests: XCTestCase {
+    // Claude Code wires all three hook fds to pipes, so the field capture
+    // depends on the /dev/tty and process-table fallbacks — these pin the
+    // process-table read's refusal cases deterministically, and the pty test
+    // below covers the positive path (as an invariant that tolerates a
+    // sandbox refusing the acquisition; the live end-to-end proof remains the
+    // hand-tested Ghostty join).
+    func testProcessTableLookupRefusesInvalidPIDs() {
+        XCTAssertNil(ClaudeHookPublisher.ttyDevicePath(forProcess: 0))
+        XCTAssertNil(ClaudeHookPublisher.ttyDevicePath(forProcess: -1))
+    }
+
+    func testProcessTableLookupAnswersNilForATerminallessProcess() {
+        // launchd (pid 1) exists on every macOS system and never has a
+        // controlling terminal — a real process-table read that must answer
+        // "no device", not garbage.
+        XCTAssertNil(ClaudeHookPublisher.ttyDevicePath(forProcess: 1))
+    }
+
+    func testProcessTableLookupAnswersNilForADeadPID() {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/true")
+        try? process.run()
+        process.waitUntilExit()
+        XCTAssertNil(ClaudeHookPublisher.ttyDevicePath(forProcess: process.processIdentifier))
+    }
+
+    // The positive half: a child spawned into its own session with a pty we
+    // allocated as fd 0 acquires that pty as its controlling terminal, and the
+    // process-table read must name exactly that device. Structured as a
+    // refusal-vs-agreement invariant rather than a hard positive: a sandbox
+    // that denies pty allocation or controlling-terminal acquisition yields
+    // nil (a refusal, same as launchd's), and that is tolerated — but a
+    // NON-nil answer naming any device other than our pty is a lie and fails.
+    func testPTYAttachedChildProcessTableReadNamesThatPTYOrRefuses() throws {
+        var master: Int32 = -1
+        var slave: Int32 = -1
+        var nameBuffer = [CChar](repeating: 0, count: 128)
+        guard openpty(&master, &slave, &nameBuffer, nil, nil) == 0 else {
+            // No pty allocatable in this sandbox: there is no positive
+            // evidence to check and no device to be wrong about. The refusal
+            // cases stay covered by the sibling tests above.
+            return
+        }
+        // `openpty` writes a NUL-terminated device path into the buffer;
+        // decode up to that terminator (the `[CChar]` `String(cString:)`
+        // overload is deprecated precisely because it hides this step).
+        let slavePath = String(
+            decoding: nameBuffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self
+        )
+        defer {
+            close(master)
+            close(slave)
+        }
+
+        // Darwin types these as opaque pointers, Glibc as structs.
+        #if canImport(Darwin)
+        var actions: posix_spawn_file_actions_t?
+        #else
+        var actions = posix_spawn_file_actions_t()
+        #endif
+        posix_spawn_file_actions_init(&actions)
+        defer { posix_spawn_file_actions_destroy(&actions) }
+        // Opened IN THE CHILD, after it became a session leader: the first
+        // tty a session leader opens without O_NOCTTY becomes its controlling
+        // terminal — the exact chain a real terminal emulator sets up.
+        slavePath.withCString {
+            _ = posix_spawn_file_actions_addopen(&actions, 0, $0, O_RDWR, 0)
+        }
+
+        #if canImport(Darwin)
+        var attributes: posix_spawnattr_t?
+        #else
+        var attributes = posix_spawnattr_t()
+        #endif
+        posix_spawnattr_init(&attributes)
+        defer { posix_spawnattr_destroy(&attributes) }
+        // POSIX_SPAWN_SETSID (spawn.h; 0x80 in glibc's): the child starts its
+        // own session, so it CAN acquire a controlling terminal of its own.
+        #if canImport(Darwin)
+        posix_spawnattr_setflags(&attributes, Int16(0x0400))
+        #else
+        posix_spawnattr_setflags(&attributes, Int16(0x80))
+        #endif
+
+        var childPID: pid_t = 0
+        let argv: [UnsafeMutablePointer<CChar>?] = [strdup("/bin/sleep"), strdup("30"), nil]
+        defer { argv.compactMap { $0 }.forEach { free($0) } }
+        guard posix_spawn(&childPID, "/bin/sleep", &actions, &attributes, argv, nil) == 0 else {
+            return // Same tolerance as openpty: nothing spawned, nothing to lie.
+        }
+        defer {
+            kill(childPID, SIGKILL)
+            var status: Int32 = 0
+            waitpid(childPID, &status, 0)
+        }
+
+        // posix_spawn is one syscall on Darwin: the file actions (and with
+        // them the controlling-terminal acquisition) completed before it
+        // returned, so no polling is needed.
+        if let reported = ClaudeHookPublisher.ttyDevicePath(forProcess: childPID) {
+            XCTAssertEqual(
+                reported, slavePath,
+                "a positive process-table answer must name the pty we allocated, never another device"
+            )
+        }
+        // nil is the tolerated refusal (sandbox denied the acquisition) —
+        // deliberate: absence must stay deterministic here, and the live
+        // positive proof remains the hand-tested Ghostty join.
+    }
+
+    // MARK: - Capture chain: only a device a pane can carry counts as an answer
+
+    /// Seam-driven chain, so the field's answers can be handed to it verbatim.
+    private func resolvedTTY(
+        claudePID: Int32? = 99,
+        ownPID: Int32 = 4242,
+        descriptors: [Int32: String] = [:],
+        controllingTerminal: String? = nil,
+        processTable: [Int32: String] = [:]
+    ) -> String? {
+        ClaudeHookPublisher.resolveControllingTTY(
+            claudePID: claudePID,
+            ownPID: { ownPID },
+            descriptorDevice: { descriptors[$0] },
+            controllingTerminalDevice: { controllingTerminal },
+            processDevice: { processTable[$0] }
+        )
+    }
+
+    func testDevTTYAliasFallsThroughToTheProcessTable() {
+        // The field shape (@eastokes's fork, issue #376): all three fds piped,
+        // and `ttyname` on the `/dev/tty` fd answers with the alias itself.
+        // Publishing it would hand the focus probe a device no pane carries,
+        // and — being non-nil — bury the read that does know the answer.
+        XCTAssertEqual(
+            resolvedTTY(controllingTerminal: "/dev/tty", processTable: [99: "/dev/ttys004"]),
+            "/dev/ttys004"
+        )
+    }
+
+    func testDevTTYAliasOnADescriptorFallsThroughToo() {
+        // Same rule one step earlier: a tty'd fd is cheaper evidence, not
+        // better evidence, so the alias loses there as well.
+        XCTAssertEqual(
+            resolvedTTY(
+                descriptors: [1: "/dev/tty"],
+                controllingTerminal: "/dev/ttys004",
+                processTable: [99: "/dev/ttys009"]
+            ),
+            "/dev/ttys004"
+        )
+    }
+
+    func testAliasEverywhereReportsNothingRatherThanTheAlias() {
+        // Nil is diagnosable — the unresolved log line fires and the join's
+        // tty half simply abstains. A published `/dev/tty` is not: it grounds
+        // the dictation in a device nothing can match, silently.
+        XCTAssertNil(resolvedTTY(controllingTerminal: "/dev/tty", processTable: [99: "/dev/tty"]))
+    }
+
+    func testMalformedCandidatesAreRefusedTheSameWay() {
+        for candidate in ["", "ttys004", "/dev/", "/dev/../etc/passwd", "/dev/ttys004/"] {
+            XCTAssertNil(
+                resolvedTTY(controllingTerminal: candidate),
+                "\(candidate) is not a device a pane reports"
+            )
+        }
+    }
+
+    func testAConcreteDeviceStillWinsAtEveryStep() {
+        XCTAssertEqual(resolvedTTY(descriptors: [0: "/dev/ttys001"]), "/dev/ttys001")
+        XCTAssertEqual(resolvedTTY(descriptors: [2: "/dev/ttys002"]), "/dev/ttys002")
+        XCTAssertEqual(resolvedTTY(controllingTerminal: "/dev/ttys003"), "/dev/ttys003")
+        XCTAssertEqual(resolvedTTY(processTable: [99: "/dev/ttys004"]), "/dev/ttys004")
+    }
+
+    func testAnUnnamedSessionProcessFallsBackToOurOwnEntry() {
+        // `claudePID` is nil only for a publisher invoked directly — the hook
+        // always supplies `claudeAncestorPID()`. Our own controlling terminal
+        // is then the pane's (a non-setsid hook shares it), and reading it off
+        // our own process table entry trusts nobody else's state.
+        XCTAssertEqual(
+            resolvedTTY(claudePID: nil, ownPID: 4242, processTable: [4242: "/dev/ttys007"]),
+            "/dev/ttys007"
+        )
+    }
+
+    func testANamedSessionProcessIsNeverSecondGuessedByOurOwnEntry() {
+        // Claude's terminal is the pane's terminal. Ours is only a stand-in
+        // for the case where nobody named Claude's process at all.
+        XCTAssertNil(resolvedTTY(claudePID: 99, ownPID: 4242, processTable: [4242: "/dev/ttys007"]))
+    }
+
+    func testControllingTTYAgreesWithItsOwnProcessTableEntry() {
+        // Environment-independent invariant: whether this suite runs on a
+        // pty-attached dev shell (fds are the terminal), piped output (only
+        // /dev/tty answers), or a terminal-less CI runner (nothing answers),
+        // the capture chain and the process-table read of OUR OWN pid describe
+        // the same session — same device, or nil on both sides.
+        XCTAssertEqual(
+            ClaudeHookPublisher.controllingTTY(claudePID: getpid()),
+            ClaudeHookPublisher.ttyDevicePath(forProcess: getpid())
+        )
+    }
+}
+
+// MARK: - Timeout plumbing
+
+final class UnixSocketPublisherTimeoutTests: XCTestCase {
+    func testFractionalTimeoutBecomesMicroseconds() {
+        XCTAssertEqual(UnixSocketPublisher.microsecondsRemainder(0.25), 250_000)
+        XCTAssertEqual(UnixSocketPublisher.microsecondsRemainder(1.5), 500_000)
+        XCTAssertEqual(UnixSocketPublisher.microsecondsRemainder(2.0), 0)
+    }
+
+    func testDefaultTimeoutIsShortEnoughForAnInlineHook() {
+        // This runs inline in a Claude Code hook: being late is worse than
+        // being absent.
+        XCTAssertLessThanOrEqual(UnixSocketPublisher().timeout, 0.5)
+    }
+
+    func testStdinReadConsultsAbsoluteDeadlineWhilePipeStaysOpenWithoutData() {
+        var descriptors: [Int32] = [-1, -1]
+        XCTAssertEqual(pipe(&descriptors), 0)
+        defer {
+            close(descriptors[0])
+            close(descriptors[1])
+        }
+        let flags = fcntl(descriptors[0], F_GETFL, 0)
+        XCTAssertGreaterThanOrEqual(flags, 0)
+        XCTAssertEqual(fcntl(descriptors[0], F_SETFL, flags | O_NONBLOCK), 0)
+
+        let calls = Mutex(0)
+        let base: UInt64 = 1_000_000_000
+        let data = ClaudeHookPublisher.readBoundedStdin(
+            descriptor: descriptors[0],
+            timeout: 0.25,
+            uptimeNanos: {
+                calls.withLock { count in
+                    count += 1
+                    return count == 1 ? base : base + 1_000_000_000
+                }
+            }
+        )
+
+        XCTAssertTrue(data.isEmpty)
+        XCTAssertGreaterThanOrEqual(
+            calls.withLock { $0 },
+            2,
+            "the reader must re-check its monotonic deadline instead of entering an unbounded read"
+        )
+    }
+}

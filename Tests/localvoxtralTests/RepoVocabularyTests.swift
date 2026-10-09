@@ -1,6 +1,8 @@
+@testable import ClaudeContextWire
 import Foundation
 import XCTest
 @testable import localvoxtral
+import localvoxtralTestSupport
 
 // MARK: - Terminal window-title parser
 
@@ -13,126 +15,92 @@ final class TerminalWorkingDirectoryResolverTests: XCTestCase {
         )
     }
 
-    func testAbsolutePathWithShellDecoration() {
-        XCTAssertEqual(candidates("/Users/x/dev/proj — zsh"), ["/Users/x/dev/proj"])
+    func testWindowTitleCandidates() {
+        let cases: [(name: String, title: String, expected: [String])] = [
+            ("AbsolutePathWithShellDecoration", "/Users/x/dev/proj — zsh", ["/Users/x/dev/proj"]),
+            ("TildePathIsExpanded", "~/dev/proj", ["/Users/tester/dev/proj"]),
+            ("BareTildeExpandsToHome", "~", ["/Users/tester"]),
+            // "proj — zsh — 80×24": a bare last-path-component is not resolvable.
+            ("TerminalDotAppBareNameIsRejected", "proj — zsh — 80×24", []),
+            ("ITerm2UserHostStyle", "user@host: ~/dev/proj", ["/Users/tester/dev/proj"]),
+            ("EditorDecorationAndBoxDimensions", "/a — vim (80×24)", ["/a"]),
+            ("TrailingCommaTrimmed", "~/dev/proj,", ["/Users/tester/dev/proj"]),
+            ("BoxDimensionsOnlyYieldNoCandidate", "80×24", []),
+            ("MultipleCandidatesInOrderOfAppearance", "host: ~/a and /b/c done", ["/Users/tester/a", "/b/c"]),
+            ("DeduplicatesRepeatedCandidates", "/x/y and /x/y", ["/x/y"]),
+        ]
+        for (name, title, expected) in cases {
+            XCTAssertEqual(candidates(title), expected, name)
+        }
     }
 
-    func testTildePathIsExpanded() {
-        XCTAssertEqual(candidates("~/dev/proj"), ["/Users/tester/dev/proj"])
-    }
-
-    func testBareTildeExpandsToHome() {
-        XCTAssertEqual(candidates("~"), ["/Users/tester"])
-    }
-
-    func testTerminalDotAppBareNameIsRejected() {
-        // "proj — zsh — 80×24": a bare last-path-component is not resolvable.
-        XCTAssertEqual(candidates("proj — zsh — 80×24"), [])
-    }
-
-    func testITerm2UserHostStyle() {
-        XCTAssertEqual(candidates("user@host: ~/dev/proj"), ["/Users/tester/dev/proj"])
-    }
-
-    func testEditorDecorationAndBoxDimensions() {
-        XCTAssertEqual(candidates("/a — vim (80×24)"), ["/a"])
-    }
-
-    func testTrailingCommaTrimmed() {
-        XCTAssertEqual(candidates("~/dev/proj,"), ["/Users/tester/dev/proj"])
-    }
-
-    func testBoxDimensionsOnlyYieldNoCandidate() {
-        XCTAssertEqual(candidates("80×24"), [])
-    }
-
-    func testMultipleCandidatesInOrderOfAppearance() {
-        XCTAssertEqual(
-            candidates("host: ~/a and /b/c done"),
-            ["/Users/tester/a", "/b/c"]
-        )
-    }
-
-    func testDeduplicatesRepeatedCandidates() {
-        XCTAssertEqual(candidates("/x/y and /x/y"), ["/x/y"])
-    }
-
-    func testResolveReturnsFirstExistingDirectory() {
-        let resolved = TerminalWorkingDirectoryResolver.resolveWorkingDirectory(
-            fromWindowTitle: "cd /nope then ~/yes",
-            homeDirectory: home,
-            isDirectory: { $0 == "/Users/tester/yes" }
-        )
-        XCTAssertEqual(resolved, "/Users/tester/yes")
-    }
-
-    func testResolveReturnsNilWhenNoneExist() {
-        let resolved = TerminalWorkingDirectoryResolver.resolveWorkingDirectory(
-            fromWindowTitle: "/a /b",
-            homeDirectory: home,
-            isDirectory: { _ in false }
-        )
-        XCTAssertNil(resolved)
+    /// `existing` lists the only paths the injected existence check accepts.
+    func testResolveWorkingDirectory() {
+        let cases: [(name: String, title: String, homeDirectory: String, existing: [String], expected: String?)] = [
+            (
+                "ResolveReturnsFirstExistingDirectory",
+                "cd /nope then ~/yes", home, ["/Users/tester/yes"], "/Users/tester/yes"
+            ),
+            ("ResolveReturnsNilWhenNoneExist", "/a /b", home, [], nil),
+            // The T6 field case (2026-07-11): Ghostty's tab title is exactly
+            // "../Desktop/projects/supervoxtral". The extracted absolute run
+            // "/Desktop/projects/supervoxtral" does not exist; the home-anchored
+            // expansion does and must resolve.
+            (
+                "GhosttyAbbreviatedTitleResolvesHomeAnchored",
+                "../Desktop/projects/supervoxtral",
+                "/Users/x",
+                ["/Users/x/Desktop/projects/supervoxtral"],
+                "/Users/x/Desktop/projects/supervoxtral"
+            ),
+            // A genuinely absolute path that exists must never be shadowed by its
+            // home-anchored twin, even when both exist.
+            (
+                "ExistingAbsolutePathWinsOverHomeAnchoredTwin",
+                "/opt/work/repo", home, ["/opt/work/repo", "\(home)/opt/work/repo"], "/opt/work/repo"
+            ),
+            // A genuinely absolute path that does not exist locally (an SSH or
+            // container path, an unmounted volume) must resolve to NIL — never be
+            // re-anchored under home, which would index a same-named local repo and
+            // inject wrong-repo vocabulary. Only `../`-prefixed (explicitly elided)
+            // titles get home-anchoring.
+            ("NonExistentAbsolutePathDoesNotFallBackToHome", "/work/repo — zsh", home, ["\(home)/work/repo"], nil),
+            // THE T6 field failure, canonical case (owner-confirmed 2026-07-11):
+            // Ghostty's tab title elides with a Unicode HORIZONTAL ELLIPSIS, not
+            // ASCII dots — the real title was "…/Desktop/projects/supervoxtral"
+            // (reported by typing, which loses the distinction from "../"). The
+            // ellipsis-elided title must home-anchor exactly like the ASCII form.
+            (
+                "T6GhosttyEllipsisElidedTitleResolvesHomeAnchored",
+                "…/Desktop/projects/supervoxtral",
+                "/Users/owner",
+                ["/Users/owner/Desktop/projects/supervoxtral"],
+                "/Users/owner/Desktop/projects/supervoxtral"
+            ),
+            // U+2025 TWO DOT LEADER is accepted as an elision mark too.
+            (
+                "TwoDotLeaderElidedTitleResolvesHomeAnchored",
+                "‥/dev/proj — zsh", home, ["\(home)/dev/proj"], "/Users/tester/dev/proj"
+            ),
+            ("AbbreviatedTitleWithNothingExistingResolvesNil", "../foo", home, [], nil),
+        ]
+        for (name, title, homeDirectory, existing, expected) in cases {
+            let resolved = TerminalWorkingDirectoryResolver.resolveWorkingDirectory(
+                fromWindowTitle: title,
+                homeDirectory: homeDirectory,
+                isDirectory: { existing.contains($0) }
+            )
+            XCTAssertEqual(resolved, expected, name)
+        }
     }
 
     // MARK: - Ghostty-abbreviated titles (leading components elided as `..`)
 
-    /// The T6 field case (2026-07-11): Ghostty's tab title is exactly
-    /// "../Desktop/projects/supervoxtral". The extracted absolute run
-    /// "/Desktop/projects/supervoxtral" does not exist; the home-anchored
-    /// expansion does and must resolve.
-    func testGhosttyAbbreviatedTitleResolvesHomeAnchored() {
-        let resolved = TerminalWorkingDirectoryResolver.resolveWorkingDirectory(
-            fromWindowTitle: "../Desktop/projects/supervoxtral",
-            homeDirectory: "/Users/x",
-            isDirectory: { $0 == "/Users/x/Desktop/projects/supervoxtral" }
-        )
-        XCTAssertEqual(resolved, "/Users/x/Desktop/projects/supervoxtral")
-    }
-
-    /// A genuinely absolute path that exists must never be shadowed by its
-    /// home-anchored twin, even when both exist.
-    func testExistingAbsolutePathWinsOverHomeAnchoredTwin() {
-        let resolved = TerminalWorkingDirectoryResolver.resolveWorkingDirectory(
-            fromWindowTitle: "/opt/work/repo",
-            homeDirectory: home,
-            isDirectory: { $0 == "/opt/work/repo" || $0 == "\(self.home)/opt/work/repo" }
-        )
-        XCTAssertEqual(resolved, "/opt/work/repo")
-    }
-
-    /// A genuinely absolute path that does not exist locally (an SSH or
-    /// container path, an unmounted volume) must resolve to NIL — never be
-    /// re-anchored under home, which would index a same-named local repo and
-    /// inject wrong-repo vocabulary. Only `../`-prefixed (explicitly elided)
-    /// titles get home-anchoring.
-    func testNonExistentAbsolutePathDoesNotFallBackToHome() {
-        let resolved = TerminalWorkingDirectoryResolver.resolveWorkingDirectory(
-            fromWindowTitle: "/work/repo — zsh",
-            homeDirectory: home,
-            isDirectory: { $0 == "\(self.home)/work/repo" }
-        )
-        XCTAssertNil(resolved)
-    }
-
-    /// THE T6 field failure, canonical case (owner-confirmed 2026-07-11):
-    /// Ghostty's tab title elides with a Unicode HORIZONTAL ELLIPSIS, not
-    /// ASCII dots — the real title was "…/Desktop/projects/supervoxtral"
-    /// (reported by typing, which loses the distinction from "../"). The
-    /// ellipsis-elided title must home-anchor exactly like the ASCII form.
-    func testT6GhosttyEllipsisElidedTitleResolvesHomeAnchored() {
-        let resolved = TerminalWorkingDirectoryResolver.resolveWorkingDirectory(
-            fromWindowTitle: "…/Desktop/projects/supervoxtral",
-            homeDirectory: "/Users/owner",
-            isDirectory: { $0 == "/Users/owner/Desktop/projects/supervoxtral" }
-        )
-        XCTAssertEqual(resolved, "/Users/owner/Desktop/projects/supervoxtral")
-    }
-
-    /// The same canonical T6 case through the PRODUCTION existence check (no
-    /// injected predicate — the default real-filesystem one), against a real
-    /// temp directory tree, so hermetic test defaults can never mask a broken
-    /// production wiring again.
+    /// The canonical T6 case (the `T6GhosttyEllipsisElidedTitleResolvesHomeAnchored`
+    /// row of `testResolveWorkingDirectory`) through the PRODUCTION existence
+    /// check (no injected predicate — the default real-filesystem one), against
+    /// a real temp directory tree, so hermetic test defaults can never mask a
+    /// broken production wiring again.
     func testT6GhosttyEllipsisElidedTitleResolvesWithRealFilesystemCheck() throws {
         let tempHome = FileManager.default.temporaryDirectory
             .appendingPathComponent("t6-home-\(UUID().uuidString)").path
@@ -151,24 +119,25 @@ final class TerminalWorkingDirectoryResolverTests: XCTestCase {
         )
     }
 
-    /// U+2025 TWO DOT LEADER is accepted as an elision mark too.
-    func testTwoDotLeaderElidedTitleResolvesHomeAnchored() {
-        let resolved = TerminalWorkingDirectoryResolver.resolveWorkingDirectory(
-            fromWindowTitle: "‥/dev/proj — zsh",
-            homeDirectory: home,
-            isDirectory: { $0 == "\(self.home)/dev/proj" }
-        )
-        XCTAssertEqual(resolved, "/Users/tester/dev/proj")
-    }
-
-    func testEllipsisFallbackCandidateShape() {
-        XCTAssertEqual(
-            TerminalWorkingDirectoryResolver.homeAnchoredFallbackCandidates(
-                fromWindowTitle: "…/Desktop/proj — zsh",
-                homeDirectory: home
-            ),
-            ["/Users/tester/Desktop/proj"]
-        )
+    func testHomeAnchoredFallbackCandidates() {
+        let cases: [(name: String, title: String, expected: [String])] = [
+            ("EllipsisFallbackCandidateShape", "…/Desktop/proj — zsh", ["/Users/tester/Desktop/proj"]),
+            ("DotDotFallbackCandidateShape", "../Desktop/proj — zsh", ["/Users/tester/Desktop/proj"]),
+            // A tilde run is already home-anchored: no fallback is generated.
+            ("TildeRunHasNoFallback", "~/dev/proj", []),
+            // An absolute run generates NO fallback: only `../` signals elision.
+            ("AbsoluteRunHasNoFallback", "/work/repo — zsh", []),
+        ]
+        for (name, title, expected) in cases {
+            XCTAssertEqual(
+                TerminalWorkingDirectoryResolver.homeAnchoredFallbackCandidates(
+                    fromWindowTitle: title,
+                    homeDirectory: home
+                ),
+                expected,
+                name
+            )
+        }
     }
 
     // MARK: - Redacted title-shape diagnostic
@@ -192,41 +161,6 @@ final class TerminalWorkingDirectoryResolverTests: XCTestCase {
         )
         XCTAssertEqual(shape.count, 60)
         XCTAssertEqual(shape, String(repeating: "a", count: 60))
-    }
-
-    func testAbbreviatedTitleWithNothingExistingResolvesNil() {
-        let resolved = TerminalWorkingDirectoryResolver.resolveWorkingDirectory(
-            fromWindowTitle: "../foo",
-            homeDirectory: home,
-            isDirectory: { _ in false }
-        )
-        XCTAssertNil(resolved)
-    }
-
-    func testHomeAnchoredFallbackCandidateShapes() {
-        XCTAssertEqual(
-            TerminalWorkingDirectoryResolver.homeAnchoredFallbackCandidates(
-                fromWindowTitle: "../Desktop/proj — zsh",
-                homeDirectory: home
-            ),
-            ["/Users/tester/Desktop/proj"]
-        )
-        // A tilde run is already home-anchored: no fallback is generated.
-        XCTAssertEqual(
-            TerminalWorkingDirectoryResolver.homeAnchoredFallbackCandidates(
-                fromWindowTitle: "~/dev/proj",
-                homeDirectory: home
-            ),
-            []
-        )
-        // An absolute run generates NO fallback: only `../` signals elision.
-        XCTAssertEqual(
-            TerminalWorkingDirectoryResolver.homeAnchoredFallbackCandidates(
-                fromWindowTitle: "/work/repo — zsh",
-                homeDirectory: home
-            ),
-            []
-        )
     }
 }
 
@@ -396,157 +330,6 @@ final class TerminalDescendantProcessResolverTests: XCTestCase {
     }
 }
 
-// MARK: - Git-root walk + HEAD/branch parsing (fixture dirs, no git binary)
-
-final class RepoIndexingWalkTests: XCTestCase {
-    private func makeTempDir() -> URL {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("repovocab-walk-\(UUID().uuidString)")
-        try! FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-        addTeardownBlock { try? FileManager.default.removeItem(at: url) }
-        return url
-    }
-
-    private func write(_ content: String, to url: URL) {
-        try! FileManager.default.createDirectory(
-            at: url.deletingLastPathComponent(), withIntermediateDirectories: true
-        )
-        try! content.write(to: url, atomically: true, encoding: .utf8)
-    }
-
-    func testFindsGitRootWalkingUp() {
-        let repo = makeTempDir()
-        write("ref: refs/heads/main\n", to: repo.appendingPathComponent(".git/HEAD"))
-        let deep = repo.appendingPathComponent("sub/deep")
-        try! FileManager.default.createDirectory(at: deep, withIntermediateDirectories: true)
-
-        let root = RepoIndexing.findGitRoot(startingAt: deep.path)
-        XCTAssertEqual(root, repo.standardizedFileURL.path)
-    }
-
-    func testFindGitRootReturnsNilOutsideRepo() {
-        let dir = makeTempDir()
-        XCTAssertNil(RepoIndexing.findGitRoot(startingAt: dir.path))
-    }
-
-    func testBranchParsedFromHead() {
-        let repo = makeTempDir()
-        write("ref: refs/heads/feature/foo\n", to: repo.appendingPathComponent(".git/HEAD"))
-        XCTAssertEqual(RepoIndexing.branch(root: repo.path), "feature/foo")
-    }
-
-    func testDetachedHeadYieldsNilBranch() {
-        let repo = makeTempDir()
-        write(
-            "9fceb02d0ae598e95dc970b74767f19372d61af8\n",
-            to: repo.appendingPathComponent(".git/HEAD")
-        )
-        XCTAssertNil(RepoIndexing.branch(root: repo.path))
-    }
-
-    func testWorktreeGitdirPointerFollowedToHead() {
-        // A linked worktree: `.git` is a FILE pointing at the real gitdir, whose
-        // HEAD holds the worktree's branch.
-        let mainRepo = makeTempDir()
-        let worktreeGitDir = mainRepo.appendingPathComponent(".git/worktrees/wt")
-        write("ref: refs/heads/wt-branch\n", to: worktreeGitDir.appendingPathComponent("HEAD"))
-
-        let worktree = makeTempDir()
-        write("gitdir: \(worktreeGitDir.path)\n", to: worktree.appendingPathComponent(".git"))
-
-        XCTAssertEqual(
-            RepoIndexing.findGitRoot(startingAt: worktree.path),
-            worktree.standardizedFileURL.path
-        )
-        XCTAssertEqual(RepoIndexing.branch(root: worktree.path), "wt-branch")
-    }
-}
-
-// MARK: - ls-files parsing + vocabulary build (synthesized bytes)
-
-final class RepoIndexingParsingTests: XCTestCase {
-    func testParsesCleanNullDelimitedPaths() {
-        let data = "a/b.ts\u{0}c/d.swift\u{0}".data(using: .utf8)!
-        XCTAssertEqual(
-            RepoIndexing.parseNullDelimitedPaths(data),
-            ["a/b.ts", "c/d.swift"]
-        )
-    }
-
-    func testDropsTruncatedFinalEntry() {
-        // No trailing NUL: the final entry was cut mid-write (timeout/cap).
-        let data = "a/b.ts\u{0}c/d.sw".data(using: .utf8)!
-        XCTAssertEqual(RepoIndexing.parseNullDelimitedPaths(data), ["a/b.ts"])
-    }
-
-    func testCapsAtMaxEntries() {
-        let data = "x\u{0}y\u{0}z\u{0}".data(using: .utf8)!
-        XCTAssertEqual(
-            RepoIndexing.parseNullDelimitedPaths(data, maxEntries: 2),
-            ["x", "y"]
-        )
-    }
-
-    func testEmptyDataYieldsNoPaths() {
-        XCTAssertEqual(RepoIndexing.parseNullDelimitedPaths(Data()), [])
-    }
-
-    func testBuildVocabularyBasenamesComponentsAndBranch() {
-        let vocab = RepoIndexing.buildVocabulary(
-            paths: ["useAuth.ts", "Sources/App/UserSessionManager.swift"],
-            branch: "feat/repo-vocabulary"
-        )
-        XCTAssertTrue(vocab.terms.contains("useAuth.ts"))
-        XCTAssertTrue(vocab.terms.contains("UserSessionManager.swift"))
-        // Bare common-word components carry no technical signal — excluded
-        // (they would capitalize ordinary prose as false hints).
-        XCTAssertFalse(vocab.terms.contains("Sources"))
-        XCTAssertFalse(vocab.terms.contains("App"))
-        // A branch with separators is technical and included as a term.
-        XCTAssertTrue(vocab.terms.contains("feat/repo-vocabulary"))
-        XCTAssertEqual(vocab.branch, "feat/repo-vocabulary")
-    }
-
-    func testBuildVocabularyExcludesNonTechnicalTerms() {
-        let vocab = RepoIndexing.buildVocabulary(
-            paths: [
-                "Tests/FooTests.swift",
-                "Resources/image.png",
-                "docs/readme.txt",
-                "Makefile",
-            ],
-            branch: "main"
-        )
-        XCTAssertTrue(vocab.terms.contains("FooTests.swift"))
-        XCTAssertTrue(vocab.terms.contains("image.png"))
-        XCTAssertTrue(vocab.terms.contains("readme.txt"))
-        // Common-word components: excluded (would inject `- Tests: tests`
-        // style false hints that capitalize ordinary prose).
-        XCTAssertFalse(vocab.terms.contains("Tests"))
-        XCTAssertFalse(vocab.terms.contains("Resources"))
-        XCTAssertFalse(vocab.terms.contains("docs"))
-        // Accepted loss (documented in `isTechnicalTerm`): bare names without
-        // separators or internal capitals carry no machine-checkable signal.
-        XCTAssertFalse(vocab.terms.contains("Makefile"))
-        // A plain-word branch is excluded from TERMS but still reported.
-        XCTAssertFalse(vocab.terms.contains("main"))
-        XCTAssertEqual(vocab.branch, "main")
-    }
-
-    func testIsTechnicalTermRule() {
-        XCTAssertTrue(RepoIndexing.isTechnicalTerm("useAuth.ts"))          // dot
-        XCTAssertTrue(RepoIndexing.isTechnicalTerm("feat/polish-guard"))   // separators
-        XCTAssertTrue(RepoIndexing.isTechnicalTerm("snake_case"))          // underscore
-        XCTAssertTrue(RepoIndexing.isTechnicalTerm("UserSessionManager"))  // PascalCase
-        XCTAssertTrue(RepoIndexing.isTechnicalTerm("useAuth"))             // camelCase
-        XCTAssertFalse(RepoIndexing.isTechnicalTerm("Tests"))              // leading cap only
-        XCTAssertFalse(RepoIndexing.isTechnicalTerm("Resources"))
-        XCTAssertFalse(RepoIndexing.isTechnicalTerm("docs"))               // all lowercase
-        XCTAssertFalse(RepoIndexing.isTechnicalTerm("LICENSE"))            // all caps, no lower
-        XCTAssertFalse(RepoIndexing.isTechnicalTerm("Makefile"))           // accepted loss
-    }
-}
-
 // MARK: - TTL cache (injected clock + mtime)
 
 final class RepoVocabularyCacheTests: XCTestCase {
@@ -597,503 +380,46 @@ final class RepoVocabularyCacheTests: XCTestCase {
         )
         XCTAssertNil(miss)
     }
-}
 
-// MARK: - Matcher
+    func testMissWhenDictationFileMTimeChanged() {
+        let cache = RepoVocabularyCache(ttl: 300)
+        let start = Date(timeIntervalSince1970: 1_000)
+        let head = Date(timeIntervalSince1970: 500)
+        cache.insert(root: "/r", vocabulary: vocab, headModificationDate: head, now: start)
 
-final class RepoVocabularyMatcherTests: XCTestCase {
-    private func entries(_ transcript: String, terms: [String]) -> [ReplacementEntry] {
-        RepoVocabularyMatcher.candidateEntries(
-            transcript: transcript,
-            vocabulary: RepoVocabulary(terms: terms, branch: nil)
+        let miss = cache.lookup(
+            root: "/r",
+            now: start,
+            currentHeadModificationDate: head,
+            currentDictationFileModificationDate: Date(timeIntervalSince1970: 700)
         )
+        XCTAssertNil(miss)
     }
 
-    func testCanonicalUseAuthExample() {
-        let result = entries("open use auth dot t s and fix the import", terms: ["useAuth.ts"])
-        XCTAssertEqual(result.count, 1)
-        XCTAssertEqual(result.first?.replaceWith, "useAuth.ts")
-        XCTAssertEqual(result.first?.matches, ["use auth dot t s"])
-    }
-
-    func testCanonicalUserSessionManagerExample() {
-        let result = entries(
-            "rename the user session manager dot swift file",
-            terms: ["UserSessionManager.swift"]
-        )
-        XCTAssertEqual(result.count, 1)
-        XCTAssertEqual(result.first?.replaceWith, "UserSessionManager.swift")
-        XCTAssertEqual(result.first?.matches, ["user session manager dot swift"])
-    }
-
-    func testEditDistanceOneNearMiss() {
-        // "use auth s" -> "useauths" (8), one deletion from "useauthts".
-        let result = entries("please use auth s now", terms: ["useAuth.ts"])
-        XCTAssertEqual(result.count, 1)
-        XCTAssertEqual(result.first?.replaceWith, "useAuth.ts")
-    }
-
-    func testGroundedFuzzyTierAbstainsForTiedDistanceOneCandidates() {
-        let transcript = "Open ConfigC.swift."
-        let result = RepoVocabularyMatcher.groundedCandidateEntries(
-            transcript: transcript,
-            vocabulary: RepoVocabulary(
-                terms: ["ConfigA.swift", "ConfigB.swift"],
-                branch: nil
-            )
-        )
-
-        XCTAssertTrue(result.isEmpty, "entries: \(result)")
-        XCTAssertEqual(
-            RepoVocabularyMatcher.preapplying(entries: result, to: transcript),
-            transcript
-        )
-    }
-
-    func testGroundedCandidatesUseAlignedFallbackAfterExistingMatcherMisses() {
-        let result = RepoVocabularyMatcher.groundedCandidateEntries(
-            transcript: "Open uzoft.ts and add a null check.",
-            vocabulary: RepoVocabulary(terms: ["useAuth.ts"], branch: nil)
-        )
-        XCTAssertEqual(
-            result,
-            [ReplacementEntry(replaceWith: "useAuth.ts", matches: ["uzoft.ts"])]
-        )
-    }
-
-    func testAlignedFallbackRecoversLongFrenchPhoneticDamage() {
-        let result = RepoVocabularyMatcher.groundedCandidateEntries(
-            transcript: "Regarde de dictation vie ou modèle.",
-            vocabulary: RepoVocabulary(terms: ["DictationViewModel.swift"], branch: nil)
-        )
-        XCTAssertEqual(result.first?.replaceWith, "DictationViewModel.swift")
-        XCTAssertEqual(result.first?.matches, ["dictation vie ou modèle"])
-    }
-
-    func testAlignedFallbackRecoversRecordedContextMisses() {
-        let cases: [(transcript: String, exact: String, heard: String)] = [
-            (
-                "Rebase my brand John to feed/Polish helper MLX Swift.",
-                "feat/polish-helper-mlx-swift",
-                "feed/Polish helper MLX Swift"
-            ),
-            (
-                "Why is local voxtral cotisin identity not picked up by the runner?",
-                "LOCALVOXTRAL_CODESIGN_IDENTITY",
-                "local voxtral cotisin identity"
-            ),
-            (
-                "The crash is in Pozik's pipe read next Chong.",
-                "POSIXPipeRead.nextChunk(fromDescriptor:)",
-                "Pozik's pipe read next Chong"
-            ),
-            (
-                "Pourquoi la variable locale Voxtral co-design identity est ignorée?",
-                "LOCALVOXTRAL_CODESIGN_IDENTITY",
-                "locale Voxtral co-design identity"
-            ),
-            (
-                "Move the token refresh into off service.ts.",
-                "AuthService.ts",
-                "service.ts"
-            ),
-        ]
-
-        for item in cases {
-            let result = RepoVocabularyMatcher.groundedCandidateEntries(
-                transcript: item.transcript,
-                vocabulary: RepoVocabulary(terms: [item.exact], branch: nil)
-            )
-            XCTAssertEqual(result.first?.replaceWith, item.exact, item.transcript)
-            XCTAssertEqual(result.first?.matches, [item.heard], item.transcript)
-        }
-    }
-
-    func testAlignedFallbackAbstainsWhenCandidatesAreAmbiguous() {
-        let result = RepoVocabularyMatcher.groundedCandidateEntries(
-            transcript: "Open auth sir vice here.",
-            vocabulary: RepoVocabulary(
-                terms: ["AuthService.ts", "AuthServices.ts"],
-                branch: nil
-            )
-        )
-        XCTAssertTrue(result.isEmpty, "entries: \(result)")
-    }
-
-    func testAlignedFallbackAbstainsOnUnrelatedProse() {
-        let result = RepoVocabularyMatcher.groundedCandidateEntries(
-            transcript: "Please improve the error message for users.",
-            vocabulary: RepoVocabulary(
-                terms: ["UserSessionManager.swift", "AuthService.ts"],
-                branch: nil
-            )
-        )
-        XCTAssertTrue(result.isEmpty, "entries: \(result)")
-    }
-
-    func testAlignedFallbackDoesNotForceUnspokenFileExtensionWithoutFileCue() {
-        let result = RepoVocabularyMatcher.groundedCandidateEntries(
-            transcript: "Fix the user session manager.",
-            vocabulary: RepoVocabulary(terms: ["UserSessionManager.swift"], branch: nil)
-        )
-        XCTAssertTrue(result.isEmpty, "entries: \(result)")
-    }
-
-    func testAlignedFallbackAbstainsOnGluedSingleTokenThatWouldDeleteProse() {
-        let result = RepoVocabularyMatcher.groundedCandidateEntries(
-            transcript: "Ouvreusot.ts maintenant.",
-            vocabulary: RepoVocabulary(terms: ["useAuth.ts"], branch: nil)
-        )
-        XCTAssertTrue(result.isEmpty, "entries: \(result)")
-    }
-
-    func testPreapplyApprovedMappingPreservesPunctuation() {
-        XCTAssertEqual(
-            RepoVocabularyMatcher.preapplying(
-                entries: [
-                    ReplacementEntry(
-                        replaceWith: "useAuth.ts",
-                        matches: ["use auth dot t s"]
-                    )
-                ],
-                to: "Open use auth dot t s, then add a null check."
-            ),
-            "Open useAuth.ts, then add a null check."
-        )
-    }
-
-    func testPreapplyApprovedMappingsUsesLongestAliasFirst() {
-        XCTAssertEqual(
-            RepoVocabularyMatcher.preapplying(
-                entries: [
-                    ReplacementEntry(replaceWith: "Auth", matches: ["auth"]),
-                    ReplacementEntry(
-                        replaceWith: "AuthService.ts",
-                        matches: ["auth service dot t s"]
-                    ),
-                ],
-                to: "Open auth service dot t s and inspect auth."
-            ),
-            "Open AuthService.ts and inspect Auth."
-        )
-    }
-
-    func testPreapplyRepoClipboardConflictUsesLongerExactTermPrecedence() {
-        let repoEntry = ReplacementEntry(
-            replaceWith: "RepoAPI",
-            matches: ["heard api"]
-        )
-        let clipboardEntry = ReplacementEntry(
-            replaceWith: "ClipboardAPI",
-            matches: ["heard api"]
-        )
-
-        XCTAssertEqual(
-            RepoVocabularyMatcher.preapplying(
-                entries: [repoEntry, clipboardEntry],
-                to: "Open heard api."
-            ),
-            "Open ClipboardAPI."
-        )
-    }
-
-    func testFrenchComposedAndDecomposedAccentsFallbackAndPreapplyPreservePunctuation() {
-        let accentForms = ["modèle", "mode\u{0300}le"]
-        for accentForm in accentForms {
-            let transcript = "Regarde, dictation vie ou \(accentForm)."
-            let entries = RepoVocabularyMatcher.groundedCandidateEntries(
-                transcript: transcript,
-                vocabulary: RepoVocabulary(
-                    terms: ["DictationViewModel.swift"],
-                    branch: nil
-                )
-            )
-
-            XCTAssertEqual(entries.first?.matches, ["dictation vie ou \(accentForm)"])
-            XCTAssertEqual(
-                RepoVocabularyMatcher.preapplying(entries: entries, to: transcript),
-                "Regarde, DictationViewModel.swift."
+    /// Dictating across many repos in one app run must not keep every root's
+    /// vocabulary: past capacity the least recently stored root goes, while
+    /// the recent ones still hit within the TTL.
+    func testInsertBeyondCapacityEvictsOldestRoot() {
+        let cache = RepoVocabularyCache(ttl: 300, capacity: 2)
+        let start = Date(timeIntervalSince1970: 1_000)
+        let head = Date(timeIntervalSince1970: 500)
+        for (offset, root) in ["/a", "/b", "/c"].enumerated() {
+            cache.insert(
+                root: root,
+                vocabulary: vocab,
+                headModificationDate: head,
+                now: start.addingTimeInterval(TimeInterval(offset))
             )
         }
-    }
 
-    func testPreapplyApprovedMappingDoesNotRewriteInsideIdentifier() {
-        XCTAssertEqual(
-            RepoVocabularyMatcher.preapplying(
-                entries: [ReplacementEntry(replaceWith: "useAuth.ts", matches: ["auth"])],
-                to: "Keep preauth_handler unchanged."
-            ),
-            "Keep preauth_handler unchanged."
-        )
-    }
-
-    func testPreapplySkipsUnsafeControlCharacterTerm() {
-        XCTAssertEqual(
-            RepoVocabularyMatcher.preapplying(
-                entries: [ReplacementEntry(replaceWith: "bad\nname.ts", matches: ["bad name"])],
-                to: "Open bad name now."
-            ),
-            "Open bad name now."
-        )
-    }
-
-    func testShortFormTermsRejected() {
-        // Bare "app"/"src" normalize to < 4 chars: no standalone entries.
-        XCTAssertTrue(entries("open the app and src", terms: ["app", "src"]).isEmpty)
-    }
-
-    func testShortComponentCountsInsideLongerNGram() {
-        // "app" alone is too short, but "app dot t s x" -> "apptsx" matches app.tsx.
-        let result = entries("edit app dot t s x here", terms: ["app.tsx"])
-        XCTAssertEqual(result.first?.replaceWith, "app.tsx")
-    }
-
-    func testPureStopwordNGramsRejected() {
-        // "the file" is all stopwords: never a file match even if it normalizes
-        // to a real term.
-        XCTAssertTrue(entries("open the file now", terms: ["thefile"]).isEmpty)
-    }
-
-    func testEntryCapAtTwelve() {
-        let terms = (0..<15).map { "alphafile\(String(format: "%02d", $0))" }
-        let transcript = terms.joined(separator: " ")
-        XCTAssertEqual(entries(transcript, terms: terms).count, 12)
-    }
-
-    func testRankingLongerNormalizedFirst() {
-        let result = entries("config configuration", terms: ["config", "configuration"])
-        XCTAssertEqual(result.map(\.replaceWith), ["configuration", "config"])
-    }
-
-    func testPromptSectionRendersDictionaryShape() {
-        let section = RepoVocabularyMatcher.promptSection(entries: [
-            ReplacementEntry(replaceWith: "useAuth.ts", matches: ["use auth dot t s"]),
-        ])
-        XCTAssertTrue(section.contains("Repository vocabulary"))
-        XCTAssertTrue(section.contains("- useAuth.ts: use auth dot t s"))
-    }
-
-    func testAppendedSectionStandsAloneWhenBaseEmpty() {
-        let appended = RepoVocabularyMatcher.appendedPromptSection(
-            base: "",
-            entries: [ReplacementEntry(replaceWith: "useAuth.ts", matches: ["use auth"])]
-        )
-        XCTAssertTrue(appended.hasPrefix("Repository vocabulary"))
-    }
-
-    func testAppendedSectionUnchangedWithNoEntries() {
-        XCTAssertEqual(
-            RepoVocabularyMatcher.appendedPromptSection(base: "Replacement dictionary:\n- x: y", entries: []),
-            "Replacement dictionary:\n- x: y"
-        )
-    }
-
-    func testPromptSectionSanitizesEmbeddedNewlineIntoSingleLine() {
-        // `git ls-files -z` preserves newlines in file names; the rendered
-        // dictionary line must stay a single intact `- key: aliases` line.
-        let section = RepoVocabularyMatcher.promptSection(entries: [
-            ReplacementEntry(replaceWith: "use\nAuth.ts", matches: ["use auth dot t s"]),
-        ])
-        let entryLines = section.split(separator: "\n").filter { $0.hasPrefix("- ") }
-        XCTAssertEqual(entryLines.count, 1)
-        XCTAssertEqual(entryLines.first, "- useAuth.ts: use auth dot t s")
-    }
-
-    func testPromptSectionStripsControlCharactersFromAliases() {
-        let section = RepoVocabularyMatcher.promptSection(entries: [
-            ReplacementEntry(replaceWith: "ok.ts", matches: ["use\u{0007}\tok"]),
-        ])
-        XCTAssertTrue(section.contains("- ok.ts: useok"))
-    }
-
-    func testPromptSectionDropsUnrenderableEntries() {
-        // Key empty after sanitization, key reduced to a dash run, and an entry
-        // whose every alias sanitizes away: none may render (and with nothing
-        // renderable the whole section is empty).
-        let section = RepoVocabularyMatcher.promptSection(entries: [
-            ReplacementEntry(replaceWith: "\u{0007}\n", matches: ["spoken"]),
-            ReplacementEntry(replaceWith: "---", matches: ["spoken"]),
-            ReplacementEntry(replaceWith: "ok.ts", matches: ["\n", "\u{0000}"]),
-        ])
-        XCTAssertEqual(section, "")
-    }
-
-    func testCommonComponentWordsDoNotBecomeMatcherEntries() {
-        // A repo full of Tests/Resources directories must not turn ordinary
-        // prose into capitalization "corrections": the technical-signal gate
-        // keeps those components out of the vocabulary entirely.
-        let vocab = RepoIndexing.buildVocabulary(
-            paths: ["Tests/FooTests.swift", "Resources/image.png"],
-            branch: nil
-        )
-        let entries = RepoVocabularyMatcher.candidateEntries(
-            transcript: "run the tests and update the resources please",
-            vocabulary: vocab
-        )
-        XCTAssertTrue(entries.isEmpty, "entries: \(entries)")
-    }
-
-    func testMatcherHandlesLargeVocabulary() {
-        // 20k technical terms x a 300-word transcript. No wall-clock assertion
-        // (repo rule) — the guarantee is the complexity restructure (exact tier
-        // = one index lookup per gram; fuzzy tier = ±1-length buckets swept at
-        // most once per distinct gram); this pins CORRECTNESS at that scale and
-        // acts as a canary: a return to O(grams x terms) Levenshtein would make
-        // it obviously pathological.
-        var terms = (0..<20_000).map { "GeneratedFile\($0).swift" }
-        terms.append("useAuth.ts")
-        let vocab = RepoVocabulary(terms: terms, branch: nil)
-        let filler = Array(
-            repeating: "please improve overall code quality generally",
-            count: 50
-        ).joined(separator: " ")
-        let transcript = filler + " then open use auth dot t s directly"
-        let entries = RepoVocabularyMatcher.candidateEntries(
-            transcript: transcript, vocabulary: vocab
-        )
-        XCTAssertTrue(entries.contains { $0.replaceWith == "useAuth.ts" })
-    }
-
-    func testAlignedFallbackAbstainsCleanlyWithLargeAmbiguousVocabulary() {
-        let terms = (0..<20_000).map { "GeneratedFile\($0).swift" }
-        let result = RepoVocabularyMatcher.groundedCandidateEntries(
-            transcript: "please improve overall error handling for generated files",
-            vocabulary: RepoVocabulary(terms: terms, branch: nil)
-        )
-        XCTAssertTrue(result.isEmpty, "entries: \(result)")
+        let now = start.addingTimeInterval(10)
+        XCTAssertNil(cache.lookup(root: "/a", now: now, currentHeadModificationDate: head))
+        XCTAssertEqual(cache.lookup(root: "/b", now: now, currentHeadModificationDate: head), vocab)
+        XCTAssertEqual(cache.lookup(root: "/c", now: now, currentHeadModificationDate: head), vocab)
     }
 }
 
 // MARK: - Service orchestration (injected subprocess + fixture .git)
-
-final class ClipboardVocabularyTests: XCTestCase {
-    // MARK: - Entity extraction (reuses the guard's recognizer)
-
-    func testEntitiesRecognizeCodeLikeTokensAndDedupe() {
-        let excerpt = """
-        Fix UserSessionManager.swift and rerun with --force.
-        See src/auth/useAuth.ts and $HOME_DIR, then UserSessionManager.swift again.
-        """
-        XCTAssertEqual(
-            ClipboardVocabulary.entities(inExcerpt: excerpt),
-            ["UserSessionManager.swift", "--force", "src/auth/useAuth.ts", "$HOME_DIR"]
-        )
-    }
-
-    func testEntitiesUnwrapBacktickSpans() {
-        XCTAssertEqual(
-            ClipboardVocabulary.entities(inExcerpt: "call `resolveWorkingDirectory` here"),
-            ["resolveWorkingDirectory"]
-        )
-    }
-
-    func testEntitiesRecognizeBareContextIdentifiersMissedByGuardGrammar() {
-        XCTAssertEqual(
-            ClipboardVocabulary.entities(
-                inExcerpt: "LOCALVOXTRAL_CODESIGN_IDENTITY ShortcutRecorder POSIXPipeRead.nextChunk(fromDescriptor:)"
-            ),
-            [
-                "LOCALVOXTRAL_CODESIGN_IDENTITY",
-                "ShortcutRecorder",
-                "POSIXPipeRead.nextChunk(fromDescriptor:)",
-            ]
-        )
-    }
-
-    func testSupplementalEntityExtractionRejectsOrdinaryClipboardProse() {
-        XCTAssertTrue(
-            ClipboardVocabulary.entities(
-                inExcerpt: "Please remember that authentication service behavior matters"
-            ).isEmpty
-        )
-    }
-
-    func testSupplementalEntitiesRejectColonAndHyphenatedProse() {
-        let cases: [(excerpt: String, transcript: String)] = [
-            ("Description: details", "description"),
-            ("well-known", "well known"),
-        ]
-
-        for item in cases {
-            XCTAssertTrue(
-                ClipboardVocabulary.entities(inExcerpt: item.excerpt).isEmpty,
-                "excerpt: \(item.excerpt)"
-            )
-            XCTAssertTrue(
-                ClipboardVocabulary.candidateEntries(
-                    transcript: item.transcript,
-                    excerpt: item.excerpt
-                ).isEmpty,
-                "excerpt: \(item.excerpt)"
-            )
-        }
-    }
-
-    func testProseExcerptYieldsNoEntities() {
-        XCTAssertTrue(
-            ClipboardVocabulary.entities(
-                inExcerpt: "just a plain sentence with no code tokens at all"
-            ).isEmpty
-        )
-    }
-
-    // MARK: - Transcript matching (same matcher as repo vocabulary)
-
-    /// The T5 field case (2026-07-11): clipboard holds the exact identifier,
-    /// the STT glued the dictated tail into `manager.swift`. The transcript
-    /// n-gram must match the clipboard entity and yield the structured
-    /// (spoken, exact) pair the session can pre-apply before polishing.
-    func testT5TranscriptGramMatchesClipboardEntity() {
-        let result = ClipboardVocabulary.candidateEntries(
-            transcript: "look at user session manager.swift",
-            excerpt: "UserSessionManager.swift"
-        )
-        XCTAssertEqual(result.count, 1)
-        XCTAssertEqual(result.first?.replaceWith, "UserSessionManager.swift")
-        XCTAssertEqual(result.first?.matches, ["user session manager.swift"])
-    }
-
-    func testSupplementalEntitiesGroundCommonTechnicalDictationDamage() {
-        let cases: [(transcript: String, excerpt: String, expected: String)] = [
-            (
-                "set local voxtral code sign identity before packaging",
-                "LOCALVOXTRAL_CODESIGN_IDENTITY",
-                "LOCALVOXTRAL_CODESIGN_IDENTITY"
-            ),
-            (
-                "the crash is in posix pipe read next chunk from descriptor",
-                "POSIXPipeRead.nextChunk(fromDescriptor:)",
-                "POSIXPipeRead.nextChunk(fromDescriptor:)"
-            ),
-            (
-                "check whether shortcut recorder is initialized",
-                "ShortcutRecorder",
-                "ShortcutRecorder"
-            ),
-        ]
-
-        for testCase in cases {
-            let result = ClipboardVocabulary.candidateEntries(
-                transcript: testCase.transcript,
-                excerpt: testCase.excerpt
-            )
-            XCTAssertEqual(
-                result.first?.replaceWith,
-                testCase.expected,
-                "transcript: \(testCase.transcript); entries: \(result)"
-            )
-        }
-    }
-
-    func testUnrelatedTranscriptYieldsNoEntries() {
-        XCTAssertTrue(
-            ClipboardVocabulary.candidateEntries(
-                transcript: "completely unrelated dictation about lunch",
-                excerpt: "UserSessionManager.swift"
-            ).isEmpty
-        )
-    }
-}
 
 final class RepoVocabularyServiceTests: XCTestCase {
     private func makeFixtureRepo() -> URL {
@@ -1163,6 +489,74 @@ final class RepoVocabularyServiceTests: XCTestCase {
         XCTAssertEqual(count, 1)
     }
 
+    func testDictationFileTermsJoinTheVocabularyFirstAndReachTheMatcher() async throws {
+        let repo = makeFixtureRepo()
+        try writeDictationFile("- Claude Code — the agent\n- `useAuth.ts`\n", repo: repo)
+        let vocab = await RepoVocabularyService.vocabulary(
+            forWorkingDirectory: repo.path,
+            cache: RepoVocabularyCache(),
+            runLsFiles: { _ in
+                RepoGitRunner.Output(
+                    data: "src/useAuth.ts\u{0}src/SessionClock.swift\u{0}".data(using: .utf8)!,
+                    exitCode: 0, timedOut: false, capped: false
+                )
+            }
+        )
+        let terms = try XCTUnwrap(vocab?.terms)
+        XCTAssertEqual(Array(terms.prefix(2)), ["Claude Code", "useAuth.ts"])
+        XCTAssertEqual(terms.filter { $0 == "useAuth.ts" }.count, 1)
+        XCTAssertTrue(terms.contains("SessionClock.swift"))
+
+        let outcome = RepoVocabularyMatcher.groundedCandidates(
+            transcript: "open clothes code please", vocabulary: try XCTUnwrap(vocab)
+        )
+        XCTAssertEqual(
+            outcome.verificationCandidates,
+            [ReplacementEntry(replaceWith: "Claude Code", matches: ["clothes code"])]
+        )
+    }
+
+    /// An agent that writes a term expects the next dictation to use it, not
+    /// one five minutes later when the cache would expire on its own.
+    func testEditingTheDictationFileInvalidatesTheCachedVocabulary() async throws {
+        let repo = makeFixtureRepo()
+        let runCount = RunCounter()
+        let cache = RepoVocabularyCache()
+        let clock: @Sendable () -> Date = { Date(timeIntervalSince1970: 5_000) }
+        let run: @Sendable (String) async -> RepoGitRunner.Output? = { _ in
+            await runCount.increment()
+            return RepoGitRunner.Output(
+                data: "useAuth.ts\u{0}".data(using: .utf8)!,
+                exitCode: 0, timedOut: false, capped: false
+            )
+        }
+
+        let before = await RepoVocabularyService.vocabulary(
+            forWorkingDirectory: repo.path, cache: cache, now: clock, runLsFiles: run
+        )
+        XCTAssertEqual(before?.terms.contains("Voxtral"), false)
+
+        let file = try writeDictationFile("- Voxtral\n", repo: repo)
+        try FileManager.default.setAttributes(
+            [.modificationDate: Date(timeIntervalSince1970: 4_000)], ofItemAtPath: file.path
+        )
+        let after = await RepoVocabularyService.vocabulary(
+            forWorkingDirectory: repo.path, cache: cache, now: clock, runLsFiles: run
+        )
+        XCTAssertEqual(after?.terms.first, "Voxtral")
+        let count = await runCount.value
+        XCTAssertEqual(count, 2)
+    }
+
+    @discardableResult
+    private func writeDictationFile(_ text: String, repo: URL) throws -> URL {
+        let github = repo.appendingPathComponent(".github")
+        try FileManager.default.createDirectory(at: github, withIntermediateDirectories: true)
+        let file = github.appendingPathComponent("dictation.md")
+        try text.write(to: file, atomically: true, encoding: .utf8)
+        return file
+    }
+
     private actor RunCounter {
         private(set) var value = 0
         func increment() { value += 1 }
@@ -1187,9 +581,18 @@ final class RepoVocabularyIndexerEndToEndTests: XCTestCase {
         env["GIT_TERMINAL_PROMPT"] = "0"
         env["HOME"] = directory.path
         process.environment = env
-        try? process.run()
-        process.waitUntilExit()
+        do { try process.runUntilExit() } catch { return -1 }
         return process.terminationStatus
+    }
+
+    /// `git commit` with the identity and signing settings given per command
+    /// rather than written into each fixture repo's config by three more
+    /// spawns.
+    private func commitAll(in directory: URL) -> Int32 {
+        runGit([
+            "-c", "user.email=test@example.com", "-c", "user.name=Test",
+            "-c", "commit.gpgsign=false", "commit", "-m", "init",
+        ], in: directory)
     }
 
     func testHarvestsVocabularyFromRealRepo() async throws {
@@ -1202,9 +605,6 @@ final class RepoVocabularyIndexerEndToEndTests: XCTestCase {
         addTeardownBlock { try? FileManager.default.removeItem(at: repo) }
 
         XCTAssertEqual(runGit(["init", "-b", "main"], in: repo), 0)
-        runGit(["config", "user.email", "test@example.com"], in: repo)
-        runGit(["config", "user.name", "Test"], in: repo)
-        runGit(["config", "commit.gpgsign", "false"], in: repo)
 
         try "export const useAuth = () => {}\n".write(
             to: repo.appendingPathComponent("useAuth.ts"), atomically: true, encoding: .utf8
@@ -1217,7 +617,7 @@ final class RepoVocabularyIndexerEndToEndTests: XCTestCase {
         )
 
         XCTAssertEqual(runGit(["add", "-A"], in: repo), 0)
-        XCTAssertEqual(runGit(["commit", "-m", "init"], in: repo), 0)
+        XCTAssertEqual(commitAll(in: repo), 0)
 
         let vocab = await RepoVocabularyService.vocabulary(
             forWorkingDirectory: repo.path,
@@ -1245,6 +645,36 @@ final class RepoVocabularyIndexerEndToEndTests: XCTestCase {
         )
         XCTAssertEqual(titleEntries?.entries.first?.replaceWith, "useAuth.ts")
 
+        // The resolved root is reported to the caller, which is how a
+        // dictation's learned terms are attributed to a project without the
+        // commit path walking the filesystem a second time.
+        let reportedRoot = RepoVocabularyRootBox()
+        _ = await RepoVocabularyService.entries(
+            forWindowTitle: "user@mac: \(repo.path) — zsh",
+            transcript: "open use auth dot t s please",
+            cache: RepoVocabularyCache(),
+            rootSink: { root in reportedRoot.report(root) }
+        )
+        guard case .root(let reported, _) = reportedRoot.value else {
+            return XCTFail("the pipeline resolved a repo but reported \(reportedRoot.value)")
+        }
+        XCTAssertEqual(
+            URL(fileURLWithPath: reported).standardizedFileURL.path,
+            URL(fileURLWithPath: repo.path).standardizedFileURL.path
+        )
+
+        // Reporting nil is not the same as staying silent: a terminal that is
+        // not in a repository says so, which is what lets a dictation there be
+        // attributed to no project rather than to none we could name.
+        let noRepoRoot = RepoVocabularyRootBox()
+        _ = await RepoVocabularyService.entries(
+            forWindowTitle: "user@mac: \(FileManager.default.temporaryDirectory.path) — zsh",
+            transcript: "open use auth dot t s please",
+            cache: RepoVocabularyCache(),
+            rootSink: { root in noRepoRoot.report(root) }
+        )
+        XCTAssertEqual(noRepoRoot.value, .noRepository)
+
         // A usable focused-window title disambiguates the focused tab and must
         // stay tier 1 even when descendant inspection would fail closed.
         let titlePreferredEntries = await RepoVocabularyService.entries(
@@ -1258,6 +688,111 @@ final class RepoVocabularyIndexerEndToEndTests: XCTestCase {
         XCTAssertEqual(titlePreferredEntries?.entries.first?.replaceWith, "useAuth.ts")
     }
 
+    /// A git repo with no commits whose `.github/dictation.md` holds `terms`:
+    /// `ls-files` answers empty, so the file's terms are the whole vocabulary.
+    private func makeRepoWithDictationTerms(_ name: String, terms: String) throws -> URL {
+        let repo = FileManager.default.temporaryDirectory
+            .appendingPathComponent("repovocab-\(name)-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: repo, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: repo) }
+        XCTAssertEqual(runGit(["init", "-b", "main"], in: repo), 0)
+        let github = repo.appendingPathComponent(".github")
+        try FileManager.default.createDirectory(at: github, withIntermediateDirectories: true)
+        try terms.write(
+            to: github.appendingPathComponent("dictation.md"), atomically: true, encoding: .utf8
+        )
+        return repo
+    }
+
+    /// The join named the session's directory; a title naming another repo
+    /// (another tab, a stale title) does not override it (#661).
+    func testAJoinedWorkspaceDecidesTheRepoOverTheTitle() async throws {
+        XCTAssertTrue(FileManager.default.isExecutableFile(atPath: "/usr/bin/git"))
+        let titled = try makeRepoWithDictationTerms("titled", terms: "- Parakeet Stream\n")
+        let joined = try makeRepoWithDictationTerms("joined", terms: "- Voxtral Realtime\n")
+        let subdirectory = joined.appendingPathComponent("Sources/App")
+        try FileManager.default.createDirectory(at: subdirectory, withIntermediateDirectories: true)
+
+        let root = RepoVocabularyRootBox()
+        let outcome = await RepoVocabularyService.entries(
+            forWindowTitle: "user@mac: \(titled.path) — zsh",
+            joinedWorkspaceDirectory: subdirectory.path,
+            transcript: "ask voxtral realtime and parakeet stream",
+            cache: RepoVocabularyCache(),
+            rootSink: { root.report($0) }
+        )
+
+        let terms = outcome?.entries.map(\.replaceWith) ?? []
+        XCTAssertTrue(terms.contains("Voxtral Realtime"), "entries: \(terms)")
+        XCTAssertFalse(terms.contains("Parakeet Stream"), "entries: \(terms)")
+        guard case .root(let reported, _) = root.value else {
+            return XCTFail("the joined workspace's repo was not reported: \(root.value)")
+        }
+        XCTAssertEqual(
+            URL(fileURLWithPath: reported).standardizedFileURL.path,
+            joined.standardizedFileURL.path
+        )
+    }
+
+    /// A joined workspace outside any repo is the answer, not a reason to
+    /// guess from the title: no vocabulary, and "no repository" reported.
+    func testAJoinedWorkspaceOutsideARepoYieldsNoVocabulary() async throws {
+        XCTAssertTrue(FileManager.default.isExecutableFile(atPath: "/usr/bin/git"))
+        let titled = try makeRepoWithDictationTerms("titled", terms: "- Parakeet Stream\n")
+        let plain = FileManager.default.temporaryDirectory
+            .appendingPathComponent("repovocab-plain-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: plain, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: plain) }
+
+        let root = RepoVocabularyRootBox()
+        let outcome = await RepoVocabularyService.entries(
+            forWindowTitle: "user@mac: \(titled.path) — zsh",
+            joinedWorkspaceDirectory: plain.path,
+            transcript: "ask parakeet stream",
+            cache: RepoVocabularyCache(),
+            rootSink: { root.report($0) }
+        )
+
+        XCTAssertNil(outcome)
+        XCTAssertEqual(root.value, .noRepository)
+    }
+
+    /// The Claude Desktop case end to end through the production pipeline: no
+    /// terminal PID and a target that is not a terminal, and the joined
+    /// workspace's `.github/dictation.md` still grounds the transcript.
+    @MainActor
+    func testThePipelineGroundsAJoinedWorkspaceWithoutATerminal() async throws {
+        XCTAssertTrue(FileManager.default.isExecutableFile(atPath: "/usr/bin/git"))
+        let repo = try makeRepoWithDictationTerms("desktop", terms: "- Voxtral Realtime\n")
+        let pipeline = RepoVocabularyPipeline(
+            settings: makeSettings(),
+            commitTargetAppPID: { nil },
+            targetBundleID: { ClaudeDesktopAllowlist.bundleID }
+        )
+
+        let root = RepoVocabularyRootBox()
+        let outcome = await pipeline.grounding(
+            endpointURL: URL(string: "http://127.0.0.1:8080/v1/chat/completions")!,
+            transcript: "ask voxtral realtime",
+            joinedWorkspace: LocalWorkspacePath(verifiedLocal: repo.path),
+            repositoryRoot: root
+        )
+
+        XCTAssertEqual(outcome?.entries.map(\.replaceWith), ["Voxtral Realtime"])
+        guard case .root = root.value else {
+            return XCTFail("the joined workspace's repo was not reported: \(root.value)")
+        }
+
+        // The same dictation without the join has nothing to read.
+        let unjoined = await pipeline.grounding(
+            endpointURL: URL(string: "http://127.0.0.1:8080/v1/chat/completions")!,
+            transcript: "ask voxtral realtime",
+            joinedWorkspace: nil,
+            repositoryRoot: nil
+        )
+        XCTAssertNil(unjoined)
+    }
+
     func testTitleClobberedAgentResolvesRepoFromTerminalDescendant() async throws {
         XCTAssertTrue(FileManager.default.isExecutableFile(atPath: "/usr/bin/git"))
 
@@ -1267,14 +802,11 @@ final class RepoVocabularyIndexerEndToEndTests: XCTestCase {
         addTeardownBlock { try? FileManager.default.removeItem(at: repo) }
 
         XCTAssertEqual(runGit(["init", "-b", "main"], in: repo), 0)
-        runGit(["config", "user.email", "test@example.com"], in: repo)
-        runGit(["config", "user.name", "Test"], in: repo)
-        runGit(["config", "commit.gpgsign", "false"], in: repo)
         try "export const useAuth = () => {}\n".write(
             to: repo.appendingPathComponent("useAuth.ts"), atomically: true, encoding: .utf8
         )
         XCTAssertEqual(runGit(["add", "-A"], in: repo), 0)
-        XCTAssertEqual(runGit(["commit", "-m", "init"], in: repo), 0)
+        XCTAssertEqual(commitAll(in: repo), 0)
 
         let entries = await RepoVocabularyService.entries(
             forWindowTitle: "Claude Code",
@@ -1333,9 +865,6 @@ final class RepoVocabularyIndexerEndToEndTests: XCTestCase {
         addTeardownBlock { try? FileManager.default.removeItem(at: repo) }
 
         XCTAssertEqual(runGit(["init", "-b", "main"], in: repo), 0)
-        runGit(["config", "user.email", "test@example.com"], in: repo)
-        runGit(["config", "user.name", "Test"], in: repo)
-        runGit(["config", "commit.gpgsign", "false"], in: repo)
         for index in 0..<5 {
             try "x\n".write(
                 to: repo.appendingPathComponent("file-\(index).txt"),
@@ -1343,7 +872,7 @@ final class RepoVocabularyIndexerEndToEndTests: XCTestCase {
             )
         }
         XCTAssertEqual(runGit(["add", "-A"], in: repo), 0)
-        XCTAssertEqual(runGit(["commit", "-m", "init"], in: repo), 0)
+        XCTAssertEqual(commitAll(in: repo), 0)
 
         let rawOutput = await RepoGitRunner.lsFiles(
             root: repo.path, timeoutSeconds: 2.0, maxBytes: 4

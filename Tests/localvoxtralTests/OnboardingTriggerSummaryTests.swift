@@ -24,7 +24,7 @@ final class OnboardingTriggerSummaryTests: XCTestCase {
     }
 
     private func makeStore() -> SettingsStore {
-        SettingsStore(defaults: defaults, environment: [:])
+        SettingsStore(defaults: defaults, environment: [:], secretStore: InMemorySecretStore())
     }
 
     /// A store in keyboard-shortcut mode. A fresh install now seeds the
@@ -54,6 +54,19 @@ final class OnboardingTriggerSummaryTests: XCTestCase {
         let shortcut = DictationShortcut(
             keyCode: UInt32(kVK_ANSI_A), carbonModifierFlags: UInt32(controlKey | optionKey))
         XCTAssertEqual(DictationShortcutFormatter.string(for: shortcut), "⌃⌥A")
+    }
+
+    func testFormatter_bareFunctionKeys_labelledF1ThroughF20() {
+        let expected: [(UInt32, String)] = [
+            (UInt32(kVK_F1), "F1"), (UInt32(kVK_F12), "F12"),
+            (UInt32(kVK_F13), "F13"), (UInt32(kVK_F17), "F17"),
+            (UInt32(kVK_F20), "F20"),
+        ]
+
+        for (keyCode, label) in expected {
+            let shortcut = DictationShortcut(keyCode: keyCode, carbonModifierFlags: 0)
+            XCTAssertEqual(DictationShortcutFormatter.string(for: shortcut), label)
+        }
     }
 
     func testFormatter_unknownKeyCode_fallsBack() {

@@ -1,0 +1,1449 @@
+import ClaudeContextWire
+import Foundation
+import Synchronization
+
+#if canImport(Darwin)
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+#elseif canImport(Glibc)
+import Glibc
+#endif
+
+public struct ClaudeRemoteListenerLimits: Sendable, Equatable {
+    /// Dedicated port. The managed backends own 8471 (voxmlx) and 8472
+    /// (polishd); this is a third, and it is the only one that is ever reachable
+    /// from a forwarded connection.
+    public var port: UInt16
+    public var maxConcurrentConnections: Int
+    /// Remote mod channel polls held at once (#1412). Each holds a thread for
+    /// up to its hold, outside `maxConcurrentConnections`, so hooks never
+    /// wait behind them.
+    public var maxHeldPolls: Int
+    public var backlog: Int32
+    /// Whole-connection deadline: head, auth, body, response. A tunnelled peer
+    /// on a bad link is still not allowed to hold a slot indefinitely.
+    public var connectionTimeout: TimeInterval
+    public var http: ClaudeRemoteHTTPLimits
+    public var wire: ClaudeHookLimits
+    public var snippets: ClaudeSnippetLimits
+    /// Caps on the allowlisted env headers the shim adds. Re-applied here on
+    /// arrival: the shim validating first is a courtesy, not a guarantee.
+    public var environment: ClaudeRemoteEnvironmentLimits
+
+    public init(
+        port: UInt16 = 8473,
+        maxConcurrentConnections: Int = 8,
+        maxHeldPolls: Int = 16,
+        backlog: Int32 = 16,
+        connectionTimeout: TimeInterval = 3.0,
+        http: ClaudeRemoteHTTPLimits = .default,
+        wire: ClaudeHookLimits = .default,
+        snippets: ClaudeSnippetLimits = .default,
+        environment: ClaudeRemoteEnvironmentLimits = .default
+    ) {
+        self.port = port
+        self.maxConcurrentConnections = maxConcurrentConnections
+        self.maxHeldPolls = maxHeldPolls
+        self.backlog = backlog
+        self.connectionTimeout = connectionTimeout
+        self.http = http
+        self.wire = wire
+        self.snippets = snippets
+        self.environment = environment
+    }
+
+    public static let `default` = ClaudeRemoteListenerLimits()
+}
+
+#if canImport(Darwin) || canImport(Glibc)
+
+/// Loopback HTTP ingest for REMOTE Claude Code sessions.
+///
+/// The topology: an OpenSSH `RemoteForward 8473 127.0.0.1:8473` makes the remote
+/// host's `127.0.0.1:8473` come out of the local ssh client and connect here.
+/// Claude Code on the remote host runs the plugin's command-hook curl shim
+/// against that address — no publisher binary and no `jq`/Node on the remote
+/// side, just POSIX `sh` and `curl`.
+///
+/// Everything below is the consequence of one fact: *we cannot see who is on the
+/// other end.* The local broker asks the kernel for a peer UID and gets an
+/// unforgeable answer. Here the peer is always our own ssh client, so the
+/// transport tells us nothing about the origin. That inverts the design:
+///
+/// * **The token is the identity**, and it is checked against the enrolled-host
+///   registry BEFORE a byte of body is read.
+/// * **Every accepted session is `.remote`**, unconditionally. There is no
+///   payload field, no header, and no address that can make this listener mint a
+///   `.localAuthenticated` origin — so a local process that connects here can
+///   only ever downgrade itself to remote capabilities. Remote capabilities mean
+///   opaque context: `ClaudeWorkspaceReference.make` will not build a
+///   `LocalWorkspacePath` for them, which makes "remote cwd reaches the
+///   filesystem" a compile error rather than a review item.
+/// * **Sessions are namespaced by host id** (`ClaudeRemoteSessionScope`), so two
+///   hosts cannot collide, and neither can name a local session.
+///
+/// Why not `Network.framework`: NWListener would not let us bind loopback-only,
+/// inspect the peer address, and read the `Authorization` header before framing
+/// a body — and its HTTP handling would frame that body for us, which is exactly
+/// the decision we need to make ourselves. Raw POSIX, one accept thread and one
+/// short-lived thread per connection, mirroring `ClaudeContextBroker`.
+///
+/// `FileHandle.availableData`/`readDataToEndOfFile` are banned repo-wide (field
+/// crash, PR #60) and appear nowhere here.
+public final class ClaudeRemoteContextListener: Sendable {
+    private struct State {
+        var isRunning = false
+        var admission = ConnectionAdmission()
+        /// Mod channel polls holding a thread; see `maxHeldPolls`.
+        var heldPolls = 0
+        var wakeWriteFD: Int32 = -1
+        /// Signalled by the accept loop's `defer` on every exit. `stop()` waits
+        /// on it, so a rebind after a revoke/enroll cannot race the outgoing
+        /// loop for the port.
+        var loopExit: DispatchSemaphore?
+    }
+
+    private let state = Mutex(State())
+    private let registry: ClaudeSessionRegistry
+    private let hosts: ClaudeRemoteHostRegistry
+    private let limits: ClaudeRemoteListenerLimits
+    private let now: @Sendable () -> Date
+    private let uptimeNanos: @Sendable () -> UInt64
+    /// Rejections since launch, for the Settings hint. Injected (rather than
+    /// owned) so it OUTLIVES this listener: the coordinator builds a fresh
+    /// listener on every rebind, and evidence the user has not read yet must not
+    /// be erased by enrolling a second host.
+    private let rejections: ClaudeRemoteRejectionTally
+    /// Nonces the forward supervisor minted for an in-flight ownership probe.
+    /// Injected for the same reason the tally is: the coordinator rebuilds the
+    /// listener on every rebind, and a probe in flight across one must not be
+    /// lost. See `ClaudeRemoteForwardProbeWitness` for why this exists at all.
+    private let forwardProbes: ClaudeRemoteForwardProbeWitness
+    /// Authenticated host activity can pre-start a slow herdr `-L` away from
+    /// dictation latency. The path remains an opaque remote label.
+    private let onRemoteHerdrActivity: @Sendable (String, String) -> Void
+    /// A host's shim listed its agents' skill names (#1024): host id, names.
+    private let onRemoteSkills: @Sendable (String, [String]) -> Void
+    /// The Mac's asks for a remote project's terms (#641): which sessions'
+    /// next reply carries `X-Lvx-Terms`, and which may answer on
+    /// `/v1/terms`. Nil without a learned-term store; the route then 404s.
+    private let projectTerms: RemoteProjectTermRequests?
+    /// Quick capture's asks for a remote project's README and drafts (#745),
+    /// and their three routes. Nil without an Inbox; the routes then 404.
+    private let quickCapture: RemoteQuickCaptureRequests?
+    /// The Mac's half of a host's `localvoxtral doctor` (#910). Nil without
+    /// the app's checks; the route then 404s.
+    private let doctor: RemoteDoctorRoute?
+    /// The remote sessions' mod channels (#1412). Nil without a hub; the
+    /// routes then 404, which the mod reads as an app without them.
+    private let modChannels: ClaudeRemoteModChannels?
+    /// A remote session's `/inbox` (#1412), behind the mod channel's proofs.
+    /// Nil without an Inbox; the routes then 404.
+    private let inbox: RemoteInboxRoute?
+
+    #if DEBUG
+    private let debugPostAuthenticationHook = Mutex<(@Sendable () -> Void)?>(nil)
+
+    public func debugConfigurePostAuthenticationHook(_ hook: (@Sendable () -> Void)?) {
+        debugPostAuthenticationHook.withLock { $0 = hook }
+    }
+
+    /// Fires on a connection's thread before anything is done with it, so a
+    /// test can let the peer leave first.
+    private let debugServeHook = Mutex<(@Sendable () -> Void)?>(nil)
+
+    public func debugConfigureServeHook(_ hook: (@Sendable () -> Void)?) {
+        debugServeHook.withLock { $0 = hook }
+    }
+    #endif
+
+    public enum StartFailure: Error, Equatable {
+        case alreadyRunning
+        case socketCreationFailed(errno: Int32)
+        case bindFailed(errno: Int32)
+        case listenFailed(errno: Int32)
+        /// Nothing is enrolled, so there is nothing to listen for. Not an error
+        /// the user should see — just a reason not to open a port.
+        case noEnrolledHosts
+    }
+
+    /// - Parameters:
+    ///   - now: injected wall clock, for the TIMESTAMP stamped on a record —
+    ///     which must be a real date, because it is compared against the
+    ///     registry's other records.
+    ///   - uptimeNanos: injected monotonic source, for the connection DEADLINE.
+    ///     Deliberately a second, separate seam. These are two different
+    ///     questions and one clock cannot answer both: `now` is settable (NTP,
+    ///     a DST change, the user fixing their clock), and a deadline built on a
+    ///     settable clock either fires instantly or never when it steps. It is
+    ///     also frozen in tests — a test that pins `now` to inspect a record's
+    ///     timestamp would otherwise pin every connection's deadline to "never
+    ///     expires", quietly disabling the slowloris bound in exactly the suite
+    ///     meant to prove it.
+    public init(
+        registry: ClaudeSessionRegistry,
+        hosts: ClaudeRemoteHostRegistry,
+        limits: ClaudeRemoteListenerLimits = .default,
+        rejections: ClaudeRemoteRejectionTally = ClaudeRemoteRejectionTally(),
+        forwardProbes: ClaudeRemoteForwardProbeWitness = ClaudeRemoteForwardProbeWitness(),
+        now: @escaping @Sendable () -> Date = { Date() },
+        uptimeNanos: @escaping @Sendable () -> UInt64 = { DispatchTime.now().uptimeNanoseconds },
+        onRemoteHerdrActivity: @escaping @Sendable (String, String) -> Void = { _, _ in },
+        onRemoteSkills: @escaping @Sendable (String, [String]) -> Void = { _, _ in },
+        projectTerms: RemoteProjectTermRequests? = nil,
+        quickCapture: RemoteQuickCaptureRequests? = nil,
+        doctor: RemoteDoctorRoute? = nil,
+        modChannels: ClaudeRemoteModChannels? = nil,
+        inbox: RemoteInboxRoute? = nil
+    ) {
+        self.doctor = doctor
+        self.modChannels = modChannels
+        self.inbox = inbox
+        self.projectTerms = projectTerms
+        self.quickCapture = quickCapture
+        self.registry = registry
+        self.hosts = hosts
+        self.limits = limits
+        self.rejections = rejections
+        self.forwardProbes = forwardProbes
+        self.now = now
+        self.uptimeNanos = uptimeNanos
+        self.onRemoteHerdrActivity = onRemoteHerdrActivity
+        self.onRemoteSkills = onRemoteSkills
+    }
+
+    public var isRunning: Bool { state.withLock { $0.isRunning } }
+    public var port: UInt16 { limits.port }
+    /// Rejections since the tally was created, by category.
+    public var rejectionSnapshot: ClaudeRemoteRejectionTally.Snapshot { rejections.snapshot() }
+
+    /// Bind loopback and start accepting.
+    ///
+    /// Every failure is thrown, never swallowed (AGENTS: a silent failure path is
+    /// how the ensureReady bug cost an hour of remote probing).
+    public func start() throws {
+        guard hosts.hasActiveHosts else { throw StartFailure.noEnrolledHosts }
+
+        let (listenerFD, wakeReadFD, exitSignal): (Int32, Int32, DispatchSemaphore) =
+            try state.withLock { state in
+                guard !state.isRunning else { throw StartFailure.alreadyRunning }
+
+            let fd = socket(AF_INET, POSIXSocket.stream, 0)
+            guard fd >= 0 else { throw StartFailure.socketCreationFailed(errno: errno) }
+
+            // SO_REUSEADDR only, never SO_REUSEPORT: REUSEADDR lets us rebind a
+            // port still in TIME_WAIT from our own previous run, while REUSEPORT
+            // would let ANOTHER process on this machine bind the same port
+            // alongside us and race us for connections — i.e. steal tokens.
+            var reuse: Int32 = 1
+            setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
+
+            var address = sockaddr_in()
+            POSIXSocket.setLength(of: &address)
+            address.sin_family = sa_family_t(AF_INET)
+            address.sin_port = limits.port.bigEndian
+            // INADDR_LOOPBACK, explicitly — never INADDR_ANY. The tunnel's local
+            // end arrives on 127.0.0.1, and binding anything wider would put a
+            // token-authenticated ingest on the user's LAN.
+            address.sin_addr = in_addr(s_addr: INADDR_LOOPBACK.bigEndian)
+
+            let bound = withUnsafePointer(to: &address) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+                    bind(fd, sockaddrPointer, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+            guard bound == 0 else {
+                let code = errno
+                close(fd)
+                throw StartFailure.bindFailed(errno: code)
+            }
+            guard listen(fd, limits.backlog) == 0 else {
+                let code = errno
+                close(fd)
+                throw StartFailure.listenFailed(errno: code)
+            }
+
+            // Self-pipe, for the same reason the local broker has one: closing a
+            // listener fd underneath a blocked accept() is a use-after-close
+            // race against fd recycling.
+            var wakePipe: [Int32] = [-1, -1]
+            guard pipe(&wakePipe) == 0 else {
+                let code = errno
+                close(fd)
+                throw StartFailure.socketCreationFailed(errno: code)
+            }
+            POSIXSocket.suppressSIGPIPE(onPipe: wakePipe[1])
+            state.wakeWriteFD = wakePipe[1]
+            let exitSignal = DispatchSemaphore(value: 0)
+            state.loopExit = exitSignal
+            state.isRunning = true
+                return (fd, wakePipe[0], exitSignal)
+            }
+
+        // Outside the lock: the accept loop's first act is to read `isRunning`,
+        // and this mutex is not reentrant.
+        let thread = Thread { [weak self] in
+            self?.acceptLoop(listenerFD: listenerFD, wakeReadFD: wakeReadFD, exitSignal: exitSignal)
+        }
+        thread.name = "com.localvoxtral.claude-remote"
+        thread.stackSize = 512 * 1024
+        thread.start()
+
+        Log.claudeContext.info(
+            "Claude remote context listener on 127.0.0.1:\(Int(self.limits.port), privacy: .public)"
+        )
+    }
+
+    /// Stop accepting, and do not return until the accept loop is gone.
+    ///
+    /// Waiting is what makes the enroll/revoke rebind deterministic: a caller
+    /// that revokes the last host and immediately re-enrolls one calls
+    /// `stop(); start()` back to back, and without the wait `start()` can reach
+    /// `bind` while the outgoing loop still holds the port — an intermittent
+    /// EADDRINUSE that looks exactly like a real port conflict.
+    public func stop() {
+        let (wakeFD, exitSignal): (Int32, DispatchSemaphore?) = state.withLock { state in
+            guard state.isRunning else { return (-1, nil) }
+            state.isRunning = false
+            let wakeFD = state.wakeWriteFD
+            // Taken under the lock, so the loop's defer sees -1 and cannot close
+            // it a second time.
+            state.wakeWriteFD = -1
+            let exitSignal = state.loopExit
+            state.loopExit = nil
+            return (wakeFD, exitSignal)
+        }
+        guard wakeFD >= 0 else { return }
+        var byte: UInt8 = 1
+        _ = retryingOnEINTRInt { write(wakeFD, &byte, 1) }
+        close(wakeFD)
+        exitSignal?.wait()
+        Log.claudeContext.info("Claude remote context listener stopped")
+    }
+
+    // MARK: - Accept
+
+    private func acceptLoop(listenerFD: Int32, wakeReadFD: Int32, exitSignal: DispatchSemaphore?) {
+        defer {
+            // Release everything start() handed us, on EVERY exit — including a
+            // spontaneous one (failed poll, dead listener, repeated accept
+            // errors). That path used to clear `isRunning` and leave the wake
+            // pipe's write end open for the life of the process.
+            let wakeWriteFD: Int32 = state.withLock { state in
+                state.isRunning = false
+                let fd = state.wakeWriteFD
+                state.wakeWriteFD = -1
+                state.loopExit = nil
+                return fd
+            }
+            // Non-negative only on a spontaneous exit; stop() takes it under the
+            // same lock. Exactly one of us closes it.
+            if wakeWriteFD >= 0 { close(wakeWriteFD) }
+            close(listenerFD)
+            close(wakeReadFD)
+            exitSignal?.signal()
+        }
+        var stickyErrors = 0
+
+        while state.withLock({ $0.isRunning }) {
+            var fds = [
+                pollfd(fd: listenerFD, events: Int16(POLLIN), revents: 0),
+                pollfd(fd: wakeReadFD, events: Int16(POLLIN), revents: 0),
+            ]
+            let ready = retryingOnEINTRInt32 { poll(&fds, 2, -1) }
+            if ready < 0 {
+                Log.claudeContext.error("Remote listener poll failed (\(errno, privacy: .public)); stopping")
+                return
+            }
+            if fds[1].revents != 0 { return }
+            guard fds[0].revents & Int16(POLLIN) != 0 else {
+                if fds[0].revents & Int16(POLLERR | POLLHUP | POLLNVAL) != 0 {
+                    Log.claudeContext.error("Remote listener socket failed; stopping accept loop")
+                    return
+                }
+                continue
+            }
+
+            var peer = sockaddr_in()
+            var peerLength = socklen_t(MemoryLayout<sockaddr_in>.size)
+            let fd = retryingOnEINTRInt32 {
+                withUnsafeMutablePointer(to: &peer) { pointer in
+                    pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { sockaddrPointer in
+                        accept(listenerFD, sockaddrPointer, &peerLength)
+                    }
+                }
+            }
+            guard fd >= 0 else {
+                let code = errno
+                switch code {
+                case EAGAIN, EWOULDBLOCK, ECONNABORTED:
+                    continue
+                case EMFILE, ENFILE:
+                    Log.claudeContext.error("Remote listener hit the descriptor limit; backing off")
+                    usleep(100_000)
+                    continue
+                default:
+                    stickyErrors += 1
+                    Log.claudeContext.error(
+                        "Remote accept failed (\(code, privacy: .public)); sticky=\(stickyErrors, privacy: .public)"
+                    )
+                    if stickyErrors >= 2 { return }
+                    continue
+                }
+            }
+            stickyErrors = 0
+
+            // The socket is loopback-bound, so this can only fail if that bind
+            // regressed — which is exactly why it is checked rather than assumed.
+            guard peer.sin_family == sa_family_t(AF_INET),
+                  ClaudeRemotePeerPolicy.isLoopbackIPv4(hostOrderAddress: UInt32(bigEndian: peer.sin_addr.s_addr))
+            else {
+                Log.claudeContext.error("Rejected non-loopback connection to the remote listener")
+                close(fd)
+                continue
+            }
+
+            let decision = state.withLock { state -> ConnectionAdmission.Decision? in
+                guard state.isRunning else { return nil }
+                return state.admission.admit(limit: limits.maxConcurrentConnections)
+            }
+            switch decision {
+            case .refused(first: true):
+                Log.claudeContext.error(
+                    "Claude remote context listener at its cap of \(self.limits.maxConcurrentConnections, privacy: .public) connections: refusing new ones until one ends"
+                )
+            case .admitted(let refused) where refused > 0:
+                Log.claudeContext.error(
+                    "Claude remote context listener refused \(refused, privacy: .public) connections while at its cap; each lost a context update"
+                )
+            default:
+                break
+            }
+            guard case .admitted = decision else {
+                // Over the cap: drop. The hook fails open and the user loses one
+                // context update — the right trade against unbounded threads.
+                close(fd)
+                continue
+            }
+            let thread = Thread { [weak self] in
+                guard let self else {
+                    close(fd)
+                    return
+                }
+                // A held mod poll gives its slot back once it holds.
+                if !self.serve(connectionFD: fd) {
+                    self.state.withLock { $0.admission.release() }
+                }
+            }
+            thread.name = "com.localvoxtral.claude-remote.conn"
+            thread.stackSize = 512 * 1024
+            thread.start()
+        }
+    }
+
+    // MARK: - Serve
+
+    /// One request per connection, then close. There is no keep-alive to reason
+    /// about and no second request to re-authenticate.
+    ///
+    /// - Returns: whether the connection already gave its slot back, which a
+    ///   held mod poll does.
+    @discardableResult
+    private func serve(connectionFD fd: Int32) -> Bool {
+        defer { close(fd) }
+        #if DEBUG
+        debugServeHook.withLock { $0 }?()
+        #endif
+
+        // A response to a peer that already left raises SIGPIPE, which kills
+        // the app, unless the socket has SO_NOSIGPIPE; Darwin refuses that
+        // option once the peer has reset the connection (#791). Nobody is left
+        // to answer then.
+        guard POSIXSocket.suppressSIGPIPE(onSocket: fd) else {
+            Log.claudeContext.error("Dropping Claude remote connection: the peer left before it was served")
+            return false
+        }
+        // Monotonic, not wall clock. See `init(uptimeNanos:)`.
+        let deadline = uptimeNanos() &+ UInt64(limits.connectionTimeout * 1_000_000_000)
+
+        var buffer = Data()
+        var request: ClaudeRemoteHTTPRequest?
+        var bodyOffset = 0
+
+        // Phase 1: the head, and nothing else.
+        while request == nil {
+            do {
+                let parsed = try ClaudeRemoteHTTPCodec.parseRequestHead(buffer, limits: limits.http)
+                request = parsed.request
+                bodyOffset = parsed.bodyOffset
+            } catch ClaudeRemoteHTTPError.incompleteHead {
+                guard readMore(fd: fd, into: &buffer, deadline: deadline) else { return false }
+                continue
+            } catch {
+                respond(fd: fd, status: status(for: error))
+                return false
+            }
+        }
+        guard let request else { return false }
+
+        // Phase 2: authenticate on the HEAD ALONE, before ANY other judgement
+        // about the request.
+        //
+        // This is the ordering that matters most in the file. An unauthenticated
+        // peer never gets to hand us a body — not to parse, not to buffer, not
+        // to log. `Content-Length` was already bounded by the head parser, so
+        // even a rejected request never sized an allocation.
+        //
+        // The path check used to run FIRST, which made this endpoint an oracle:
+        // 404 versus 401 told an unauthenticated caller exactly which event
+        // paths exist, enumerable without a credential. It says nothing an
+        // attacker could not guess from the public plugin manifest — but "the
+        // answer is currently harmless" is not a reason to answer. Nothing is
+        // discriminated on until the token is known good.
+        //
+        // The rejection is CLASSIFIED on the way out. One undifferentiated line
+        // is what made a night of "Rejected unauthenticated connection" say
+        // nothing about whether the remedy was updating a host's plugin or
+        // re-running its enrollment (field report, 2026-07-26). The category is
+        // derived from the header's shape and the authentication result only —
+        // no token material reaches the log, the tally, or the UI.
+
+        // The ONE thing looked at before the token, and the exception proves
+        // the rule above rather than weakening it: the value compared is a
+        // random nonce THIS process minted moments ago and is still waiting
+        // for, so a peer that did not receive it cannot produce a match, and a
+        // peer that did learns nothing from having produced one. The response
+        // is byte-for-byte the same 401 either way — this branch exists to keep
+        // our own probe out of the rejection tally, whose whole job is telling
+        // the user which of three real fixes to apply. Nothing is ingested,
+        // nothing is authorized: the arrival itself is the entire signal.
+        if forwardProbes.note(
+            headerValue: request.headers[ClaudeRemoteForwardProbeWitness.headerName]
+        ) {
+            Log.claudeContext.info(
+                "Claude remote forward ownership probe arrived on this listener"
+            )
+            respond(fd: fd, status: 401)
+            return false
+        }
+
+        let shape = ClaudeRemoteHTTPCodec.authorizationShape(
+            in: request.headers["authorization"], limits: limits.http
+        )
+        let candidate = request.bearerToken
+        let authenticatedHost = candidate.flatMap { hosts.authenticate(token: $0) }
+        guard let token = candidate, let host = authenticatedHost else {
+            // The REAL authentication result, not a constant `false`: the
+            // mapping's contract includes "an accepted credential is not a
+            // rejection", and its only production caller should exercise that
+            // rather than assert it. Reaching the fallback would mean
+            // `bearerToken` and `authorizationShape` disagreed about one header
+            // — impossible while the former is implemented on the latter, and
+            // `unknownToken` is the conservative reading if it ever were not.
+            let category = ClaudeRemoteRejectionCategory.category(
+                for: shape, authenticated: authenticatedHost != nil
+            ) ?? .unknownToken
+            rejections.record(category)
+            // Same line either way, and always logged — but a connection that
+            // never offered a credential is not an error. The verify probe posts
+            // here without one on purpose and reads the 401 as success, so
+            // logging that at `.error` trains the reader to scroll past the
+            // category that means a host really is broken. `.notice` still
+            // persists to disk in the unified log, so nothing stops being
+            // findable later.
+            if category.isFault {
+                Log.claudeContext.error("\(category.logLine, privacy: .public)")
+            } else {
+                Log.claudeContext.notice("\(category.logLine, privacy: .public)")
+            }
+            respond(fd: fd, status: 401)
+            return false
+        }
+        #if DEBUG
+        debugPostAuthenticationHook.withLock { $0 }?()
+        #endif
+
+        // The hook's own plugin version: parsed here, but RECORDED only where
+        // the request is finally accepted — the same two points
+        // `noteActivity` is called below. First-auth alone is not acceptance:
+        // the revocation-safe re-authentication happens later, and a request
+        // whose host was revoked (or whose token rotated) in between must not
+        // mutate that host's report — rotation would carry the field into the
+        // reinstated host. The codec validates a strict numeric shape and
+        // collapses everything else onto `.headerAbsent`, the pre-1.10.0
+        // plugin generation that sends no header at all; the registry keeps
+        // the highest report this app session, so header-less hooks from
+        // sessions still running a pre-update shim cannot un-do a verified
+        // update. Never logged, never in a response body; it only selects a
+        // fixed UI string.
+        let pluginVersionReport = ClaudeRemotePluginVersionCodec.report(in: request.headers)
+        // The Vibe shim's own version, under the same recording rule. A Vibe
+        // request carries no Claude plugin version, and its absence says
+        // nothing about that plugin, so the two reports never mix.
+        let requestAgent = ClaudeRemoteAgentCodec.agent(in: request.headers)
+        let vibeHooksVersion = VibeRemoteHooksVersionCodec.version(in: request.headers)
+
+        if request.path == RemoteProjectTermRequests.answerPath {
+            serveTermsAnswer(
+                fd: fd, request: request, buffer: &buffer, bodyOffset: bodyOffset,
+                deadline: deadline, token: token, host: host
+            )
+            return false
+        }
+
+        if [
+            RemoteQuickCaptureRequests.readmePath,
+            RemoteQuickCaptureRequests.draftPromptPath,
+            RemoteQuickCaptureRequests.draftAnswerPath,
+            RemoteQuickCaptureRequests.draftWordsPath,
+            RemoteQuickCaptureRequests.draftContextPath,
+            RemoteQuickCaptureRequests.draftCheckPath,
+        ].contains(request.path) {
+            serveQuickCaptureAnswer(
+                fd: fd, request: request, buffer: &buffer, bodyOffset: bodyOffset,
+                deadline: deadline, token: token, host: host
+            )
+            return false
+        }
+
+        if request.path == RemoteDoctorRoute.path {
+            serveDoctor(fd: fd, request: request, token: token, host: host)
+            return false
+        }
+
+        if request.path == RemoteInboxRoute.listPath || request.path == RemoteInboxRoute.openPath {
+            serveInbox(
+                fd: fd, request: request, buffer: &buffer, bodyOffset: bodyOffset,
+                deadline: deadline, token: token, host: host
+            )
+            return false
+        }
+
+        if request.path == ClaudeRemoteModWire.pollPath || request.path == ClaudeRemoteModWire.replyPath {
+            return serveModChannel(
+                fd: fd, request: request, buffer: &buffer, bodyOffset: bodyOffset,
+                deadline: deadline, token: token, host: host
+            )
+        }
+
+        guard ClaudeRemoteHTTPCodec.eventName(inPath: request.path) != nil else {
+            respond(fd: fd, status: 404)
+            return false
+        }
+
+        // Phase 3: the body, now that we know who is speaking.
+        while buffer.count - bodyOffset < request.contentLength {
+            guard readMore(fd: fd, into: &buffer, deadline: deadline) else {
+                respond(fd: fd, status: 400)
+                return false
+            }
+        }
+        let bodyStart = buffer.index(buffer.startIndex, offsetBy: bodyOffset)
+        let bodyEnd = buffer.index(bodyStart, offsetBy: request.contentLength)
+        let body = Data(buffer[bodyStart..<bodyEnd])
+
+        // Parse and scope OUTSIDE the host lock: constant-time-hashing every
+        // stored token is already the lock's fixed cost per request, and
+        // serializing body parsing behind it would stall every other host's
+        // auth behind one slow payload. Only the COMMIT — the part the
+        // revocation race is about — re-authenticates under the lock.
+        guard var prepared = prepareIngest(body: body, request: request, host: host) else {
+            // Unparseable payloads never touch the session registry, so
+            // revocation has nothing to protect. The body stays identical to
+            // an ingested record; only this fixed status header differs.
+            // This is an ACCEPTED outcome — the host is noted alive here, and
+            // its plugin report lands with it.
+            hosts.noteActivity(hostID: host.id)
+            noteVersions(hostID: host.id, agent: requestAgent, plugin: pluginVersionReport, vibe: vibeHooksVersion)
+            respond(
+                fd: fd,
+                status: 200,
+                body: ClaudeRemoteHTTPCodec.hookResponseBody,
+                sessionStatus: .unknown
+            )
+            return false
+        }
+        prepared.shimVersion = switch prepared.record.agent {
+        case .claude: pluginVersionReport
+        case .vibe: vibeHooksVersion.map { .version($0) }
+        case .opencode, .codex: nil
+        }
+        guard let commitIngestStatus = hosts.withAuthenticatedHost(
+            token: token,
+            expectedHostID: host.id,
+            { _ in
+                commitIngest(prepared)
+            }
+        ) else {
+            // Rejected as revoked-before-ingest: nothing is recorded — not
+            // activity, and not the plugin report (review finding: the report
+            // used to be written on first auth alone, letting an in-flight
+            // request mutate a host the re-authentication had just refused,
+            // with rotation preserving the field into the reinstated host).
+            Log.claudeContext.error(
+                "Rejected remote connection: host was revoked before ingest"
+            )
+            respond(fd: fd, status: 401)
+            return false
+        }
+        // AFTER the closure has returned and its lock is released: both notes
+        // take persistLock → state, so neither may run inside the
+        // `withAuthenticatedHost` body above.
+        hosts.noteActivity(hostID: host.id)
+        noteVersions(hostID: host.id, agent: requestAgent, plugin: pluginVersionReport, vibe: vibeHooksVersion)
+        if let socketPath = prepared.environment?.herdrSocketPath {
+            onRemoteHerdrActivity(host.id, socketPath)
+        }
+        // Only here, after the re-authentication: a revoked host's list is
+        // never kept.
+        if let skills = AgentSkillNamesCodec.names(in: request.headers) {
+            onRemoteSkills(host.id, skills)
+        }
+        if let agentProjects = AgentProjectsCodec.entries(in: request.headers) {
+            quickCapture?.noteAgentProjects(agentProjects, hostID: host.id)
+        }
+        let scopedSessionID = ClaudeAgentSessionScope.scopedSessionID(
+            agent: prepared.record.agent, sessionID: prepared.record.sessionID
+        )
+        let joinedSnapshot = commitIngestStatus == .joined ? registry.snapshot(sessionID: scopedSessionID) : nil
+        if let joinedSnapshot { quickCapture?.noteReport(for: joinedSnapshot) }
+        let captureAsks = RemoteQuickCaptureRequests.requestReadsTheAsks(
+            agent: prepared.record.agent, plugin: pluginVersionReport, vibe: vibeHooksVersion
+        )
+            ? joinedSnapshot.flatMap { quickCapture?.asks(for: $0) }
+            : nil
+        respond(
+            fd: fd,
+            status: 200,
+            body: ClaudeRemoteHTTPCodec.hookResponseBody,
+            sessionStatus: commitIngestStatus,
+            readmeWanted: captureAsks?.readme ?? false,
+            draftID: captureAsks?.draftID,
+            termsWanted: commitIngestStatus == .joined
+                && shimReadsTermsHeader(agent: prepared.record.agent, plugin: pluginVersionReport, vibe: vibeHooksVersion)
+                && projectTerms?.takeMark(sessionID: scopedSessionID) == true
+        )
+        return false
+    }
+
+    /// Whether THIS request's shim reads `X-Lvx-Terms`. The Mac marks only
+    /// sessions on hosts that reported a new enough shim, but a host's
+    /// record is its highest report, and a session started before an update
+    /// keeps the old shim. The mark then stays for a later hook, or expires.
+    private func shimReadsTermsHeader(
+        agent: ClaudeHookAgent, plugin: ClaudeRemotePluginVersionReport, vibe: String?
+    ) -> Bool {
+        switch agent {
+        case .claude:
+            return plugin >= .version(RemoteProjectTermRequests.minimumPluginVersion)
+        case .vibe:
+            guard let vibe else { return false }
+            return !ClaudeRemotePluginVersionCodec.isVersion(
+                vibe, olderThan: RemoteProjectTermRequests.minimumVibeHooksVersion
+            )
+        case .opencode, .codex:
+            return false
+        }
+    }
+
+    /// `POST /v1/terms`: a host's runner answering the Mac's ask for its
+    /// project's terms (#641). Authenticated like a hook, before this is
+    /// reached. The answer is accepted only for a live session of this host
+    /// that the Mac asked, from the agent it asked, and is stored under the
+    /// project the Mac recorded when it asked: the body names nothing but
+    /// terms. Refusals log a category, never a byte of the body.
+    private func serveTermsAnswer(
+        fd: Int32,
+        request: ClaudeRemoteHTTPRequest,
+        buffer: inout Data,
+        bodyOffset: Int,
+        deadline: UInt64,
+        token: String,
+        host: ClaudeRemoteHost
+    ) {
+        guard let projectTerms else {
+            respond(fd: fd, status: 404)
+            return
+        }
+        guard request.contentLength <= RemoteProjectTermRequests.maxAnswerBytes else {
+            Log.backends.error("Project terms: refused a remote answer: body over the cap")
+            respond(fd: fd, status: 413)
+            return
+        }
+        guard let hookAgent = ClaudeRemoteAgentCodec.agent(in: request.headers),
+              let agent = ProjectTermProposal.Agent(hookAgent),
+              let rawSessionID = RemoteProjectTermRequests.answerSessionID(in: request.headers)
+        else {
+            Log.backends.error("Project terms: refused a remote answer: no valid agent or session")
+            respond(fd: fd, status: 400)
+            return
+        }
+        while buffer.count - bodyOffset < request.contentLength {
+            guard readMore(fd: fd, into: &buffer, deadline: deadline) else {
+                respond(fd: fd, status: 400)
+                return
+            }
+        }
+        let bodyStart = buffer.index(buffer.startIndex, offsetBy: bodyOffset)
+        let body = Data(buffer[bodyStart..<buffer.index(bodyStart, offsetBy: request.contentLength)])
+
+        // The same key the hook's record got: scoped under the host whose
+        // token authenticated THIS request, then under the agent.
+        let sessionID = ClaudeAgentSessionScope.scopedSessionID(
+            agent: hookAgent,
+            sessionID: ClaudeRemoteSessionScope.scopedSessionID(hostID: host.id, sessionID: rawSessionID)
+        )
+        // Under the host lock, check to store: a revocation or rotation cannot
+        // land between the check and the answer entering the store.
+        enum Verdict { case notAsked, notTerms, accepted(Int) }
+        guard let verdict = hosts.withAuthenticatedHost(token: token, expectedHostID: host.id, { _ -> Verdict in
+            guard let session = registry.snapshot(sessionID: sessionID), session.agent == hookAgent,
+                  let slot = projectTerms.takeAnswerSlot(sessionID: sessionID, agent: agent)
+            else { return .notAsked }
+            let usage = agent == .vibe ? RemoteProjectTermRequests.reportedUsage(in: request.headers) : nil
+            return projectTerms.accept(answer: body, slot: slot, reportedUsage: usage).map(Verdict.accepted)
+                ?? .notTerms
+        }) else {
+            Log.claudeContext.error("Rejected remote connection: host was revoked before ingest")
+            respond(fd: fd, status: 401)
+            return
+        }
+        hosts.noteActivity(hostID: host.id)
+        let count: Int
+        switch verdict {
+        case .notAsked:
+            Log.backends.error(
+                "Project terms: refused a remote \(agent.rawValue, privacy: .public) answer: no live session was asked"
+            )
+            respond(fd: fd, status: 409)
+            return
+        case .notTerms:
+            Log.backends.error(
+                "Project terms: refused a remote \(agent.rawValue, privacy: .public) answer: not a terms object"
+            )
+            respond(fd: fd, status: 400)
+            return
+        case .accepted(let accepted):
+            count = accepted
+        }
+        Log.backends.info(
+            "Project terms: remote \(agent.rawValue, privacy: .public) answered \(body.count, privacy: .public) bytes, \(count, privacy: .public) term-shaped"
+        )
+        respond(fd: fd, status: 200)
+    }
+
+    /// `POST /v1/readme`, `/v1/draft/prompt`, `/v1/draft/words`,
+    /// `/v1/draft/context`, `/v1/draft/check` and `/v1/draft`: a host
+    /// answering one of quick capture's asks (#745, #918). Authenticated like a
+    /// hook before this is reached, and scoped like `/v1/terms`: the session
+    /// id is scoped under the host whose token authenticated THIS request,
+    /// then under the agent the request names, and `RemoteQuickCaptureRequests`
+    /// takes an answer only from the session and agent it asked. The bodies are untrusted: README bytes the Mac only
+    /// summarizes, an issue list it only quotes into a prompt, and the
+    /// agent's output, read as #731 reads a local run's; a context bundle
+    /// only quoted into the first draft's prompt. Refusals log a category,
+    /// never a byte of a body.
+    private func serveQuickCaptureAnswer(
+        fd: Int32,
+        request: ClaudeRemoteHTTPRequest,
+        buffer: inout Data,
+        bodyOffset: Int,
+        deadline: UInt64,
+        token: String,
+        host: ClaudeRemoteHost
+    ) {
+        guard let quickCapture else {
+            respond(fd: fd, status: 404)
+            return
+        }
+        enum Route { case readme, prompt(String), answer(String), words(String), context(String), check(String) }
+        let route: Route
+        let cap: Int
+        let draftID = request.headers[RemoteQuickCaptureRequests.draftIDHeaderName.lowercased()]
+            .flatMap { ClaudeRemoteHTTPCodec.isDraftID($0) ? $0 : nil }
+        switch request.path {
+        case RemoteQuickCaptureRequests.readmePath:
+            route = .readme
+            cap = RemoteQuickCaptureRequests.maxReadmeBytes
+        case RemoteQuickCaptureRequests.draftPromptPath:
+            guard let draftID else { return refuseQuickCapture(fd: fd, status: 400, "no valid draft id") }
+            route = .prompt(draftID)
+            cap = RemoteQuickCaptureRequests.maxIssueListBytes
+        case RemoteQuickCaptureRequests.draftWordsPath:
+            guard let draftID else { return refuseQuickCapture(fd: fd, status: 400, "no valid draft id") }
+            route = .words(draftID)
+            cap = 0
+        case RemoteQuickCaptureRequests.draftContextPath:
+            guard let draftID else { return refuseQuickCapture(fd: fd, status: 400, "no valid draft id") }
+            route = .context(draftID)
+            cap = QuickCaptureContext.maxBundleBytes
+        case RemoteQuickCaptureRequests.draftCheckPath:
+            guard let draftID else { return refuseQuickCapture(fd: fd, status: 400, "no valid draft id") }
+            route = .check(draftID)
+            cap = 0
+        default:
+            guard let draftID else { return refuseQuickCapture(fd: fd, status: 400, "no valid draft id") }
+            route = .answer(draftID)
+            cap = RemoteQuickCaptureRequests.maxDraftAnswerBytes
+        }
+        guard request.contentLength <= cap else {
+            return refuseQuickCapture(fd: fd, status: 413, "body over the cap")
+        }
+        guard let hookAgent = ClaudeRemoteAgentCodec.agent(in: request.headers),
+              let agent = ProjectTermProposal.Agent(hookAgent), agent != .opencode,
+              let rawSessionID = RemoteQuickCaptureRequests.sessionID(in: request.headers)
+        else {
+            return refuseQuickCapture(fd: fd, status: 400, "no valid agent or session")
+        }
+        while buffer.count - bodyOffset < request.contentLength {
+            guard readMore(fd: fd, into: &buffer, deadline: deadline) else {
+                respond(fd: fd, status: 400)
+                return
+            }
+        }
+        let bodyStart = buffer.index(buffer.startIndex, offsetBy: bodyOffset)
+        let body = Data(buffer[bodyStart..<buffer.index(bodyStart, offsetBy: request.contentLength)])
+        let sessionID = ClaudeAgentSessionScope.scopedSessionID(
+            agent: hookAgent,
+            sessionID: ClaudeRemoteSessionScope.scopedSessionID(hostID: host.id, sessionID: rawSessionID)
+        )
+        let exit = request.headers[RemoteQuickCaptureRequests.draftExitHeaderName.lowercased()]
+        // Under the host lock, check to store, as for `/v1/terms`. Unlike
+        // there, the session need not be live: the ask recorded its host,
+        // session and agent, and a draft outlives a session the user closed.
+        enum Verdict { case notAsked, accepted(Data?), status(Int) }
+        guard let verdict = hosts.withAuthenticatedHost(token: token, expectedHostID: host.id, { _ -> Verdict in
+            switch route {
+            case .readme:
+                return quickCapture.acceptReadme(sessionID: sessionID, readme: body) ? .accepted(nil) : .notAsked
+            case .prompt(let id):
+                return quickCapture.prompt(
+                    draftID: id, sessionID: sessionID, agent: agent, issueList: body,
+                    listedRepository: RemoteQuickCaptureRequests.issuesRepository(in: request.headers)
+                )
+                    .map { .accepted(Data($0.utf8)) } ?? .notAsked
+            case .answer(let id):
+                return quickCapture.acceptDraft(
+                    draftID: id, sessionID: sessionID, agent: agent, exit: exit, output: body,
+                    reportedUsage: agent == .vibe ? RemoteProjectTermRequests.reportedUsage(in: request.headers) : nil
+                ) ? .accepted(nil) : .notAsked
+            case .words(let id):
+                return quickCapture.words(draftID: id, sessionID: sessionID, agent: agent)
+                    .map { .accepted(Data($0.utf8)) } ?? .notAsked
+            case .context(let id):
+                return quickCapture.acceptContext(
+                    draftID: id, sessionID: sessionID, agent: agent, bundle: body,
+                    listedRepository: RemoteQuickCaptureRequests.issuesRepository(in: request.headers)
+                )
+                    ? .accepted(nil) : .notAsked
+            case .check(let id):
+                switch quickCapture.checkPrompt(draftID: id, sessionID: sessionID, agent: agent) {
+                case .notAsked: return .notAsked
+                case .wait: return .status(202)
+                case .done: return .status(204)
+                case .prompt(let prompt): return .accepted(Data(prompt.utf8))
+                }
+            }
+        }) else {
+            Log.claudeContext.error("Rejected remote connection: host was revoked before ingest")
+            respond(fd: fd, status: 401)
+            return
+        }
+        hosts.noteActivity(hostID: host.id)
+        switch verdict {
+        case .notAsked:
+            refuseQuickCapture(fd: fd, status: 409, "\(request.path) from a session not asked")
+        case .accepted(let reply):
+            Log.backends.notice(
+                "Quick capture: remote \(agent.rawValue, privacy: .public) answered \(request.path, privacy: .public) with \(body.count, privacy: .public) bytes"
+            )
+            respond(fd: fd, status: 200, body: reply)
+        case .status(let status):
+            respond(fd: fd, status: status)
+        }
+    }
+
+    /// `POST /v1/mod/poll` and `/v1/mod/reply`: a remote session's mod
+    /// channel (#1412). Authenticated like a hook before this is reached;
+    /// then the body must carry the host's channel key proof, which a squatter
+    /// on the host's forward port, holding only the token, cannot make. A
+    /// poll's answer carries the same proof over its nonce, so the mod acts
+    /// on nothing a squatter wrote, and the challenge the next poll must
+    /// carry, so a captured poll replays into nothing. Refusals log a
+    /// reason, never a byte of a body.
+    ///
+    /// - Returns: whether the connection gave its slot back (a held poll).
+    private func serveModChannel(
+        fd: Int32,
+        request: ClaudeRemoteHTTPRequest,
+        buffer: inout Data,
+        bodyOffset: Int,
+        deadline: UInt64,
+        token: String,
+        host: ClaudeRemoteHost
+    ) -> Bool {
+        guard let modChannels else {
+            respond(fd: fd, status: 404)
+            return false
+        }
+        let isPoll = request.path == ClaudeRemoteModWire.pollPath
+        guard let (body, key) = readSignedModBody(
+            fd: fd, request: request, buffer: &buffer, bodyOffset: bodyOffset, deadline: deadline,
+            token: token, host: host,
+            cap: isPoll ? ClaudeRemoteModWire.maxPollBytes : ClaudeRemoteModWire.maxReplyBytes
+        ) else { return false }
+
+        guard isPoll else {
+            if ClaudeModChannelWire.isReply(body),
+               let reply = ClaudeModChannelWire.decode(ClaudeModChannelWire.Reply.self, from: body) {
+                modChannels.deliver(hostID: host.id, reply: reply)
+            } else if ClaudeModChannelWire.isBye(body),
+                      let bye = ClaudeModChannelWire.decode(ClaudeModChannelWire.Bye.self, from: body) {
+                modChannels.bye(hostID: host.id, sessionID: bye.sessionID)
+            } else {
+                Log.backends.error("Remote mod channel: dropped an unreadable reply")
+                respond(fd: fd, status: 400)
+                return false
+            }
+            respond(fd: fd, status: 200)
+            return false
+        }
+
+        guard let poll = ClaudeRemoteModWire.decodePoll(body) else {
+            Log.backends.error("Remote mod channel: refused an unreadable poll")
+            respond(fd: fd, status: 400)
+            return false
+        }
+        let held = state.withLock { state -> Bool in
+            guard state.heldPolls < limits.maxHeldPolls else { return false }
+            state.heldPolls += 1
+            // The hold waits on the app, not the peer: the slot goes back so
+            // hooks keep their eight.
+            state.admission.release()
+            return true
+        }
+        guard held else {
+            Log.backends.error(
+                "Remote mod channel: \(self.limits.maxHeldPolls, privacy: .public) polls already held; refusing one"
+            )
+            respond(fd: fd, status: 503)
+            return false
+        }
+        defer { state.withLock { $0.heldPolls -= 1 } }
+
+        // The listener's threads are synchronous; the hold is not.
+        let outcome = Mutex<ClaudeRemoteModChannels.PollOutcome?>(nil)
+        let done = DispatchSemaphore(value: 0)
+        Task {
+            let polled = await modChannels.poll(hostID: host.id, request: poll)
+            outcome.withLock { $0 = polled }
+            done.signal()
+        }
+        done.wait()
+        // Again after the hold: a host revoked or rotated while its poll
+        // held gets nothing under the key it had.
+        guard hosts.modChannelKey(token: token, expectedHostID: host.id) == key else {
+            Log.claudeContext.error("Rejected remote mod channel answer: host was revoked while its poll held")
+            respond(fd: fd, status: 401)
+            return true
+        }
+        let answer: Data
+        switch outcome.withLock({ $0 }) {
+        case .lines(let attach, let first, let lines)?:
+            answer = ClaudeRemoteModWire.answerBody(
+                attach: attach, first: first, lines: lines,
+                next: modChannels.issueChallenge(hostID: host.id, sessionID: poll.sessionID, instance: poll.instance)
+            )
+        case .unchallenged?:
+            // The attach the mod named, so it keeps its count.
+            answer = ClaudeRemoteModWire.answerBody(
+                attach: poll.attach, first: poll.acked + 1, lines: [],
+                next: modChannels.issueChallenge(hostID: host.id, sessionID: poll.sessionID, instance: poll.instance)
+            )
+        case .revoked?:
+            respond(fd: fd, status: 401)
+            return true
+        case .busy?, nil:
+            respond(fd: fd, status: 409)
+            return true
+        }
+        respond(
+            fd: fd, status: 200, body: answer,
+            modProof: ClaudeRemoteModWire.answerProof(key: key, nonce: poll.nonce, body: answer)
+        )
+        return true
+    }
+
+    /// A mod request's body, once the host is re-authenticated and the body
+    /// carries the channel key's proof; nil after answering the refusal.
+    private func readSignedModBody(
+        fd: Int32,
+        request: ClaudeRemoteHTTPRequest,
+        buffer: inout Data,
+        bodyOffset: Int,
+        deadline: UInt64,
+        token: String,
+        host: ClaudeRemoteHost,
+        cap: Int
+    ) -> (body: Data, key: String)? {
+        guard request.contentLength <= cap else {
+            Log.backends.error("Remote mod channel: refused a request over the body cap")
+            respond(fd: fd, status: 413)
+            return nil
+        }
+        while buffer.count - bodyOffset < request.contentLength {
+            guard readMore(fd: fd, into: &buffer, deadline: deadline) else {
+                respond(fd: fd, status: 400)
+                return nil
+            }
+        }
+        let bodyStart = buffer.index(buffer.startIndex, offsetBy: bodyOffset)
+        let body = Data(buffer[bodyStart..<buffer.index(bodyStart, offsetBy: request.contentLength)])
+        // Re-authenticated, as ingest is: a host revoked or rotated since the
+        // first check has no key.
+        guard let key = hosts.modChannelKey(token: token, expectedHostID: host.id) else {
+            Log.claudeContext.error("Rejected remote mod channel request: host was revoked")
+            respond(fd: fd, status: 401)
+            return nil
+        }
+        let proof = request.headers[ClaudeRemoteModWire.proofHeaderName.lowercased()] ?? ""
+        guard ClaudeRemoteModWire.sameProof(proof, ClaudeRemoteModWire.requestProof(key: key, body: body)) else {
+            Log.backends.error(
+                "Remote mod channel: refused a request from host \(host.id, privacy: .public) without the channel key's proof; run setup again for that host"
+            )
+            respond(fd: fd, status: 403)
+            return nil
+        }
+        return (body, key)
+    }
+
+    /// A remote session's Inbox list or open (#1412). Signed both ways like a
+    /// poll, so a squatter on the forward port neither reads the titles nor
+    /// hands the pane a list of its own.
+    private func serveInbox(
+        fd: Int32,
+        request: ClaudeRemoteHTTPRequest,
+        buffer: inout Data,
+        bodyOffset: Int,
+        deadline: UInt64,
+        token: String,
+        host: ClaudeRemoteHost
+    ) {
+        guard let inbox else {
+            respond(fd: fd, status: 404)
+            return
+        }
+        guard let (body, key) = readSignedModBody(
+            fd: fd, request: request, buffer: &buffer, bodyOffset: bodyOffset, deadline: deadline,
+            token: token, host: host, cap: RemoteInboxRoute.maxRequestBytes
+        ) else { return }
+        guard let asked = RemoteInboxRoute.decode(body, opening: request.path == RemoteInboxRoute.openPath) else {
+            Log.backends.error("Remote inbox: refused an unreadable request")
+            respond(fd: fd, status: 400)
+            return
+        }
+        let answer = inbox.answer(hostID: host.id, request: asked)
+        // Again after the wait, as after a poll's hold: a host revoked or
+        // rotated meanwhile gets nothing under the key it had.
+        guard hosts.modChannelKey(token: token, expectedHostID: host.id) == key else {
+            Log.claudeContext.error("Rejected remote inbox answer: host was revoked while it waited")
+            respond(fd: fd, status: 401)
+            return
+        }
+        let sign = { (body: Data) in ClaudeRemoteModWire.answerProof(key: key, nonce: asked.nonce, body: body) }
+        switch answer {
+        case .list(let list):
+            respond(fd: fd, status: 200, body: list, modProof: sign(list))
+        case .opened:
+            respond(fd: fd, status: 200, body: Data(), modProof: sign(Data()))
+        case .unknownSession:
+            respond(fd: fd, status: 409, body: Data(), modProof: sign(Data()))
+        case .unknownCapture:
+            respond(fd: fd, status: 404, body: Data(), modProof: sign(Data()))
+        case .timedOut:
+            respond(fd: fd, status: 503, body: Data(), modProof: sign(Data()))
+        }
+    }
+
+    /// A host's doctor asks for the Mac's checks. Reads no body, records no
+    /// activity: running doctor is not the host sending context.
+    private func serveDoctor(fd: Int32, request: ClaudeRemoteHTTPRequest, token: String, host: ClaudeRemoteHost) {
+        guard let doctor else {
+            respond(fd: fd, status: 404)
+            return
+        }
+        // Re-authenticated as ingest is: a host revoked since the first
+        // check gets nothing.
+        guard hosts.withAuthenticatedHost(token: token, expectedHostID: host.id, { _ in true }) == true else {
+            Log.claudeContext.error("Rejected remote doctor request: host was revoked")
+            respond(fd: fd, status: 401)
+            return
+        }
+        let json = request.headers["accept"]?.contains("application/json") == true
+        switch doctor.answer(hostID: host.id, json: json) {
+        case .timedOut:
+            Log.backends.error("Remote doctor: the app did not answer in time")
+            respond(fd: fd, status: 503)
+        case .body(let body, let contentType, let failed):
+            Log.backends.info(
+                "Remote doctor: answered a host, \(body.count, privacy: .public) bytes, \(failed, privacy: .public) failed"
+            )
+            respond(fd: fd, status: 200, body: body, doctorFailed: failed, contentType: contentType)
+        }
+    }
+
+    private func refuseQuickCapture(fd: Int32, status: Int, _ reason: String) {
+        Log.backends.error("Quick capture: refused a remote answer: \(reason, privacy: .public)")
+        respond(fd: fd, status: status)
+    }
+
+    /// A Vibe request says nothing about the Claude Code plugin: recording its
+    /// missing plugin header would read as a pre-1.10.0 plugin and raise
+    /// "Plugin update available" on a host that may not have the plugin at all.
+    /// An agent this build does not know records nothing under either name.
+    private func noteVersions(
+        hostID: String, agent: ClaudeHookAgent?, plugin: ClaudeRemotePluginVersionReport, vibe: String?
+    ) {
+        switch agent {
+        case .claude: hosts.notePluginVersion(hostID: hostID, plugin)
+        case .vibe: if let vibe { hosts.noteVibeHooksVersion(hostID: hostID, vibe) }
+        case .opencode, .codex, nil: break
+        }
+    }
+
+    private struct PreparedIngest {
+        let record: ClaudeHookRecord
+        let snippets: [ClaudeContentSnippet]
+        let environment: ClaudeRemoteSessionEnvironment?
+        let hostID: String
+        /// This request's shim version, per the agent the record names.
+        var shimVersion: ClaudeRemotePluginVersionReport?
+    }
+
+    /// The parse/scope half of ingest, safe outside any lock.
+    private func prepareIngest(
+        body: Data,
+        request: ClaudeRemoteHTTPRequest,
+        host: ClaudeRemoteHost
+    ) -> PreparedIngest? {
+        guard let payload = ClaudeRemoteHookPayloadParser.parse(
+            data: body,
+            fallbackEvent: ClaudeRemoteHTTPCodec.eventName(inPath: request.path),
+            timestamp: now().timeIntervalSince1970,
+            limits: limits.wire,
+            snippetLimits: limits.snippets
+        ) else {
+            // With the event, which is the one thing that makes this actionable:
+            // "every SessionStart is unparseable" and "one PostToolUse was" are
+            // different bugs. Taken from the URL the plugin manifest chose and
+            // narrowed to a KNOWN event name — the path is bounded but still
+            // peer-supplied, and a log line is not the place to find that out.
+            let event = Self.knownEventLabel(inPath: request.path)
+            Log.claudeContext.error(
+                "Rejected remote record: unparseable payload (event \(event, privacy: .public))"
+            )
+            return nil
+        }
+
+        // Which agent the shim speaks for. Absent is Claude Code; an agent
+        // this build does not know is refused, never filed under another's
+        // rules (`ClaudeRemoteAgentCodec`).
+        guard let agent = ClaudeRemoteAgentCodec.agent(in: request.headers) else {
+            Log.claudeContext.error("Rejected remote record: unknown agent header")
+            return nil
+        }
+
+        // The two lines that define this listener's trust model. The session id
+        // is namespaced under the host whose TOKEN authenticated the request —
+        // not under anything the payload said — and the origin is `.remote`
+        // unconditionally. Neither is derived from content. The agent prefix
+        // the registry adds in front (`vibe:remote:<host>:<id>`) only keeps two
+        // agents on ONE host from sharing a key.
+        var record = payload.record
+        record.agent = agent
+        record.sessionID = ClaudeRemoteSessionScope.scopedSessionID(
+            hostID: host.id,
+            sessionID: record.sessionID
+        )
+
+        // Enrichment rides as HEADERS, not in the body: the shim has no jq and
+        // must hand Claude Code's event JSON on byte-for-byte, so there is
+        // nowhere in the body to put this without parsing and re-serializing it
+        // on a host where we cannot count on a JSON tool existing.
+        //
+        // The header VALUES stay what they were on the wire — opaque labels
+        // about another machine — and they land in their own snapshot field,
+        // never in `process`. Re-validated here against the same charset and
+        // caps the shim applies; the shim's own validation is a courtesy from a
+        // machine we do not control.
+        let environment = ClaudeRemoteAgentCodec.environment(
+            ClaudeRemoteEnvironmentCodec.environment(in: request.headers, limits: limits.environment),
+            for: agent
+        )
+        // Count only. The values name panes, sockets and TTYs on the user's
+        // other machine; the log is not the place for them, and a count is what
+        // makes "the shim is on an old version" diagnosable.
+        if let environment {
+            let count = ClaudeRemoteEnvironmentField.allCases.filter { environment[$0] != nil }.count
+            Log.claudeContext.debug(
+                "Remote record carried \(count, privacy: .public) allowlisted env labels"
+            )
+        }
+
+        return PreparedIngest(
+            record: record,
+            snippets: payload.snippets,
+            environment: environment,
+            hostID: host.id
+        )
+    }
+
+    /// The session-registry half of ingest. Runs under the host-registry lock
+    /// (`withAuthenticatedHost`) so revocation cannot commit between the
+    /// re-check and this write.
+    ///
+    /// The fixed response header reports whether this record left the session
+    /// present without changing the constant response body.
+    private func commitIngest(_ prepared: PreparedIngest) -> ClaudeRemoteSessionStatus {
+        let origin = ClaudeTransportOrigin.remote(
+            channel: ClaudeRemoteSessionScope.channel(hostID: prepared.hostID)
+        )
+        let snapshot = registry.ingest(
+            prepared.record,
+            origin: origin,
+            snippets: prepared.snippets,
+            environment: prepared.environment,
+            remoteShimVersion: prepared.shimVersion
+        )
+        // Shape only. A remote record carries the user's prompt and excerpts of
+        // their code; a log is the wrong place for either.
+        Log.claudeContext.debug(
+            "Ingested remote \(prepared.record.event.rawValue, privacy: .public) from \(prepared.hostID, privacy: .public)"
+        )
+        return snapshot != nil && prepared.record.event != .sessionEnd ? .joined : .unknown
+    }
+
+    private func status(for error: any Error) -> Int {
+        guard let httpError = error as? ClaudeRemoteHTTPError else { return 400 }
+        switch httpError {
+        case .headTooLarge: return 431
+        case .bodyTooLarge: return 413
+        case .lengthRequired: return 411
+        case .unsupportedMethod: return 405
+        case .incompleteHead, .malformed, .unsupportedTransferEncoding: return 400
+        }
+    }
+
+    private func respond(
+        fd: Int32,
+        status: Int,
+        body: Data? = nil,
+        sessionStatus: ClaudeRemoteSessionStatus? = nil,
+        readmeWanted: Bool = false,
+        draftID: String? = nil,
+        termsWanted: Bool = false,
+        doctorFailed: Int? = nil,
+        modProof: String? = nil,
+        contentType: String = "application/json"
+    ) {
+        let data = ClaudeRemoteHTTPCodec.response(
+            status: status,
+            body: body,
+            sessionStatus: sessionStatus,
+            termsWanted: termsWanted,
+            readmeWanted: readmeWanted,
+            draftID: draftID,
+            doctorFailed: doctorFailed,
+            modProof: modProof,
+            contentType: contentType
+        )
+        _ = data.withUnsafeBytes { raw -> Int in
+            guard let base = raw.baseAddress else { return 0 }
+            var offset = 0
+            while offset < raw.count {
+                let written = retryingOnEINTRInt {
+                    send(fd, base.advanced(by: offset), raw.count - offset, POSIXSocket.sendFlags)
+                }
+                if written <= 0 { return offset } // Peer gone: nothing to do.
+                offset += written
+            }
+            return offset
+        }
+    }
+
+    /// Append one chunk, or fail.
+    ///
+    /// Gated on `poll` with the remaining budget rather than `SO_RCVTIMEO`: the
+    /// deadline is for the WHOLE connection, so a peer that dribbles one byte
+    /// per timeout period — the classic slowloris — makes no progress against it.
+    /// A per-read timeout would reset with every byte and let that run forever.
+    ///
+    /// - Parameter deadline: an absolute `uptimeNanos()` value.
+    private func readMore(fd: Int32, into buffer: inout Data, deadline: UInt64) -> Bool {
+        let current = uptimeNanos()
+        guard current < deadline else { return false }
+        let remainingMillis = (deadline - current) / 1_000_000
+        var descriptorPoll = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+        // Clamped: a deadline further out than ~24 days would overflow Int32 and
+        // poll(2) reads a negative timeout as "block forever" — the one
+        // behaviour this function exists to prevent.
+        let timeout = Int32(min(remainingMillis, UInt64(Int32.max)))
+        let ready = retryingOnEINTRInt32 { poll(&descriptorPoll, 1, timeout) }
+        guard ready > 0 else { return false } // Timed out or failed: done either way.
+
+        var chunk = [UInt8](repeating: 0, count: 8 * 1024)
+        let count = retryingOnEINTRInt { read(fd, &chunk, chunk.count) }
+        guard count > 0 else { return false } // EOF or error.
+        buffer.append(contentsOf: chunk[0..<count])
+
+        // Hard ceiling independent of the phase we are in: the most a
+        // well-formed request can ever be. That is head + separator + body —
+        // the CRLFCRLF terminating the head lives in this buffer too, and
+        // omitting it made the ceiling one separator TIGHTER than a legitimate
+        // maximum-sized request, so the largest requests we advertise as valid
+        // were dropped mid-body.
+        guard buffer.count <= Self.maxBufferedBytes(for: limits.http) else { return false }
+        return true
+    }
+
+    /// The event a hook path names, when it names one this app knows.
+    ///
+    /// An unrecognized (or absent) event reads as `unknown` rather than as
+    /// whatever the peer wrote: the path reached us bounded by the head limit,
+    /// not by an allowlist, and echoing it into the log would put peer-chosen
+    /// text there.
+    package static func knownEventLabel(inPath path: String) -> String {
+        guard let name = ClaudeRemoteHTTPCodec.eventName(inPath: path),
+              ClaudeHookEvent(rawValue: name) != nil
+        else { return "unknown" }
+        return name
+    }
+
+    /// The largest buffer a well-formed request can legitimately occupy.
+    package static func maxBufferedBytes(for http: ClaudeRemoteHTTPLimits) -> Int {
+        http.maxHeadBytes + ClaudeRemoteHTTPCodec.headTerminator.count + http.maxBodyBytes
+    }
+}
+
+@inline(__always)
+private func retryingOnEINTRInt32(_ body: () -> Int32) -> Int32 {
+    while true {
+        let result = body()
+        if result == -1 && errno == EINTR { continue }
+        return result
+    }
+}
+
+@inline(__always)
+private func retryingOnEINTRInt(_ body: () -> Int) -> Int {
+    while true {
+        let result = body()
+        if result == -1 && errno == EINTR { continue }
+        return result
+    }
+}
+
+#endif

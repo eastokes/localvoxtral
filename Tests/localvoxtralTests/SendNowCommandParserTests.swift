@@ -4,19 +4,19 @@ import XCTest
 final class SendNowCommandParserTests: XCTestCase {
     func testParse_plainTextInsertsText() {
         XCTAssertEqual(
-            SendNowCommandParser.parse("explain the error", triggerPhrase: "send now"),
+            SendNowCommandParser.parse("explain the error", triggerPhrases: ["send now"]),
             .insertText("explain the error")
         )
     }
 
     func testParse_sendNowOnlyPressesReturn() {
         XCTAssertEqual(
-            SendNowCommandParser.parse("send now", triggerPhrase: "send now"),
-            .pressReturn(deleteCharacterCount: 8)
+            SendNowCommandParser.parse("send now", triggerPhrases: ["send now"]),
+            .pressReturn
         )
         XCTAssertEqual(
-            SendNowCommandParser.parse("Send now.", triggerPhrase: "send now"),
-            .pressReturn(deleteCharacterCount: 9)
+            SendNowCommandParser.parse("Send now.", triggerPhrases: ["send now"]),
+            .pressReturn
         )
     }
 
@@ -24,9 +24,9 @@ final class SendNowCommandParserTests: XCTestCase {
         XCTAssertEqual(
             SendNowCommandParser.parse(
                 "show me the failing test send now",
-                triggerPhrase: "send now"
+                triggerPhrases: ["send now"]
             ),
-            .insertTextAndPressReturn("show me the failing test", deleteCharacterCount: 9)
+            .insertTextAndPressReturn("show me the failing test")
         )
     }
 
@@ -34,19 +34,19 @@ final class SendNowCommandParserTests: XCTestCase {
         XCTAssertEqual(
             SendNowCommandParser.parse(
                 "run the focused test, send now.",
-                triggerPhrase: "send now"
+                triggerPhrases: ["send now"]
             ),
-            .insertTextAndPressReturn("run the focused test", deleteCharacterCount: 11)
+            .insertTextAndPressReturn("run the focused test")
         )
     }
 
     func testParse_emptyTextDoesNothing() {
-        XCTAssertEqual(SendNowCommandParser.parse("   ", triggerPhrase: "send now"), .none)
+        XCTAssertEqual(SendNowCommandParser.parse("   ", triggerPhrases: ["send now"]), .none)
     }
 
     func testParse_sendNowInsideWordDoesNotTriggerCommand() {
         XCTAssertEqual(
-            SendNowCommandParser.parse("resend now", triggerPhrase: "send now"),
+            SendNowCommandParser.parse("resend now", triggerPhrases: ["send now"]),
             .insertText("resend now")
         )
     }
@@ -55,15 +55,15 @@ final class SendNowCommandParserTests: XCTestCase {
         XCTAssertEqual(
             SendNowCommandParser.parse(
                 "run the focused test ship it",
-                triggerPhrase: "ship it"
+                triggerPhrases: ["ship it"]
             ),
-            .insertTextAndPressReturn("run the focused test", deleteCharacterCount: 8)
+            .insertTextAndPressReturn("run the focused test")
         )
     }
 
     func testParse_blankTriggerPhraseDisablesCommandParsing() {
         XCTAssertEqual(
-            SendNowCommandParser.parse("send now", triggerPhrase: "   "),
+            SendNowCommandParser.parse("send now", triggerPhrases: ["   "]),
             .insertText("send now")
         )
     }

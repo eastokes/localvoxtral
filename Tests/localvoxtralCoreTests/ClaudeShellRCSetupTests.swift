@@ -1,0 +1,713 @@
+import Foundation
+import XCTest
+@testable import localvoxtralCore
+
+/// The rc-file editor for the plain-ssh join's one setup step.
+///
+/// It appends to a file the user owns and did not ask us to touch, so every
+/// rule here is about not damaging it: replace rather than duplicate, remove
+/// cleanly, preserve everything outside the markers byte for byte, and refuse
+/// outright when the file is a symlink into someone's dotfiles repo.
+final class ClaudeShellRCSetupTests: XCTestCase {
+    private func snippet(_ shell: ClaudeShellKind) -> String {
+        ClaudeShellRCSetup.snippet(for: shell)
+    }
+
+    // MARK: - Which shell, and which file
+
+    func testTheLoginShellIsDetectedByBasenameFromRealPaths() {
+        let cases: [(String?, ClaudeShellKind?)] = [
+            ("/bin/zsh", .zsh),
+            ("/bin/bash", .bash),
+            ("/usr/local/bin/bash", .bash),
+            ("/opt/homebrew/bin/fish", .fish),
+            ("/usr/local/bin/fish", .fish),
+            // Not shells this app will write POSIX (or fish) into.
+            ("/bin/ksh", nil),
+            ("/bin/sh", nil),
+            ("/usr/bin/false", nil),
+            // Not a path at all.
+            ("zsh", nil),
+            ("", nil),
+            (nil, nil),
+        ]
+        for (path, expected) in cases {
+            XCTAssertEqual(
+                ClaudeShellKind.detect(loginShellPath: path), expected,
+                "login shell \(path ?? "nil")"
+            )
+        }
+    }
+
+    func testTheRCFileFollowsMacOSConventionPerShell() {
+        XCTAssertEqual(
+            ClaudeShellRCSetup.relativeRCPath(for: .zsh) { _ in false }, ".zshrc"
+        )
+        XCTAssertEqual(
+            ClaudeShellRCSetup.relativeRCPath(for: .fish) { _ in false },
+            ".config/fish/conf.d/localvoxtral.fish"
+        )
+        // macOS terminals run bash as a LOGIN shell, which reads
+        // `.bash_profile` and never `.bashrc` — but an account that keeps
+        // everything in `.bashrc` is sourcing it from there, and appending to
+        // the file they actually edit survives their next dotfile change.
+        XCTAssertEqual(
+            ClaudeShellRCSetup.relativeRCPath(for: .bash) { $0 == ".bash_profile" },
+            ".bash_profile"
+        )
+        XCTAssertEqual(
+            ClaudeShellRCSetup.relativeRCPath(for: .bash) { $0 == ".bashrc" }, ".bashrc"
+        )
+        XCTAssertEqual(
+            ClaudeShellRCSetup.relativeRCPath(for: .bash) { _ in true }, ".bash_profile",
+            "both present: the login shell's own file wins"
+        )
+        XCTAssertEqual(
+            ClaudeShellRCSetup.relativeRCPath(for: .bash) { _ in false }, ".bash_profile",
+            "neither present: create the one a login shell reads"
+        )
+    }
+
+    // MARK: - The block itself
+
+    func testThePOSIXBlockCarriesEveryGuardThatWasMeasured() {
+        for shell in [ClaudeShellKind.zsh, .bash] {
+            let text = snippet(shell)
+            XCTAssertTrue(text.contains("[ -z \"${LC_LVX_TTY:-}\" ]"), "\(shell): already-set guard")
+            XCTAssertTrue(text.contains("[ -z \"${SSH_TTY:-}\" ]"), "\(shell): only-on-this-Mac")
+            XCTAssertTrue(
+                text.contains("case \"$(tty 2>/dev/null)\" in /dev/*"),
+                "\(shell): a tty-less shell prints `not a tty`, and exporting that "
+                    + "poisons the already-set guard for everything downstream"
+            )
+            XCTAssertTrue(
+                text.contains("if [ -z"),
+                "\(shell): an `if` block, not an `&&` chain — the chain's status becomes "
+                    + "the rc file's status and breaks `set -e` sourcing"
+            )
+            XCTAssertFalse(text.contains("set -gx"), "\(shell): that is fish syntax")
+        }
+    }
+
+    func testTheFishBlockIsFishAndNotPOSIX() {
+        let text = snippet(.fish)
+        XCTAssertTrue(text.contains("set -gx LC_LVX_TTY"))
+        XCTAssertTrue(text.contains("not set -q LC_LVX_TTY"))
+        XCTAssertTrue(text.contains("not set -q SSH_TTY"))
+        XCTAssertTrue(text.contains("string match -q -- '/dev/*'"))
+        // fish has neither, and shipping either would be a syntax error in the
+        // user's startup file — the exact damage this file exists to avoid.
+        XCTAssertFalse(text.contains("case \""))
+        XCTAssertFalse(text.contains("$(tty"))
+        XCTAssertFalse(text.contains("export "))
+    }
+
+    func testEveryShellsBlockIsDelimitedByTheSameMarkers() {
+        for shell in ClaudeShellKind.allCases {
+            let text = snippet(shell)
+            XCTAssertTrue(text.hasPrefix(ClaudeShellRCSetup.markerBegin), "\(shell)")
+            XCTAssertTrue(text.hasSuffix(ClaudeShellRCSetup.markerEnd), "\(shell)")
+            XCTAssertTrue(ClaudeShellRCSetup.containsBlock(text), "\(shell)")
+        }
+    }
+
+    // MARK: - Apply, replace, remove
+
+    func testApplyingToAnEmptyFileWritesJustTheBlock() {
+        let result = ClaudeShellRCSetup.apply(to: "", snippet: snippet(.zsh))
+        XCTAssertEqual(result, snippet(.zsh) + "\n")
+    }
+
+    func testApplyingPreservesEverythingElseAndSeparatesTheBlock() throws {
+        let existing = "export EDITOR=vim\nalias ll='ls -la'\n"
+        let result = try XCTUnwrap(ClaudeShellRCSetup.apply(to: existing, snippet: snippet(.zsh)))
+        XCTAssertTrue(result.hasPrefix(existing), "the user's own lines are untouched")
+        XCTAssertTrue(result.contains(snippet(.zsh)))
+        XCTAssertTrue(
+            result.contains("alias ll='ls -la'\n\n" + ClaudeShellRCSetup.markerBegin),
+            "a blank line before the block, so it cannot fuse onto their last line"
+        )
+    }
+
+    func testApplyingTwiceIsAByteForByteNoOp() throws {
+        // Not tidiness: two copies would run `tty` twice on every shell start,
+        // forever, and the second block's guard would then see the first's
+        // export and skip — silently masking a stale value.
+        let once = try XCTUnwrap(
+            ClaudeShellRCSetup.apply(to: "export EDITOR=vim\n", snippet: snippet(.zsh))
+        )
+        let twice = try XCTUnwrap(ClaudeShellRCSetup.apply(to: once, snippet: snippet(.zsh)))
+        XCTAssertEqual(once, twice)
+        XCTAssertEqual(
+            twice.components(separatedBy: ClaudeShellRCSetup.markerBegin).count - 1, 1
+        )
+    }
+
+    func testApplyingREPLACESAnOlderBlockRatherThanAppending() throws {
+        let stale = """
+        export EDITOR=vim
+        \(ClaudeShellRCSetup.markerBegin)
+        export LC_LVX_TTY="$(tty)"
+        \(ClaudeShellRCSetup.markerEnd)
+        alias ll='ls -la'
+        """
+        let result = try XCTUnwrap(ClaudeShellRCSetup.apply(to: stale, snippet: snippet(.zsh)))
+        XCTAssertFalse(
+            result.contains("export LC_LVX_TTY=\"$(tty)\"\n\(ClaudeShellRCSetup.markerEnd)"),
+            "the old body must be gone, or a shipped fix never reaches the user"
+        )
+        XCTAssertTrue(result.contains("case \"$(tty 2>/dev/null)\" in /dev/*"))
+        XCTAssertTrue(result.hasPrefix("export EDITOR=vim\n"))
+        XCTAssertTrue(result.hasSuffix("alias ll='ls -la'"))
+        XCTAssertEqual(
+            result.components(separatedBy: ClaudeShellRCSetup.markerBegin).count - 1, 1
+        )
+    }
+
+    func testRemovingLeavesEverythingElseExactlyAsItWas() throws {
+        // EQUALITY, not `contains`. The weaker assertion hid a growing gap:
+        // `apply` inserts a blank separator line and `remove` did not take it
+        // back, so apply→remove left an extra newline every cycle (review
+        // finding m1).
+        let existing = "export EDITOR=vim\nalias ll='ls -la'\n"
+        let applied = try XCTUnwrap(ClaudeShellRCSetup.apply(to: existing, snippet: snippet(.zsh)))
+        let removed = try XCTUnwrap(ClaudeShellRCSetup.remove(from: applied))
+        XCTAssertEqual(removed, existing, "apply then remove is a byte-for-byte round trip")
+    }
+
+    func testRemovingFromAFileWithNoBlockChangesNothing() {
+        let existing = "export EDITOR=vim\n"
+        XCTAssertEqual(ClaudeShellRCSetup.remove(from: existing), existing)
+    }
+
+    func testAnIndentedMarkerIsStillOurBlock() throws {
+        // Someone's formatter, or a copy-paste into an `if` — the block must
+        // still be findable, or the next apply duplicates it.
+        let indented = "    \(ClaudeShellRCSetup.markerBegin)\n    x=1\n    \(ClaudeShellRCSetup.markerEnd)\n"
+        XCTAssertTrue(ClaudeShellRCSetup.containsBlock(indented))
+        let removed = try XCTUnwrap(ClaudeShellRCSetup.remove(from: indented))
+        XCTAssertFalse(ClaudeShellRCSetup.containsBlock(removed))
+    }
+
+    func testACRLFFileSMarkersAreStillFound() throws {
+        // `.whitespaces` is space and tab only, so a `…(begin)\r` line read
+        // with it looks marker-free — and the next apply APPENDS a duplicate.
+        // A dotfile synced from a Windows-touched repo is exactly that file.
+        // Found by self-review, 2026-09-06.
+        let crlf = "export EDITOR=vim\r\n"
+            + ClaudeShellRCSetup.markerBegin + "\r\n"
+            + "old body\r\n"
+            + ClaudeShellRCSetup.markerEnd + "\r\n"
+        XCTAssertTrue(ClaudeShellRCSetup.containsBlock(crlf))
+        let result = try XCTUnwrap(ClaudeShellRCSetup.apply(to: crlf, snippet: snippet(.zsh)))
+        XCTAssertEqual(
+            result.components(separatedBy: ClaudeShellRCSetup.markerBegin).count - 1, 1,
+            "replaced, not duplicated"
+        )
+        XCTAssertFalse(result.contains("old body"))
+    }
+
+    func testAnUNPAIREDBeginMarkerIsRefusedRatherThanWrittenPast() throws {
+        // The content-losing path, and the reason this returns nil rather than
+        // appending: a file with a dangling begin gains a SECOND begin and one
+        // end, and the next apply then replaces everything between the FIRST
+        // begin and that end — swallowing whatever the user wrote in between.
+        // Found by self-review, 2026-09-06.
+        let damaged = """
+        export EDITOR=vim
+        \(ClaudeShellRCSetup.markerBegin)
+        someone deleted the end marker
+        alias ll='ls -la'
+        """
+        XCTAssertTrue(ClaudeShellRCSetup.hasDamagedBlock(damaged))
+        XCTAssertFalse(ClaudeShellRCSetup.containsBlock(damaged))
+        XCTAssertNil(ClaudeShellRCSetup.apply(to: damaged, snippet: snippet(.zsh)))
+        XCTAssertNil(ClaudeShellRCSetup.remove(from: damaged))
+    }
+
+    func testADanglingBeginBeforeACompletePairIsDamagedNotSpanned() throws {
+        // The content-losing shape review finding M1 named: taking the FIRST
+        // begin and the first end AFTER it spans the user's own lines and
+        // deletes them. Reachable by hand-edit — delete an end marker, then
+        // re-paste the README block to "fix" it.
+        let damaged = [
+            ClaudeShellRCSetup.markerBegin,
+            "export EDITOR=vim",
+            ClaudeShellRCSetup.markerBegin,
+            "old body",
+            ClaudeShellRCSetup.markerEnd,
+        ].joined(separator: "\n")
+        XCTAssertTrue(ClaudeShellRCSetup.hasDamagedBlock(damaged))
+        XCTAssertNil(
+            ClaudeShellRCSetup.apply(to: damaged, snippet: snippet(.zsh)),
+            "`export EDITOR=vim` sits between the two begins and must not be deleted"
+        )
+        XCTAssertNil(ClaudeShellRCSetup.remove(from: damaged))
+    }
+
+    func testAnEndMarkerWithNoBeginIsAlsoDamaged() throws {
+        let stray = "export EDITOR=vim\n\(ClaudeShellRCSetup.markerEnd)\n"
+        XCTAssertTrue(ClaudeShellRCSetup.hasDamagedBlock(stray))
+        XCTAssertNil(ClaudeShellRCSetup.apply(to: stray, snippet: snippet(.zsh)))
+    }
+
+    func testTWOCompleteBlocksCollapseToOne() throws {
+        // The README block pasted twice by hand. Replacing only the first left
+        // the second forever, which is the duplicate the idempotency claim
+        // exists to prevent (review finding m2).
+        let doubled = snippet(.zsh) + "\nexport EDITOR=vim\n" + snippet(.zsh) + "\n"
+        let result = try XCTUnwrap(ClaudeShellRCSetup.apply(to: doubled, snippet: snippet(.zsh)))
+        XCTAssertEqual(
+            result.components(separatedBy: ClaudeShellRCSetup.markerBegin).count - 1, 1,
+            "one block afterwards, not two"
+        )
+        XCTAssertTrue(result.contains("export EDITOR=vim"), "and the user's line survives")
+    }
+
+    func testTwoCompleteBlocksAreBothRemoved() throws {
+        let doubled = snippet(.zsh) + "\nexport EDITOR=vim\n" + snippet(.zsh) + "\n"
+        let removed = try XCTUnwrap(ClaudeShellRCSetup.remove(from: doubled))
+        XCTAssertFalse(ClaudeShellRCSetup.containsBlock(removed))
+        XCTAssertTrue(removed.contains("export EDITOR=vim"))
+    }
+
+    func testACRLFFileKeepsItsLinesAndGetsAnLFBlock() throws {
+        // A shell reads `then\r` as a word: a CRLF block is a syntax error at
+        // every shell start. The user's own lines keep their CRLF. Asserted
+        // on BYTES.
+        let crlf = "export EDITOR=vim\r\n"
+            + ClaudeShellRCSetup.markerBegin + "\r\n"
+            + "old body\r\n"
+            + ClaudeShellRCSetup.markerEnd + "\r\n"
+            + "alias ll='ls -l'\r\n"
+        let result = try XCTUnwrap(ClaudeShellRCSetup.apply(to: crlf, snippet: snippet(.zsh)))
+        XCTAssertEqual(
+            result,
+            "export EDITOR=vim\r\n" + snippet(.zsh) + "\n" + "alias ll='ls -l'\r\n"
+        )
+    }
+
+    /// A valid startup file with one CRLF comment line stays valid through
+    /// apply, and remove gives back its exact bytes. Any CR used to make the
+    /// whole block CRLF and rejoin every user line with CRLF on remove.
+    func testMixedLineEndingsRemainExecutableAndRoundTrip() throws {
+        let original = "# synced from a Windows checkout\r\n"
+            + "if [ -n \"$PS1\" ]; then\n"
+            + "  export EDITOR=vim\n"
+            + "fi\n"
+        XCTAssertEqual(try bashSyntaxStatus(original), 0)
+
+        for shell in [ClaudeShellKind.bash, .zsh] {
+            let applied = try XCTUnwrap(ClaudeShellRCSetup.apply(to: original, snippet: snippet(shell)))
+            XCTAssertEqual(try bashSyntaxStatus(applied), 0, "\(shell): \(applied.debugDescription)")
+            XCTAssertTrue(ClaudeShellRCSetup.containsCurrentBlock(applied, snippet: snippet(shell)))
+            let reapplied = try XCTUnwrap(ClaudeShellRCSetup.apply(to: applied, snippet: snippet(shell)))
+            XCTAssertEqual(reapplied, applied, "\(shell)")
+            XCTAssertEqual(try XCTUnwrap(ClaudeShellRCSetup.remove(from: applied)), original, "\(shell)")
+        }
+    }
+
+    /// `bash -n` over the text: 0 when it parses.
+    private func bashSyntaxStatus(_ text: String) throws -> Int32 {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = ["-n"]
+        let input = Pipe()
+        process.standardInput = input
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        input.fileHandleForWriting.write(Data(text.utf8))
+        try input.fileHandleForWriting.close()
+        process.waitUntilExit()
+        return process.terminationStatus
+    }
+
+    func testTheWriterRefusesAFileWhoseMarkersDoNotPair() throws {
+        let damaged = ClaudeShellRCSetup.markerBegin + "\nstranded\n"
+        let fileSystem = StubRCFileSystem(state: ClaudeShellRCState(
+            fileExists: true, data: Data(damaged.utf8), permissions: 0o644
+        ))
+        let writer = ClaudeShellRCWriter(fileSystem: fileSystem)
+        XCTAssertThrowsError(try writer.apply(shell: .zsh)) { error in
+            XCTAssertEqual(error as? ClaudeShellRCError, .markersDoNotPair)
+        }
+        XCTAssertNil(fileSystem.written, "nothing may be written")
+    }
+
+    func testAFileThatIsONLYTheBlockRemovesToNothing() throws {
+        let onlyBlock = try XCTUnwrap(ClaudeShellRCSetup.apply(to: "", snippet: snippet(.zsh)))
+        let removed = try XCTUnwrap(ClaudeShellRCSetup.remove(from: onlyBlock))
+        XCTAssertFalse(ClaudeShellRCSetup.containsBlock(removed))
+        XCTAssertEqual(removed.trimmingCharacters(in: .whitespacesAndNewlines), "")
+    }
+
+    // MARK: - The writer's refusals
+
+    private final class StubRCFileSystem: ClaudeShellRCFileSystem, @unchecked Sendable {
+        var state: ClaudeShellRCState
+        var written: (data: Data, permissions: UInt16)?
+        var createdDirectory = false
+
+        init(state: ClaudeShellRCState) { self.state = state }
+
+        func readState() throws -> ClaudeShellRCState { state }
+        func createDirectory(permissions: UInt16) throws { createdDirectory = true }
+        func atomicWrite(_ data: Data, permissions: UInt16, replacing _: Data?) throws {
+            written = (data, permissions)
+        }
+    }
+
+    func testWritingThroughASymlinkIsRefused() throws {
+        // The case a dotfiles user actually hits: `~/.zshrc` is very often a
+        // link into a repo, and an atomic rename REPLACES the link with a
+        // regular file — silently detaching their setup. Refusing costs them a
+        // copy-paste; writing costs them their dotfiles.
+        for state in [
+            ClaudeShellRCState(fileExists: true, fileIsSymlink: true),
+            ClaudeShellRCState(fileExists: true, directoryIsSymlink: true),
+        ] {
+            let fileSystem = StubRCFileSystem(state: state)
+            let writer = ClaudeShellRCWriter(fileSystem: fileSystem)
+            XCTAssertThrowsError(try writer.apply(shell: .zsh)) { error in
+                XCTAssertEqual(error as? ClaudeShellRCError, .isSymlink)
+            }
+            XCTAssertNil(fileSystem.written, "nothing may be written")
+        }
+    }
+
+    func testAnUnwritableSetupIsNotConfiguredRatherThanSilent() {
+        let writer = ClaudeShellRCWriter(fileSystem: nil)
+        XCTAssertThrowsError(try writer.apply(shell: .zsh)) { error in
+            XCTAssertEqual(error as? ClaudeShellRCError, .notConfigured)
+        }
+        XCTAssertNil(writer.isApplied(), "unknown, never `false`")
+    }
+
+    func testANewFileIsCreatedTightAndAnExistingOnesModeIsPreserved() throws {
+        let fresh = StubRCFileSystem(state: ClaudeShellRCState(directoryExists: false))
+        try ClaudeShellRCWriter(fileSystem: fresh).apply(shell: .fish)
+        XCTAssertEqual(fresh.written?.permissions, 0o600, "a file WE create gets the tightest mode")
+        XCTAssertTrue(fresh.createdDirectory, "fish's conf.d may not exist yet")
+
+        let existing = StubRCFileSystem(state: ClaudeShellRCState(
+            fileExists: true, data: Data("export EDITOR=vim\n".utf8), permissions: 0o644
+        ))
+        try ClaudeShellRCWriter(fileSystem: existing).apply(shell: .zsh)
+        XCTAssertEqual(
+            existing.written?.permissions, 0o644,
+            "never widen and never narrow someone's own file — preserve it"
+        )
+    }
+
+    func testIsAppliedReadsTheRealFileContents() throws {
+        let fileSystem = StubRCFileSystem(state: ClaudeShellRCState(
+            fileExists: true, data: Data("export EDITOR=vim\n".utf8), permissions: 0o644
+        ))
+        let writer = ClaudeShellRCWriter(fileSystem: fileSystem)
+        XCTAssertEqual(writer.isApplied(), false)
+
+        try writer.apply(shell: .zsh)
+        fileSystem.state.data = fileSystem.written?.data
+        XCTAssertEqual(writer.isApplied(), true)
+
+        try writer.remove()
+        fileSystem.state.data = fileSystem.written?.data
+        XCTAssertEqual(writer.isApplied(), false)
+    }
+
+    func testIsCurrentTellsAnOlderBlockFromThisBuildsBlock() throws {
+        let current = ClaudeShellRCSetup.snippet(for: .zsh)
+        let older = current.replacingOccurrences(of: "# Publishes", with: "# Exports")
+        XCTAssertNotEqual(older, current)
+        let fileSystem = StubRCFileSystem(state: ClaudeShellRCState(
+            fileExists: true, data: Data("export EDITOR=vim\n\n\(older)\n".utf8),
+            permissions: 0o644
+        ))
+        let writer = ClaudeShellRCWriter(fileSystem: fileSystem)
+        XCTAssertEqual(writer.isApplied(), true)
+        XCTAssertEqual(writer.isCurrent(shell: .zsh), false, "an older block needs the rewrite")
+
+        try writer.apply(shell: .zsh)
+        fileSystem.state.data = fileSystem.written?.data
+        XCTAssertEqual(writer.isCurrent(shell: .zsh), true)
+        XCTAssertEqual(writer.isCurrent(shell: .fish), false, "another shell's block is not current")
+
+        // A CRLF block, as older builds wrote into a CRLF file, does not run:
+        // it needs the rewrite.
+        let crlf = current.replacingOccurrences(of: "\n", with: "\r\n") + "\r\n"
+        fileSystem.state.data = Data(crlf.utf8)
+        XCTAssertEqual(writer.isCurrent(shell: .zsh), false)
+
+        // Two matching copies are not current: apply would still collapse them.
+        fileSystem.state.data = Data("\(current)\n\(current)\n".utf8)
+        XCTAssertEqual(writer.isCurrent(shell: .zsh), false)
+
+        XCTAssertEqual(writer.blockState(shell: .zsh), .outdated)
+
+        fileSystem.state.data = Data("export EDITOR=vim\n".utf8)
+        XCTAssertEqual(writer.isCurrent(shell: .zsh), false)
+        XCTAssertEqual(writer.blockState(shell: .zsh), .absent)
+        fileSystem.state = ClaudeShellRCState(fileExists: true, data: nil, permissions: nil)
+        XCTAssertNil(writer.isCurrent(shell: .zsh))
+    }
+
+    func testAnEXISTINGButUNREADABLEFileIsRefusedRatherThanTreatedAsEmpty() {
+        // `~/.zshrc` mode 000, or root-owned. Mapping that to "" made a
+        // confirmed setup overwrite it with snippet-only bytes — total content
+        // loss, silently, with the row then reporting "Set up" (review finding
+        // M2).
+        let fileSystem = StubRCFileSystem(state: ClaudeShellRCState(
+            fileExists: true, data: nil, permissions: nil
+        ))
+        let writer = ClaudeShellRCWriter(fileSystem: fileSystem)
+        XCTAssertThrowsError(try writer.apply(shell: .zsh)) { error in
+            XCTAssertEqual(error as? ClaudeShellRCError, .unreadable)
+        }
+        XCTAssertNil(fileSystem.written, "nothing may be written over a file we cannot read")
+        XCTAssertNil(writer.isApplied(), "and the row must say unknown, not `not set up`")
+    }
+
+    func testADamagedFileReportsUnknownRatherThanApplied() {
+        let damaged = ClaudeShellRCSetup.markerBegin + "\nstranded\n"
+        let fileSystem = StubRCFileSystem(state: ClaudeShellRCState(
+            fileExists: true, data: Data(damaged.utf8), permissions: 0o644
+        ))
+        XCTAssertNil(
+            ClaudeShellRCWriter(fileSystem: fileSystem).isApplied(),
+            "offering Remove for a block the writer will refuse to touch is a dead button"
+        )
+    }
+
+    // MARK: - The LIVE filesystem, against a real tree
+
+    /// Every symlink test above uses a stub state, so the live `readState` —
+    /// the code that decides what those states ARE — had no coverage at all
+    /// (review finding M3). This one builds a real temp tree.
+    /// A dotfiles `~/.zshrc` links into a repo. The live reader never reads
+    /// through it, so the row must still learn it is a symlink, holding the
+    /// block or not, rather than lose that to "could not read".
+    func testTheLiveReaderReportsASymlinkedRCFileAsSymlinked() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lvx-rc-\(UUID().uuidString)")
+        let home = root.appendingPathComponent("home", isDirectory: true)
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let target = root.appendingPathComponent("zshrc")
+        try Data("\(ClaudeShellRCSetup.snippet(for: .zsh))\n".utf8).write(to: target)
+        try FileManager.default.createSymbolicLink(
+            at: home.appendingPathComponent(".zshrc"), withDestinationURL: target
+        )
+
+        let writer = ClaudeShellRCWriter(
+            fileSystem: LiveClaudeShellRCFileSystem(relativePath: ".zshrc", homeDirectoryURL: home)
+        )
+        XCTAssertEqual(
+            writer.reading(shell: .zsh),
+            ClaudeShellRCWriter.Reading(block: nil, isSymlinked: true)
+        )
+    }
+
+    func testTheLiveReaderSeesASymlinkedINTERMEDIATEDirectory() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lvx-rc-\(UUID().uuidString)")
+        let real = root.appendingPathComponent("dotfiles/config", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: real.appendingPathComponent("fish/conf.d", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        // `~/.config` → `~/dotfiles/config`, the standard dotfiles layout.
+        let home = root.appendingPathComponent("home", isDirectory: true)
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(
+            at: home.appendingPathComponent(".config", isDirectory: true), withDestinationURL: real
+        )
+
+        let relative = ClaudeShellRCSetup.relativeRCPath(for: .fish) { _ in false }
+        XCTAssertTrue(
+            LiveClaudeShellRCFileSystem.anyComponentIsSymlink(
+                under: home, relativePath: relative
+            ),
+            "a symlinked ~/.config is a link on the way to the fish file"
+        )
+
+        let state = try LiveClaudeShellRCFileSystem(
+            relativePath: relative, homeDirectoryURL: home
+        ).readState()
+        XCTAssertTrue(state.directoryIsSymlink)
+        XCTAssertThrowsError(
+            try ClaudeShellRCWriter(
+                fileSystem: LiveClaudeShellRCFileSystem(
+                    relativePath: relative, homeDirectoryURL: home
+                )
+            ).apply(shell: .fish)
+        ) { error in
+            XCTAssertEqual(error as? ClaudeShellRCError, .isSymlink)
+        }
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: real.appendingPathComponent("fish/conf.d/localvoxtral.fish").path
+            ),
+            "nothing may be planted inside the dotfiles repo"
+        )
+    }
+
+    func testTheLiveReaderWritesAndReadsBackAThoroughlyORDINARYTree() throws {
+        // The other side: with no symlink anywhere, the real writer works and
+        // round-trips, so the refusal above is about symlinks and not about
+        // the live path being broken.
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lvx-rc-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+        try Data("export EDITOR=vim\n".utf8)
+            .write(to: home.appendingPathComponent(".zshrc"))
+
+        let writer = ClaudeShellRCWriter(
+            fileSystem: LiveClaudeShellRCFileSystem(relativePath: ".zshrc", homeDirectoryURL: home)
+        )
+        XCTAssertEqual(writer.isApplied(), false)
+        try writer.apply(shell: .zsh)
+        XCTAssertEqual(writer.isApplied(), true)
+        let written = try String(
+            contentsOf: home.appendingPathComponent(".zshrc"), encoding: .utf8
+        )
+        XCTAssertTrue(written.hasPrefix("export EDITOR=vim\n"))
+        try writer.remove()
+        XCTAssertEqual(
+            try String(contentsOf: home.appendingPathComponent(".zshrc"), encoding: .utf8),
+            "export EDITOR=vim\n"
+        )
+    }
+
+    /// The live file system, with the user's editor saving the file right
+    /// after setup's read.
+    private struct SavesAfterTheRead: ClaudeShellRCFileSystem {
+        let live: LiveClaudeShellRCFileSystem
+        let save: @Sendable () throws -> Void
+        func readState() throws -> ClaudeShellRCState {
+            let state = try live.readState()
+            try save()
+            return state
+        }
+        func createDirectory(permissions: UInt16) throws { try live.createDirectory(permissions: permissions) }
+        func atomicWrite(_ data: Data, permissions: UInt16, replacing expected: Data?) throws {
+            try live.atomicWrite(data, permissions: permissions, replacing: expected)
+        }
+    }
+
+    /// A save made while setup runs is kept: setup refuses instead of
+    /// replacing it with the text it read plus the block, and running it
+    /// again applies the block to the saved file (#1726).
+    func testASaveMadeWhileSetupRunsIsKeptAndSetupRefuses() throws {
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("lvx-rc-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: home) }
+        let rc = home.appendingPathComponent(".zshrc")
+        try Data("export EDITOR=vim\n".utf8).write(to: rc)
+        let saved = Data("export EDITOR=nvim\n".utf8)
+        let live = LiveClaudeShellRCFileSystem(relativePath: ".zshrc", homeDirectoryURL: home)
+
+        let writer = ClaudeShellRCWriter(fileSystem: SavesAfterTheRead(live: live) { try saved.write(to: rc) })
+        XCTAssertThrowsError(try writer.apply(shell: .zsh)) { error in
+            XCTAssertEqual(error as? ClaudeShellRCError, .changedOnDisk)
+        }
+        XCTAssertEqual(try Data(contentsOf: rc), saved, "the save survives")
+
+        try ClaudeShellRCWriter(fileSystem: live).apply(shell: .zsh)
+        let applied = try String(contentsOf: rc, encoding: .utf8)
+        XCTAssertTrue(applied.hasPrefix("export EDITOR=nvim\n"))
+        XCTAssertTrue(ClaudeShellRCSetup.containsBlock(applied))
+    }
+
+    func testNonUTF8ContentIsRefusedRatherThanOverwritten() {
+        let fileSystem = StubRCFileSystem(state: ClaudeShellRCState(
+            fileExists: true, data: Data([0xFF, 0xFE, 0x00]), permissions: 0o644
+        ))
+        let writer = ClaudeShellRCWriter(fileSystem: fileSystem)
+        XCTAssertThrowsError(try writer.apply(shell: .zsh)) { error in
+            XCTAssertEqual(error as? ClaudeShellRCError, .invalidEncoding)
+        }
+        XCTAssertNil(fileSystem.written)
+    }
+
+    // MARK: - Reading the login shell
+
+    func testDSCLOutputIsParsedAndAnythingElseRefused() {
+        XCTAssertEqual(ClaudeLoginShellReader.parse("UserShell: /bin/zsh\n"), "/bin/zsh")
+        XCTAssertEqual(
+            ClaudeLoginShellReader.parse("name: tom\nUserShell: /opt/homebrew/bin/fish"),
+            "/opt/homebrew/bin/fish"
+        )
+        XCTAssertNil(ClaudeLoginShellReader.parse("UserShell: zsh"), "not a path")
+        XCTAssertNil(ClaudeLoginShellReader.parse("No such key: UserShell\n"))
+        XCTAssertNil(ClaudeLoginShellReader.parse(""))
+    }
+
+    func testTheEnvironmentIsOnlyAFallback() {
+        // The app launches from the GUI, where `$SHELL` comes from launchd and
+        // can be stale after a `chsh`. Directory Services is asked first.
+        XCTAssertEqual(
+            ClaudeLoginShellReader.loginShellPath(
+                runDSCL: { "UserShell: /bin/zsh" }, environment: ["SHELL": "/bin/bash"]
+            ),
+            "/bin/zsh"
+        )
+        XCTAssertEqual(
+            ClaudeLoginShellReader.loginShellPath(
+                runDSCL: { nil }, environment: ["SHELL": "/bin/bash"]
+            ),
+            "/bin/bash"
+        )
+        XCTAssertNil(
+            ClaudeLoginShellReader.loginShellPath(runDSCL: { nil }, environment: [:])
+        )
+        XCTAssertNil(
+            ClaudeLoginShellReader.loginShellPath(
+                runDSCL: { nil }, environment: ["SHELL": "bash"]
+            ),
+            "not a path"
+        )
+    }
+
+    /// Field crash 2026-09-18 (nightly 0.9.1-nightly.20260917): the host
+    /// row's update panel builds its consent sentence during SwiftUI's view
+    /// update, and that sentence asks `dscl` for the login shell. Waiting
+    /// with `Process.waitUntilExit()` spins the main run loop, which on
+    /// macOS 26 re-entered the in-progress update cycle and SIGSEGV'd. The
+    /// wait must block without running anything else queued on the run loop.
+    func testReadingTheLoginShellNeverSpinsTheMainRunLoop() {
+        XCTAssertTrue(Thread.isMainThread)
+        final class Flag: @unchecked Sendable { var fired = false }
+        let flag = Flag()
+        RunLoop.main.perform { flag.fired = true }
+
+        // The child outlives its output, so a run-loop-spinning wait is
+        // guaranteed to be waiting (and spinning) when it is reached.
+        let output = ClaudeLoginShellReader.runCapturingOutput(
+            executableURL: URL(fileURLWithPath: "/bin/sh"),
+            arguments: ["-c", "printf 'UserShell: /bin/zsh\\n'; exec sleep 0.5"]
+        )
+
+        XCTAssertEqual(output.flatMap(ClaudeLoginShellReader.parse), "/bin/zsh")
+        XCTAssertFalse(
+            flag.fired,
+            "the wait ran other main-run-loop work — re-entrancy into a SwiftUI update"
+        )
+    }
+
+    /// The bound must cover a `dscl` that hangs WITHOUT printing (a stalled
+    /// opendirectoryd), not just one that printed and then hung: a blocking
+    /// read before the deadline would freeze the main thread inside a view
+    /// update with the timeout never reached.
+    func testASilentHungChildIsGivenUpOnAtTheDeadline() {
+        let output = ClaudeLoginShellReader.runCapturingOutput(
+            executableURL: URL(fileURLWithPath: "/bin/sh"),
+            arguments: ["-c", "exec sleep 3"],
+            timeout: 0.1
+        )
+        XCTAssertNil(output, "a child that never answered must fall back to $SHELL")
+    }
+}

@@ -6,7 +6,7 @@ with daily users, so the bar is proof, not promise.
 ## Building and testing
 
 You need a Mac with Apple Silicon and macOS 15+ — see
-[docs/building.md](docs/building.md). `swift build` / `swift test` cover the
+[Building from source](https://t0msilver.github.io/localvoxtral/docs/building/). `swift build` / `swift test` cover the
 app package; `./scripts/package_app.sh release` builds the full bundle
 including the MLX helpers. Working from a non-Mac machine is supported via an
 SSH build host — the workflow and the full test-tier matrix are documented in
@@ -47,4 +47,6 @@ reviewing what you submit.
   session joins) have documented invariants in
   [docs/agent/invariants.md](docs/agent/invariants.md) — read them before
   proposing changes there; deliberate tradeoffs are not bugs.
+- Found a vulnerability? Do not open an issue — report it privately through
+  [SECURITY.md](SECURITY.md).
 - Questions or ideas: open an issue before a large PR.

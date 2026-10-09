@@ -1,30 +1,43 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
+# `lv_open`: `open`, plus the env the CI lanes need the app to see.
+# shellcheck source=scripts/lib/launch-app.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/launch-app.sh"
+
 # AX-driven packaged-app smoke drill. Run on a macOS GUI session:
 #   ./scripts/ui-smoke.sh [dist/localvoxtral.app]
 #
-# Defaults isolation:
-# localvoxtral uses UserDefaults.standard under bundle id com.localvoxtral.app.
-# There is no app-code hook for a separate suite/domain, and NSUserDefaults
-# command-line overrides do not move standard defaults to an isolated suite.
-# This script therefore snapshots that defaults domain, forces only the smoke
-# test's required external-mode setting, and restores the snapshot on exit.
+# Defaults isolation: the app runs on the harness defaults suite
+# (LOCALVOXTRAL_DEFAULTS_SUITE), which holds only the drill's forced settings;
+# the owner's com.localvoxtral.app domain is only read (#1029).
 
 APP_PATH="${1:-dist/localvoxtral.app}"
 APP_PROCESS="localvoxtral"
 BUNDLE_ID="com.localvoxtral.app"
-PERSISTENT_DEFAULTS_BACKUP="${HOME}/.localvoxtral-ui-smoke.pre.plist"
-PERSISTENT_DEFAULTS_BACKUP_HAD_DOMAIN="${PERSISTENT_DEFAULTS_BACKUP}.had-domain"
 PREFLIGHT_HELPER=""
-AX_PROBE_HELPER=""
+# Resolved from this script's location, not the cwd: the drill is invoked both
+# from the repo root and by CI steps with their own working directory.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AX_PROBE="${SCRIPT_DIR}/lib/ax-probe.swift"
 APP_PID=""
+# The bundle of the owner's own running instance, recorded when the drill quits
+# it to make room for a fresh launch, so cleanup can relaunch it. Empty means
+# the drill has not touched the owner's app and must not quit anything.
+OWNER_APP_BUNDLE=""
+# Set just before `open`, not when the pid is found: a signal in between must
+# still quit the instance being launched.
+DRILL_LAUNCHED=0
 FAILED=0
 CLEANED_UP=0
 OSASCRIPT_TIMEOUT_SECONDS="${OSASCRIPT_TIMEOUT_SECONDS:-8}"
 OSASCRIPT_TIMEOUT_BIN=""
+# Test seam (test-ui-smoke-owner-app.sh): its stubbed launch never starts.
+LAUNCH_TIMEOUT_SECONDS="${UI_SMOKE_LAUNCH_TIMEOUT_SECONDS:-10}"
 BACKEND_SAMPLE_FILE=""
 BACKEND_SAMPLER_PID=""
+APP_LOG_FILE=""
+APP_LOG_STREAM_PID=""
 SUMMARY=()
 
 if command -v timeout >/dev/null 2>&1; then
@@ -54,83 +67,11 @@ print_summary() {
   done
 }
 
-restore_defaults() {
-  if [[ ! -f "$PERSISTENT_DEFAULTS_BACKUP" ]]; then
-    return
-  fi
-
-  defaults delete "$BUNDLE_ID" >/dev/null 2>&1 || true
-  if [[ -f "$PERSISTENT_DEFAULTS_BACKUP_HAD_DOMAIN" ]]; then
-    defaults import "$BUNDLE_ID" "$PERSISTENT_DEFAULTS_BACKUP" >/dev/null 2>&1 || return 1
-  fi
-  rm -f "$PERSISTENT_DEFAULTS_BACKUP" "$PERSISTENT_DEFAULTS_BACKUP_HAD_DOMAIN"
-}
-
-recover_previous_defaults_backup() {
-  if [[ ! -f "$PERSISTENT_DEFAULTS_BACKUP" ]]; then
-    rm -f "$PERSISTENT_DEFAULTS_BACKUP_HAD_DOMAIN"
-    return 0
-  fi
-
-  printf 'WARNING: found %s from a previous interrupted UI smoke run; restoring owner defaults before continuing.\n' "$PERSISTENT_DEFAULTS_BACKUP" >&2
-  if restore_defaults; then
-    printf 'WARNING: previous UI smoke defaults backup restored and removed.\n' >&2
-    return 0
-  fi
-
-  record_fail "Could not restore previous defaults backup at $PERSISTENT_DEFAULTS_BACKUP; refusing to mutate owner defaults."
-  return 1
-}
-
-write_empty_defaults_backup() {
-  cat >"$PERSISTENT_DEFAULTS_BACKUP" <<'PLIST'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict/>
-</plist>
-PLIST
-}
-
-snapshot_defaults() {
-  rm -f "$PERSISTENT_DEFAULTS_BACKUP" "$PERSISTENT_DEFAULTS_BACKUP_HAD_DOMAIN"
-  if defaults export "$BUNDLE_ID" "$PERSISTENT_DEFAULTS_BACKUP" >/dev/null 2>&1; then
-    : >"$PERSISTENT_DEFAULTS_BACKUP_HAD_DOMAIN" || return 1
-  elif defaults read "$BUNDLE_ID" >/dev/null 2>&1; then
-    return 1
-  else
-    write_empty_defaults_backup || return 1
-  fi
-  [[ -f "$PERSISTENT_DEFAULTS_BACKUP" ]] || return 1
-}
-
-run_osascript() {
-  if [[ -n "$OSASCRIPT_TIMEOUT_BIN" ]]; then
-    "$OSASCRIPT_TIMEOUT_BIN" "${OSASCRIPT_TIMEOUT_SECONDS}s" osascript "$@"
-  else
-    # macOS does not ship GNU timeout; if it is unavailable, run osascript
-    # directly rather than failing the smoke drill before AX checks can run.
-    osascript "$@"
-  fi
-}
-
-quit_app() {
-  if ! pgrep -x "$APP_PROCESS" >/dev/null 2>&1; then
-    return
-  fi
-
-  run_osascript -e "tell application \"$APP_PROCESS\" to quit" >/dev/null 2>&1 || true
-  local deadline=$((SECONDS + 10))
-  while ((SECONDS < deadline)); do
-    if ! pgrep -x "$APP_PROCESS" >/dev/null 2>&1; then
-      return
-    fi
-    sleep 0.5
-  done
-}
+# shellcheck source=scripts/lib/owner-app-session.sh
+source "${SCRIPT_DIR}/lib/owner-app-session.sh"
 
 managed_backend_pids() {
-  pgrep -f 'voxmlx-serve|mlx_lm\.server|localvoxtral-polishd' 2>/dev/null | sort || true
+  pgrep -f 'voxmlx-serve|mlx_lm\.server|localvoxtral-polishd|localvoxtral-speechd' 2>/dev/null | sort || true
 }
 
 start_backend_sampler() {
@@ -160,20 +101,62 @@ sampled_backend_pids() {
   fi
 }
 
+# The app's own log is the launch invariant's first signal (#594). On a hosted
+# runner the bundle has no MLX helpers and there is no model cache, so a
+# wrongly started managed warmup begins a download instead of spawning a
+# process, and the sampler above sees nothing. The warmup's request line comes
+# before any download or spawn. It is logged at info level, which macOS does
+# not keep, so it is streamed live rather than read back with `log show`.
+start_app_log_stream() {
+  APP_LOG_FILE="$(mktemp -t localvoxtral-app-log.XXXXXX)"
+  log stream --level info --style compact \
+    --predicate "process == \"$APP_PROCESS\" AND subsystem == \"com.localvoxtral\"" \
+    >"$APP_LOG_FILE" 2>&1 &
+  APP_LOG_STREAM_PID=$!
+  # `log stream` prints this header once it is attached; lines logged before
+  # that are lost.
+  local deadline=$((SECONDS + 10))
+  while ((SECONDS < deadline)); do
+    grep -q '^Filtering the log data' "$APP_LOG_FILE" 2>/dev/null && return 0
+    kill -0 "$APP_LOG_STREAM_PID" 2>/dev/null || return 1
+    sleep 0.2
+  done
+  return 1
+}
+
+stop_app_log_stream() {
+  if [[ -z "$APP_LOG_STREAM_PID" ]]; then
+    return
+  fi
+
+  kill "$APP_LOG_STREAM_PID" >/dev/null 2>&1 || true
+  wait "$APP_LOG_STREAM_PID" >/dev/null 2>&1 || true
+  APP_LOG_STREAM_PID=""
+}
+
 cleanup() {
   if ((CLEANED_UP)); then
     return
   fi
   CLEANED_UP=1
+  # A signal mid-cleanup would re-enter it as a no-op and exit, leaving the
+  # owner's app stopped and the drill's defaults installed. Every step below
+  # is bounded, so finish it.
+  trap '' INT TERM HUP
 
   stop_backend_sampler
-  quit_app
-  if ! restore_defaults; then
-    printf 'WARNING: failed to restore defaults backup at %s; leaving it in place for the next run.\n' "$PERSISTENT_DEFAULTS_BACKUP" >&2
+  stop_app_log_stream
+  # Only a drill that launched, or cleared the slot to launch, owns whatever
+  # localvoxtral is running now. Before that point it is the owner's app.
+  if ((DRILL_LAUNCHED)) || [[ -n "$OWNER_APP_BUNDLE" ]]; then
+    quit_app
   fi
+  drop_harness_defaults
+  report_owner_defaults
+  relaunch_owner_app
   [[ -n "$PREFLIGHT_HELPER" ]] && rm -f "$PREFLIGHT_HELPER"
-  [[ -n "$AX_PROBE_HELPER" ]] && rm -f "$AX_PROBE_HELPER"
   [[ -n "$BACKEND_SAMPLE_FILE" ]] && rm -f "$BACKEND_SAMPLE_FILE"
+  [[ -n "$APP_LOG_FILE" ]] && rm -f "$APP_LOG_FILE"
 }
 
 signal_cleanup() {
@@ -215,7 +198,7 @@ import CoreGraphics
 var ok = true
 
 if !AXIsProcessTrusted() {
-    print("Missing Accessibility TCC grant: grant Accessibility to the self-hosted runner process in System Settings > Privacy & Security > Accessibility, then rerun.")
+    print("Missing Accessibility TCC grant: grant Accessibility to the self-hosted runner process in System Settings > Privacy & Security > Accessibility (Device Control and Data Access on macOS 27), then rerun.")
     ok = false
 }
 
@@ -236,15 +219,22 @@ else
   exit 1
 fi
 
-if ! snapshot_defaults; then
-  record_fail "Could not create persistent defaults backup at $PERSISTENT_DEFAULTS_BACKUP; refusing to mutate owner defaults."
+# Quit the owner's instance before launching: two copies share the global
+# hotkey.
+quit_owner_app
+if pgrep -x "$APP_PROCESS" >/dev/null 2>&1; then
+  record_fail "Existing app instance did not quit before smoke launch; cannot launch a fresh instance."
   print_summary
   exit 1
 fi
-if ! defaults write "$BUNDLE_ID" settings.dictation_backend_mode -string external_url \
-  || ! defaults write "$BUNDLE_ID" settings.polishing_backend_mode -string external_url \
-  || ! defaults write "$BUNDLE_ID" settings.llm_polishing_enabled -bool false \
-  || ! defaults write "$BUNDLE_ID" settings.onboarding_completed -bool true; then
+
+# The app runs on the harness suite, never the owner's domain (#1029).
+OWNER_DEFAULTS_BEFORE="$(owner_defaults_digest)"
+use_harness_defaults
+if ! defaults write "$HARNESS_DEFAULTS_SUITE" settings.dictation_backend_mode -string external_url \
+  || ! defaults write "$HARNESS_DEFAULTS_SUITE" settings.polishing_backend_mode -string external_url \
+  || ! defaults write "$HARNESS_DEFAULTS_SUITE" settings.llm_polishing_enabled -bool false \
+  || ! defaults write "$HARNESS_DEFAULTS_SUITE" settings.onboarding_completed -bool true; then
   record_fail "Could not force external backend mode and completed onboarding in defaults."
   print_summary
   exit 1
@@ -260,7 +250,7 @@ fi
 # TODO(tier-2): add a wizard-appears smoke by launching once with
 # settings.onboarding_completed=false and asserting the "Welcome to localvoxtral"
 # window, then completing it.
-record_pass "Defaults domain snapshot captured and smoke run forced to external mode with onboarding completed."
+record_pass "Harness defaults suite $HARNESS_DEFAULTS_SUITE forces external mode with onboarding completed."
 
 # Managed backends are Python entry-point processes, so match the full
 # command line (-f). The runner legitimately hosts a voxmlx-serve launchd
@@ -268,16 +258,19 @@ record_pass "Defaults domain snapshot captured and smoke run forced to external 
 # AFTER app launch count as violations.
 BASELINE_BACKEND_PIDS="$(managed_backend_pids)"
 
-quit_app
-if pgrep -x "$APP_PROCESS" >/dev/null 2>&1; then
-  record_fail "Existing app instance did not quit before smoke launch; cannot launch a fresh instance."
-  print_summary
-  exit 1
+APP_LOG_STREAM_STARTED=0
+if start_app_log_stream; then
+  APP_LOG_STREAM_STARTED=1
+else
+  record_fail "Could not start log stream on the app's log before launch: $(tail -n 3 "$APP_LOG_FILE" 2>/dev/null)"
 fi
-
 start_backend_sampler
-open -n "$APP_PATH"
-launch_deadline=$((SECONDS + 10))
+DRILL_LAUNCHED=1
+# Its History and other stores stay off the account's own (#985).
+lv_isolate_data localvoxtral-ui-smoke-data \
+  || { echo "Could not make a data folder for the app under test; not launching it on the owner's data." >&2; exit 1; }
+lv_open -n "$APP_PATH"
+launch_deadline=$((SECONDS + LAUNCH_TIMEOUT_SECONDS))
 while ((SECONDS < launch_deadline)); do
   APP_PID="$(pgrep -xn "$APP_PROCESS" 2>/dev/null || true)"
   [[ -n "$APP_PID" ]] && break
@@ -285,7 +278,7 @@ while ((SECONDS < launch_deadline)); do
 done
 
 if [[ -z "$APP_PID" ]]; then
-  record_fail "App process did not start within 10 seconds."
+  record_fail "App process did not start within ${LAUNCH_TIMEOUT_SECONDS} seconds."
   print_summary
   exit 1
 fi
@@ -418,153 +411,142 @@ fi
 # returns 0 elements on the macOS 26 runner) while the AX API sees the full
 # tree, so the AppleScript approach is dropped rather than fixed.
 #
-# The helper polls the app's windows until <needle> appears in any element's
-# title/value/description or the deadline passes; with --dump-on-fail it prints
-# the AX tree so the uploaded log shows what was actually on screen.
-write_ax_probe_helper() {
-  local stem
-  stem="$(mktemp -t localvoxtral-ax-probe)" || return 1
-  AX_PROBE_HELPER="${stem}.swift"
-  mv "$stem" "$AX_PROBE_HELPER" || return 1
-  cat >"$AX_PROBE_HELPER" <<'SWIFT'
-import ApplicationServices
-import Foundation
-
-let args = CommandLine.arguments
-guard args.count >= 4, let pid = Int32(args[1]), let timeoutSeconds = Double(args[3]) else {
-    print("usage: ax-probe <pid> <needle> <timeout-seconds> [--dump-on-fail]")
-    exit(2)
-}
-let needle = args[2]
-let dumpOnFail = args.contains("--dump-on-fail")
-let app = AXUIElementCreateApplication(pid)
-
-func copyAttr(_ element: AXUIElement, _ name: String) -> AnyObject? {
-    var value: AnyObject?
-    return AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success ? value : nil
-}
-
-func windows() -> [AXUIElement] {
-    (copyAttr(app, kAXWindowsAttribute) as? [AXUIElement]) ?? []
-}
-
-func texts(_ element: AXUIElement) -> (role: String, title: String, value: String, desc: String) {
-    let role = copyAttr(element, kAXRoleAttribute) as? String ?? "?"
-    let title = copyAttr(element, kAXTitleAttribute) as? String ?? ""
-    let desc = copyAttr(element, kAXDescriptionAttribute) as? String ?? ""
-    var value = ""
-    if let raw = copyAttr(element, kAXValueAttribute) { value = String(describing: raw) }
-    return (role, title, value, desc)
-}
-
-// Only text-bearing roles count as visible pane content. The toolbar tab
-// AXButtons (titled "General", "Endpoints", "Dictation", ...) exist on every
-// pane, so an unscoped match would let e.g. the Endpoints check pass off the
-// "Dictation" tab button without the pane ever rendering.
-let textRoles: Set<String> = ["AXStaticText", "AXTextField", "AXTextArea"]
-
-func containsNeedle(_ element: AXUIElement, depth: Int, budget: inout Int) -> Bool {
-    if depth > 40 || budget <= 0 { return false }
-    budget -= 1
-    let t = texts(element)
-    if textRoles.contains(t.role),
-       t.title.contains(needle) || t.value.contains(needle) || t.desc.contains(needle) {
-        return true
-    }
-    for child in (copyAttr(element, kAXChildrenAttribute) as? [AXUIElement]) ?? [] {
-        if containsNeedle(child, depth: depth + 1, budget: &budget) { return true }
-    }
-    return false
-}
-
-func dump(_ element: AXUIElement, depth: Int, budget: inout Int) {
-    if depth > 40 || budget <= 0 { return }
-    budget -= 1
-    let t = texts(element)
-    let indent = String(repeating: "  ", count: depth)
-    print("\(indent)\(t.role) title=\(t.title.prefix(60)) value=\(t.value.prefix(100)) desc=\(t.desc.prefix(60))")
-    for child in (copyAttr(element, kAXChildrenAttribute) as? [AXUIElement]) ?? [] {
-        dump(child, depth: depth + 1, budget: &budget)
-    }
-}
-
-let deadline = Date().addingTimeInterval(timeoutSeconds)
-repeat {
-    for window in windows() {
-        var budget = 20000
-        if containsNeedle(window, depth: 0, budget: &budget) { exit(0) }
-    }
-    usleep(250_000)
-} while Date() < deadline
-
-if dumpOnFail {
-    let wins = windows()
-    print("AXPROBE: needle \"\(needle)\" not visible after \(timeoutSeconds)s; windows=\(wins.count)")
-    for (index, window) in wins.enumerated() {
-        print("AXPROBE: === window \(index) ===")
-        var budget = 8000
-        dump(window, depth: 0, budget: &budget)
-    }
-}
-exit(1)
-SWIFT
-}
-
-window_shows_text() {
-  local expected="$1" timeout_seconds="${2:-10}"
-  shift 2 || true
-  swift "$AX_PROBE_HELPER" "$APP_PID" "$expected" "$timeout_seconds" "$@"
-}
-
-select_tab() {
-  local tab_name="$1"
-  run_osascript >/dev/null <<OSA
-tell application "System Events" to tell process "$APP_PROCESS"
-  click button "$tab_name" of toolbar 1 of window 1
-end tell
-OSA
-}
-
-assert_tab() {
-  local tab_name="$1"
-  local expected_text="$2"
-
-  if ! select_tab "$tab_name"; then
-    record_fail "Could not select Settings tab: $tab_name."
-    return
-  fi
-
-  if window_shows_text "$expected_text" 10 --dump-on-fail; then
-    record_pass "Settings tab shows expected content: $tab_name -> $expected_text."
-  else
-    record_fail "Settings tab selected but expected text was not visible: $tab_name -> $expected_text."
-  fi
-}
-
-if ! write_ax_probe_helper; then
-  record_fail "Could not write the AX text-probe helper."
+# The probe now lives in scripts/lib/ax-probe.swift, shared with
+# capture-readme-assets.sh. See its header for the flags.
+if [[ ! -f "$AX_PROBE" ]]; then
+  record_fail "AX probe helper not found: $AX_PROBE"
   print_summary
   exit 1
 fi
 
-assert_tab "General" "Permissions"
-assert_tab "Endpoints" "Dictation"
-assert_tab "Dictation" "Start dictation with"
-assert_tab "Text Processing" "Replacements"
-# The polish feature toggles live on Text Processing (moved from Endpoints).
-assert_tab "Text Processing" "Polishing"
-assert_tab "About" "Diagnostics"
+# Every probe call is pinned to the Settings window. Both of the probe's
+# fallbacks match by shape (an AXButton with this title; the first AXScrollArea),
+# and the app has other windows — the enrollment sheet alone contains two scroll
+# views — so an unpinned fallback could answer from the wrong window.
+SETTINGS_WINDOW_TITLE="localvoxtral"
+
+# Asserts <needle> inside the subtree identified by <scope-identifier>, so a
+# sidebar row label (AXStaticText, present on every pane) can never satisfy a
+# pane assertion.
+pane_shows_text() {
+  local scope="$1" expected="$2" timeout_seconds="${3:-10}"
+  swift "$AX_PROBE" "$APP_PID" \
+    --find "$expected" --scope "$scope" \
+    --window "$SETTINGS_WINDOW_TITLE" \
+    --timeout "$timeout_seconds" --dump-on-fail
+}
+
+# Presses the sidebar row by its AXIdentifier. The old selector
+# (`button "<name>" of toolbar 1 of window 1`) died with the TabView: the
+# hand-rolled sidebar has no toolbar. The display name is passed as an AXTitle
+# fallback so the drill still selects the tab (and says so in the log) if
+# SwiftUI ever stops surfacing identifiers on plain-styled buttons.
+select_tab() {
+  local tab_id="$1" tab_name="$2"
+  swift "$AX_PROBE" "$APP_PID" \
+    --press "settings.tab.${tab_id}" --title "$tab_name" \
+    --window "$SETTINGS_WINDOW_TITLE" \
+    --timeout 10 --dump-on-fail
+}
+
+# One dump, once, before the per-tab assertions: if neither the pane identifier
+# nor a scroll area is in the tree, every scoped assertion below would time out
+# for 10s each and blame its own needle. Name the real cause instead.
+assert_pane_scope_is_reachable() {
+  local tree
+  if ! tree="$(swift "$AX_PROBE" "$APP_PID" --dump --window "$SETTINGS_WINDOW_TITLE" 2>&1)"; then
+    record_fail "Could not dump the Settings window AX tree."
+    return
+  fi
+
+  if grep -q "id=settings\.pane\." <<<"$tree"; then
+    record_pass "Settings panes expose settings.pane.* AXIdentifiers; scoped assertions use them."
+  elif grep -q "AXScrollArea" <<<"$tree"; then
+    record_pass "Settings panes expose no AXIdentifier, but an AXScrollArea is present; scoped assertions use the scroll-area fallback."
+  else
+    record_fail "Settings window exposes neither a settings.pane.* AXIdentifier nor an AXScrollArea; scoped pane assertions cannot run."
+    printf '%s\n' "$tree"
+  fi
+}
+
+assert_tab() {
+  local tab_id="$1"
+  local tab_name="$2"
+  local expected_text="$3"
+
+  if ! select_tab "$tab_id" "$tab_name"; then
+    record_fail "Could not select Settings tab: $tab_name (settings.tab.$tab_id)."
+    return
+  fi
+
+  if pane_shows_text "settings.pane.${tab_id}" "$expected_text" 10; then
+    record_pass "Settings tab shows expected content: $tab_name -> $expected_text."
+  else
+    record_fail "Settings tab selected but expected text was not visible in settings.pane.$tab_id: $tab_name -> $expected_text."
+  fi
+}
+
+assert_pane_scope_is_reachable
+
+assert_tab "general" "General" "Permissions"
+assert_tab "endpoints" "Engines" "Dictation"
+# "Trigger" is the Dictation pane's first group title; the pre-#278 needle
+# ("Start dictation with") named copy that no longer exists.
+assert_tab "dictation" "Dictation" "Trigger"
+assert_tab "textProcessing" "Text Processing" "About you"
+# The polish feature toggles live on Text Processing (moved from Engines).
+assert_tab "textProcessing" "Text Processing" "Polishing"
+# The consent-grade context sources live on their own pane (moved off Text
+# Processing). Asserted on the group title, which exists nowhere else.
+assert_tab "integrations.context" "Context" "Polish context"
+assert_tab "integrations.context" "Context" "Send diff, recent files and prompts"
+# --- Integrations section: one pane per harness (2026-09-07 owner decision) ---
+assert_tab "integrations.claude" "Claude Code" "Plugin"
+assert_tab "integrations.claude" "Claude Code" "Status line"
+assert_tab "integrations.opencode" "opencode" "Plugin"
+assert_tab "integrations.vibe" "Mistral Vibe" "Hooks"
+assert_tab "integrations.codex" "Codex" "Plugin"
+assert_tab "integrations.herdr" "herdr" "Status"
+assert_tab "integrations.herdr" "herdr" "Saved machines"
+assert_tab "integrations.remote" "Remote hosts" "Add host"
+assert_tab "integrations.remote" "Remote hosts" "Terminal setup"
+# --- Terminals section: one pane per terminal ---
+# The capability rows are machine-independent ("Dictation", "Session join",
+# "Screen context" render on every terminal pane whatever the dot says), so
+# every pane is drilled on them. The STATUS SENTENCE varies with what is
+# installed on the machine, so it is asserted only where it is deterministic:
+# Terminal.app ships with macOS, is always found by LaunchServices, and always
+# gets the full green sentence.
+assert_tab "terminals.ghostty" "Ghostty" "Session join"
+assert_tab "terminals.iterm2" "iTerm2" "Session join"
+assert_tab "terminals.apple-terminal" "Terminal.app" "Session join"
+assert_tab "terminals.apple-terminal" "Terminal.app" "Installed. Dictation, session join and screen context."
+# The cmux join toggle binds $settings.cmuxSurfaceJoinEnabled — without this,
+# the row could be deleted or rebound with every lane green.
+assert_tab "terminals.cmux" "cmux" "Join sessions in cmux"
+assert_tab "terminals.cmux" "cmux" "Socket password"
+assert_tab "terminals.warp" "Warp" "Session join"
+assert_tab "terminals.wezterm" "WezTerm" "Session join"
+assert_tab "terminals.kitty" "kitty" "Session join"
+assert_tab "terminals.alacritty" "Alacritty" "Session join"
+assert_tab "terminals.hyper" "Hyper" "Session join"
+assert_tab "terminals.tabby" "Tabby" "Session join"
+assert_tab "terminals.rio" "Rio" "Session join"
+assert_tab "about" "About" "Diagnostics"
 
 # The launch phase forces external URL modes (managed mode now eagerly spawns
-# at launch), so the Endpoints pane renders endpoint configuration fields, not
+# at launch), so the Engines pane renders endpoint configuration fields, not
 # the managed status rows. Managed-row AX coverage would need a second launch
 # that tolerates the eager spawn.
-select_tab "Endpoints" >/dev/null 2>&1 || true
-if window_shows_text "Endpoint" 10 --dump-on-fail \
-  && window_shows_text "API key" 10 --dump-on-fail; then
-  record_pass "External-mode Endpoints pane shows endpoint configuration fields."
+# "Server URL" is the needle that proves external mode: the row renders in no
+# other mode, while the Mistral API group shows an "API key" row in all of
+# them. The pre-#278 needle ("Endpoint") named copy that no longer exists.
+select_tab "endpoints" "Engines" >/dev/null 2>&1 || true
+if pane_shows_text "settings.pane.endpoints" "Server URL" 10 \
+  && pane_shows_text "settings.pane.endpoints" "API key" 10; then
+  record_pass "External-mode Engines pane shows endpoint configuration fields."
 else
-  record_fail "External-mode Endpoints pane did not show endpoint configuration fields."
+  record_fail "External-mode Engines pane did not show endpoint configuration fields."
 fi
 
 quit_app
@@ -573,6 +555,22 @@ if pgrep -x "$APP_PROCESS" >/dev/null 2>&1; then
   record_fail "App did not quit cleanly; process still exists after quit."
 else
   record_pass "App quit cleanly."
+fi
+
+# Launch to quit is over; give the stream a moment to deliver the last lines.
+if ((APP_LOG_STREAM_STARTED)); then
+  sleep 1
+  stop_app_log_stream
+  # The predicate admits only the app's own lines, which compact style tags
+  # [com.localvoxtral:<category>]. None means the stream saw nothing, and an
+  # absent warmup line would prove nothing.
+  if ! grep -qF '[com.localvoxtral:' "$APP_LOG_FILE"; then
+    record_fail "The app's log stream captured no line from the app between launch and quit, so the managed warmup check cannot run. Capture tail: $(tail -n 5 "$APP_LOG_FILE")"
+  elif grep -F 'managed backend warmup requested' "$APP_LOG_FILE" >&2; then
+    record_fail "App launch requested a managed backend warmup in external mode (its log, above)."
+  else
+    record_pass "App logged no managed backend warmup request between launch and quit in external mode ($(grep -cF '[com.localvoxtral:' "$APP_LOG_FILE") app log lines captured)."
+  fi
 fi
 
 if ps -axo stat=,comm= | awk -v app="/${APP_PROCESS}$" '$2 ~ app && $1 ~ /Z/ { found = 1 } END { exit found ? 0 : 1 }'; then

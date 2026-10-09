@@ -7,14 +7,6 @@ struct ManagedBackendStatusUpdate: Equatable, Sendable {
     let status: ManagedBackendStatus
 }
 
-enum ManagedBackendStatus: Equatable, Sendable {
-    case preparingModel(progress: ModelDownloadProgress)
-    case starting
-    case ready
-    case stopped
-    case failed(summary: String, detail: String?)
-}
-
 enum ManagedBackendManagerError: LocalizedError {
     case backendFailed(name: String, summary: String, detail: String?)
 
@@ -50,6 +42,12 @@ protocol ManagedBackendSupervising: AnyObject {
 
     func start() async
     func stop() async
+    /// The child's pid while one is running.
+    var processID: pid_t? { get }
+}
+
+extension ManagedBackendSupervising {
+    var processID: pid_t? { nil }
 }
 
 extension BackendProcessSupervisor: ManagedBackendSupervising {}
@@ -68,10 +66,25 @@ protocol ManagedBackendManaging: AnyObject {
     /// Stop only the managed polishd (polishing) process, leaving speechd
     /// (dictation) untouched. A no-op if polishd was never started.
     func stopPolishing() async
+    /// Pause this backend's in-flight model download, keeping the bytes already
+    /// transferred. A no-op unless the status is `.preparingModel`. The next
+    /// `ensureReady` for the backend continues the paused file.
+    func pauseModelDownload(for spec: ManagedBackendSpec) async
+    /// Cancel this backend's model download and throw away the in-flight file's
+    /// bytes. Files that already landed in the Hugging Face cache stay — the
+    /// next download skips them. Leaves the backend `.stopped`.
+    func cancelModelDownload(for spec: ManagedBackendSpec) async
     /// Recent supervisor output lines for the given backend, or empty if the
     /// supervisor has not been created yet (backend never started). For local
     /// diagnostics export only.
     func recentOutput(for spec: ManagedBackendSpec) -> [String]
+    /// The running helper's pid, for the widgets' memory reading; nil while
+    /// it is not running.
+    func processID(for spec: ManagedBackendSpec) -> pid_t?
+}
+
+extension ManagedBackendManaging {
+    func processID(for spec: ManagedBackendSpec) -> pid_t? { nil }
 }
 
 @MainActor
@@ -79,12 +92,15 @@ protocol ManagedBackendManaging: AnyObject {
 final class BackendManager: ManagedBackendManaging {
     typealias SupervisorFactory = @MainActor (BackendProcessConfiguration) -> any ManagedBackendSupervising
     typealias PolishingModelProvider = @MainActor () -> String
-    /// Megabytes for the speechd `--cache-limit-mb` flag, or nil to omit it and
-    /// let the helper apply its built-in default.
-    typealias SpeechdCacheLimitProvider = @MainActor () -> Int?
-    /// Milliseconds for the speechd `--step-ms` flag, or nil to omit it and
-    /// let the helper apply its built-in default.
-    typealias SpeechdStepCadenceProvider = @MainActor () -> Int?
+    /// Catalog entry the managed dictation helper downloads and loads.
+    typealias SpeechModelProvider = @MainActor () -> SpeechModelOption
+    /// Megabytes speechd passes to `--cache-limit-mb`. It caps MLX's buffer
+    /// cache (freed GPU buffers kept for reuse), not the weights. Voxtral's cache
+    /// fills to whatever cap is set while time per step stays flat (#486), so a
+    /// higher cap only costs RAM. `speechd-bench` picked this value (#963):
+    /// 512 MB matches 2048 MB's step time and lag with ~1.5 GB less footprint.
+    /// Nemotron's cache stays near 10 MB, so the cap never binds for it.
+    static let speechdCacheLimitMB = 512
 
     private(set) var speechdStatus: ManagedBackendStatus
     private(set) var polishdStatus: ManagedBackendStatus
@@ -93,9 +109,16 @@ final class BackendManager: ManagedBackendManaging {
     @ObservationIgnored private let legacyPortDefense: any LegacyVoxmlxPortDefending
     @ObservationIgnored private let supervisorFactory: SupervisorFactory
     @ObservationIgnored private let polishingModelProvider: PolishingModelProvider
-    @ObservationIgnored private let speechdCacheLimitProvider: SpeechdCacheLimitProvider
-    @ObservationIgnored private let speechdStepCadenceProvider: SpeechdStepCadenceProvider
+    @ObservationIgnored private let speechModelProvider: SpeechModelProvider
     @ObservationIgnored private var speechdSupervisor: (any ManagedBackendSupervising)?
+    /// The catalog entry the RUNNING speechd was launched with. A supervisor
+    /// captures its argv at creation, so a selection change while the helper is
+    /// up has to be noticed here — otherwise the next dictation attaches to the
+    /// old model.
+    @ObservationIgnored private var speechdLaunchedModel: SpeechModelOption?
+    /// The speech model whose download started and has not finished. Set until
+    /// it completes, so a paused or interrupted download still names its bytes.
+    @ObservationIgnored private var speechdPreparingModel: SpeechModelOption?
     @ObservationIgnored private var polishdSupervisor: (any ManagedBackendSupervising)?
     // Per-backend single-flight slots. A global shared slot (the previous
     // design) let a lingering dictation run swallow a polishing request whose
@@ -104,6 +127,15 @@ final class BackendManager: ManagedBackendManaging {
     // share a slot.
     @ObservationIgnored private var dictationEnsureTask: Task<Void, Error>?
     @ObservationIgnored private var polishingEnsureTask: Task<Void, Error>?
+    /// Callers parked on each shared ensure task. A cancelled caller leaves at
+    /// once; the task itself is cancelled only when its last caller leaves, so
+    /// turning voice memos off no longer aborts a dictation start waiting on
+    /// the same helper (#1511).
+    @ObservationIgnored private var ensureWaiters: [Task<Void, Error>: [UUID: CheckedContinuation<Void, Error>]] = [:]
+    /// Backend ids whose in-flight ensure is being cancelled BY a pause, so the
+    /// download's unwinding knows to land on `.pausedModelDownload` instead of
+    /// `.stopped`. Held only for the duration of `pauseModelDownload`.
+    @ObservationIgnored private var pauseRequestedBackendIDs: Set<String> = []
     @ObservationIgnored private var speechdStateMirrorTask: Task<Void, Never>?
     @ObservationIgnored private var polishdStateMirrorTask: Task<Void, Never>?
     @ObservationIgnored private var statusUpdateContinuations: [UUID: AsyncStream<ManagedBackendStatusUpdate>.Continuation] = [:]
@@ -118,8 +150,9 @@ final class BackendManager: ManagedBackendManaging {
         polishingModelProvider: @escaping PolishingModelProvider = {
             SettingsStore.defaultLLMPolishingModel
         },
-        speechdCacheLimitProvider: @escaping SpeechdCacheLimitProvider = { nil },
-        speechdStepCadenceProvider: @escaping SpeechdStepCadenceProvider = { nil },
+        speechModelProvider: @escaping SpeechModelProvider = {
+            SpeechModelCatalog.defaultOption
+        },
         supervisorFactory: @escaping SupervisorFactory = { configuration in
             BackendProcessSupervisor(configuration: configuration)
         }
@@ -127,8 +160,7 @@ final class BackendManager: ManagedBackendManaging {
         self.modelPreparer = modelPreparer ?? HFModelDownloader()
         self.legacyPortDefense = legacyPortDefense ?? LegacyVoxmlxPortDefense(layout: layout)
         self.polishingModelProvider = polishingModelProvider
-        self.speechdCacheLimitProvider = speechdCacheLimitProvider
-        self.speechdStepCadenceProvider = speechdStepCadenceProvider
+        self.speechModelProvider = speechModelProvider
         self.supervisorFactory = supervisorFactory
         self.speechdStatus = .stopped
         self.polishdStatus = .stopped
@@ -205,10 +237,69 @@ final class BackendManager: ManagedBackendManaging {
     }
 
     private func awaitEnsureReadyTask(_ task: Task<Void, Error>) async throws {
+        let waiterID = UUID()
         try await withTaskCancellationHandler {
-            try await task.value
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                // The cancel hop below runs on the main actor after this
+                // closure, so a cancel that landed earlier is only visible here.
+                guard !Task.isCancelled else {
+                    // A superseded caller can arrive cancelled with the task
+                    // it just created; with nobody else waiting, stop it.
+                    if ensureWaiters[task]?.isEmpty ?? true {
+                        cancelAndResumeAfterUnwinding(task, continuation)
+                    } else {
+                        continuation.resume(throwing: CancellationError())
+                    }
+                    return
+                }
+                ensureWaiters[task, default: [:]][waiterID] = continuation
+                Task { @MainActor in
+                    let result = await task.result
+                    self.resumeEnsureWaiter(waiterID, of: task, with: result)
+                }
+            }
         } onCancel: {
-            task.cancel()
+            Task { @MainActor in
+                self.cancelEnsureWaiter(waiterID, of: task)
+            }
+        }
+    }
+
+    private func resumeEnsureWaiter(
+        _ waiterID: UUID,
+        of task: Task<Void, Error>,
+        with result: Result<Void, Error>
+    ) {
+        guard let continuation = ensureWaiters[task]?.removeValue(forKey: waiterID) else { return }
+        if ensureWaiters[task]?.isEmpty == true {
+            ensureWaiters[task] = nil
+        }
+        continuation.resume(with: result)
+    }
+
+    private func cancelEnsureWaiter(_ waiterID: UUID, of task: Task<Void, Error>) {
+        guard let continuation = ensureWaiters[task]?.removeValue(forKey: waiterID) else { return }
+        guard ensureWaiters[task]?.isEmpty == true else {
+            continuation.resume(throwing: CancellationError())
+            Log.backends.info("ensure waiter cancelled; the shared ensure keeps running for its other waiters")
+            return
+        }
+        ensureWaiters[task] = nil
+        cancelAndResumeAfterUnwinding(task, continuation)
+    }
+
+    /// The last waiter cancels the shared task and throws only once it has
+    /// unwound, so a caller that sees `CancellationError` also sees the status
+    /// the unwinding set (`.stopped`), not the `.preparingModel` it replaces
+    /// (#1611).
+    private func cancelAndResumeAfterUnwinding(
+        _ task: Task<Void, Error>,
+        _ continuation: CheckedContinuation<Void, Error>
+    ) {
+        task.cancel()
+        Task { @MainActor in
+            _ = await task.result
+            continuation.resume(throwing: CancellationError())
         }
     }
 
@@ -221,10 +312,11 @@ final class BackendManager: ManagedBackendManaging {
         await polishdSupervisor?.stop()
         // Drop the supervisors, not just stop them: launch arguments are
         // captured at supervisor creation, so a kept supervisor would relaunch
-        // with stale settings (cache limit / step cadence) — field-hit
-        // 2026-07-17: changing the memory limit and toggling Managed →
-        // External → Managed silently kept the old argv.
+        // with stale settings — field-hit 2026-07-17: changing a launch
+        // setting and toggling Managed → External → Managed silently kept the
+        // old argv.
         speechdSupervisor = nil
+        speechdLaunchedModel = nil
         polishdSupervisor = nil
         speechdStateMirrorTask?.cancel()
         speechdStateMirrorTask = nil
@@ -239,31 +331,106 @@ final class BackendManager: ManagedBackendManaging {
     }
 
     func stopDictation() async {
-        let cancelledEnsure = await cancelEnsureTaskAndAwaitCompletion(for: BackendCatalog.speechd)
-        let hadSupervisor = speechdSupervisor != nil
-        await speechdSupervisor?.stop()
-        // See stopAll(): drop the supervisor so the next ensure rebuilds the
-        // launch arguments from the current settings providers.
-        speechdSupervisor = nil
-        speechdStateMirrorTask?.cancel()
-        speechdStateMirrorTask = nil
-        if cancelledEnsure || hadSupervisor {
-            setStatus(.stopped, for: BackendCatalog.speechd)
-        }
+        await stopBackend(BackendCatalog.speechd)
     }
 
     func stopPolishing() async {
-        // Stop only the polishing supervisor. speechd (dictation) keeps running
-        // and its state mirror is left intact. Modeled on stopAll()'s polishd
-        // branch: cancel the mirror task and pin the status to .stopped.
-        let cancelledEnsure = await cancelEnsureTaskAndAwaitCompletion(for: BackendCatalog.polishd)
-        let hadSupervisor = polishdSupervisor != nil
-        await polishdSupervisor?.stop()
-        polishdSupervisor = nil
-        polishdStateMirrorTask?.cancel()
-        polishdStateMirrorTask = nil
-        if cancelledEnsure || hadSupervisor {
-            setStatus(.stopped, for: BackendCatalog.polishd)
+        // Stop only the polishing supervisor: speechd (dictation) keeps running
+        // and its state mirror is left intact.
+        await stopBackend(BackendCatalog.polishd)
+    }
+
+    /// One backend's stop, shared by `stopDictation` / `stopPolishing` and by
+    /// the download Cancel button. `forceStoppedStatus` pins `.stopped` even
+    /// when there was nothing to cancel or stop, for callers that already tore
+    /// the ensure task down themselves and must not leave a stale status
+    /// behind.
+    private func stopBackend(
+        _ spec: ManagedBackendSpec,
+        forceStoppedStatus: Bool = false
+    ) async {
+        let cancelledEnsure = await cancelEnsureTaskAndAwaitCompletion(for: spec)
+        let supervisor = supervisorIfCreated(for: spec)
+        await supervisor?.stop()
+        // See stopAll(): drop the supervisor so the next ensure rebuilds the
+        // launch arguments from the current settings providers.
+        setSupervisor(nil, for: spec)
+        cancelStateMirrorTask(for: spec)
+        if forceStoppedStatus || cancelledEnsure || supervisor != nil {
+            setStatus(.stopped, for: spec)
+        }
+    }
+
+    func pauseModelDownload(for spec: ManagedBackendSpec) async {
+        guard case .preparingModel = status(for: spec) else {
+            Log.backends.info(
+                "\(spec.displayName, privacy: .public) download pause ignored: no download in flight"
+            )
+            return
+        }
+        Log.backends.info("\(spec.displayName, privacy: .public) model download pause requested")
+        // Latched across the cancellation so prepareModel's unwinding lands on
+        // .pausedModelDownload rather than flashing .stopped through the status
+        // stream (the Settings row and the onboarding wizard both mirror it).
+        pauseRequestedBackendIDs.insert(spec.id)
+        // Same discipline as stopPolishing(): the ensure task must finish
+        // unwinding before anything else touches this repo's cache (PR #99).
+        let cancelledEnsure = await cancelEnsureTaskAndAwaitCompletion(for: spec)
+        pauseRequestedBackendIDs.remove(spec.id)
+
+        guard cancelledEnsure, case .pausedModelDownload(let progress) = status(for: spec) else {
+            // The download finished while the click was in flight, so there is
+            // nothing to resume; unwind to a plain stop instead of leaving the
+            // backend half-started.
+            Log.backends.info(
+                "\(spec.displayName, privacy: .public) download pause arrived after the download ended; stopping instead"
+            )
+            await stopBackend(spec, forceStoppedStatus: true)
+            return
+        }
+        Log.backends.info(
+            "\(spec.displayName, privacy: .public) model download paused at \(progress.downloadedBytes, privacy: .public) bytes"
+        )
+    }
+
+    func cancelModelDownload(for spec: ManagedBackendSpec) async {
+        Log.backends.info("\(spec.displayName, privacy: .public) model download cancel requested")
+        // The download being cancelled, which the selection may have moved
+        // away from since it started. Read it before the stop clears it.
+        let interrupted = spec.id == BackendCatalog.speechd.id ? speechdPreparingModel : nil
+        // Stop first and await the unwinding: discarding resume data while a
+        // downloader is still live would race the transfer that owns it.
+        await stopBackend(spec, forceStoppedStatus: true)
+        // nil falls back to the current selection.
+        modelPreparer.discardPartialDownloads(
+            for: modelPreparationRequest(for: spec, speechModel: interrupted)
+        )
+        if spec.id == BackendCatalog.speechd.id { speechdPreparingModel = nil }
+        Log.backends.info(
+            "\(spec.displayName, privacy: .public) model download cancelled; in-flight file discarded"
+        )
+    }
+
+    private func supervisorIfCreated(for spec: ManagedBackendSpec) -> (any ManagedBackendSupervising)? {
+        spec.id == BackendCatalog.speechd.id ? speechdSupervisor : polishdSupervisor
+    }
+
+    private func setSupervisor(_ supervisor: (any ManagedBackendSupervising)?, for spec: ManagedBackendSpec) {
+        if spec.id == BackendCatalog.speechd.id {
+            speechdSupervisor = supervisor
+            if supervisor == nil { speechdLaunchedModel = nil }
+        } else {
+            polishdSupervisor = supervisor
+        }
+    }
+
+    private func cancelStateMirrorTask(for spec: ManagedBackendSpec) {
+        if spec.id == BackendCatalog.speechd.id {
+            speechdStateMirrorTask?.cancel()
+            speechdStateMirrorTask = nil
+        } else {
+            polishdStateMirrorTask?.cancel()
+            polishdStateMirrorTask = nil
         }
     }
 
@@ -307,16 +474,46 @@ final class BackendManager: ManagedBackendManaging {
         }
     }
 
+    func processID(for spec: ManagedBackendSpec) -> pid_t? {
+        switch spec.id {
+        case BackendCatalog.speechd.id:
+            return speechdSupervisor?.processID
+        case BackendCatalog.polishd.id:
+            return polishdSupervisor?.processID
+        default:
+            return nil
+        }
+    }
+
     private func ensureReady(_ spec: ManagedBackendSpec) async throws {
-        if isReady(spec) {
+        // One snapshot per launch: the selection can change while the model
+        // downloads, and the downloader and the helper argv must not disagree.
+        let speechModel = spec.id == BackendCatalog.speechd.id ? speechModelProvider() : nil
+
+        let launchedForAnotherModel = spec.id == BackendCatalog.speechd.id
+            && supervisorIfCreated(for: spec) != nil
+            && speechdLaunchedModel != speechModel
+        if isReady(spec), !launchedForAnotherModel {
             setStatus(.ready, for: spec)
             return
         }
+        if launchedForAnotherModel {
+            // A supervisor keeps the argv it was created with, whether it is
+            // running or kept after a failed start, so a new selection needs a
+            // new one. Stop it here rather than through stopDictation(), which
+            // would cancel and await the ensure task this call is running inside.
+            await stopSupervisorKeepingEnsureTask(for: spec)
+        }
 
-        try await prepareModel(for: spec)
-        try Task.checkCancellation()
+        try await prepareModel(for: spec, speechModel: speechModel)
+        try checkCancellationLeavingStopped(spec)
 
-        if spec.id == BackendCatalog.speechd.id {
+        // A supervisor that is launching, restarting or running owns the
+        // port's likely occupant: its own helper, which binds while the model
+        // is checked and which the defense would call foreign.
+        if spec.id == BackendCatalog.speechd.id,
+           !Self.ownsLiveProcess(supervisorIfCreated(for: spec))
+        {
             let outcome = await legacyPortDefense.clearLegacyOccupantIfNeeded(port: spec.port)
             if case .occupiedByOther = outcome {
                 let summary = "\(spec.displayName) port already in use; refusing to adopt an existing backend process."
@@ -330,24 +527,76 @@ final class BackendManager: ManagedBackendManaging {
         }
 
         setStatus(.starting, for: spec)
-        try Task.checkCancellation()
-        let supervisor = supervisor(for: spec)
-        try await startAndWaitUntilReady(supervisor, spec: spec)
+        try checkCancellationLeavingStopped(spec)
+        let supervisor = supervisor(for: spec, speechModel: speechModel)
+        do {
+            try await startAndWaitUntilReady(supervisor, spec: spec)
+        } catch where Task.isCancelled {
+            // Nobody waits for this helper any more: stop it, so `.stopped`
+            // is true.
+            await stopSupervisorKeepingEnsureTask(for: spec)
+            setStatus(.stopped, for: spec)
+            Log.backends.info("\(spec.displayName, privacy: .public) start cancelled; helper stopped")
+            throw CancellationError()
+        }
     }
 
-    private func prepareModel(for spec: ManagedBackendSpec) async throws {
-        let request = modelPreparationRequest(for: spec)
+    /// A cancel that lands between the phases of `ensureReady` leaves
+    /// `.stopped`, not the last phase's status (#1614). A pause caught in the
+    /// download sets `.pausedModelDownload` there; one that lands here found
+    /// the download done, and `pauseModelDownload` stops the backend.
+    private func checkCancellationLeavingStopped(_ spec: ManagedBackendSpec) throws {
+        guard Task.isCancelled else { return }
+        setStatus(.stopped, for: spec)
+        throw CancellationError()
+    }
+
+    private static func ownsLiveProcess(_ supervisor: (any ManagedBackendSupervising)?) -> Bool {
+        switch supervisor?.state {
+        case .launching, .waitingForReady, .running, .restarting:
+            return true
+        case .idle, .stopped, .failed, nil:
+            return false
+        }
+    }
+
+    /// `stopBackend` without the ensure-task cancellation, for a caller that is
+    /// itself the ensure task.
+    private func stopSupervisorKeepingEnsureTask(for spec: ManagedBackendSpec) async {
+        await supervisorIfCreated(for: spec)?.stop()
+        setSupervisor(nil, for: spec)
+        cancelStateMirrorTask(for: spec)
+    }
+
+    private func prepareModel(
+        for spec: ManagedBackendSpec,
+        speechModel: SpeechModelOption?
+    ) async throws {
+        let request = modelPreparationRequest(for: spec, speechModel: speechModel)
         setStatus(
             .preparingModel(progress: ModelDownloadProgress(downloadedBytes: 0, totalBytes: nil)),
             for: spec
         )
+        if spec.id == BackendCatalog.speechd.id {
+            speechdPreparingModel = speechModel ?? speechModelProvider()
+        }
         do {
             try await modelPreparer.prepare(request) { [weak self] progress in
                 guard let self else { return }
                 self.setStatus(.preparingModel(progress: progress), for: spec)
             }
+            if spec.id == BackendCatalog.speechd.id { speechdPreparingModel = nil }
         } catch is CancellationError {
-            setStatus(.stopped, for: spec)
+            // A pause cancels this task too, but keeps the bytes and the last
+            // progress reading so the row stays on its bar instead of resetting
+            // to "Stopped".
+            if pauseRequestedBackendIDs.contains(spec.id),
+               case .preparingModel(let progress) = status(for: spec)
+            {
+                setStatus(.pausedModelDownload(progress: progress), for: spec)
+            } else {
+                setStatus(.stopped, for: spec)
+            }
             throw CancellationError()
         } catch {
             let summary = error.localizedDescription.trimmed.isEmpty
@@ -369,6 +618,13 @@ final class BackendManager: ManagedBackendManaging {
     ) async throws {
         let updates = supervisor.stateUpdates
         await supervisor.start()
+        // The stream carries only later transitions, and start() does nothing
+        // for a supervisor already active. One that became ready while the
+        // model was being checked would never be reported again (#1305).
+        if supervisor.state == .running {
+            mirrorSupervisorState(.running, for: spec)
+            return
+        }
 
         for await state in updates {
             switch state {
@@ -397,6 +653,9 @@ final class BackendManager: ManagedBackendManaging {
             }
         }
 
+        // The stream also ends when the ensure is cancelled; its caller
+        // sets the status then.
+        try Task.checkCancellation()
         let message = "\(spec.displayName) stopped reporting status before it became ready."
         setStatus(.failed(summary: message, detail: nil), for: spec)
         throw ManagedBackendManagerError.backendFailed(
@@ -406,15 +665,21 @@ final class BackendManager: ManagedBackendManaging {
         )
     }
 
-    private func supervisor(for spec: ManagedBackendSpec) -> any ManagedBackendSupervising {
+    private func supervisor(
+        for spec: ManagedBackendSpec,
+        speechModel: SpeechModelOption?
+    ) -> any ManagedBackendSupervising {
         switch spec.id {
         case BackendCatalog.speechd.id:
             if let speechdSupervisor {
                 startStateMirrorIfNeeded(supervisor: speechdSupervisor, spec: spec)
                 return speechdSupervisor
             }
-            let supervisor = supervisorFactory(configuration(for: spec))
+            let supervisor = supervisorFactory(
+                configuration(for: spec, speechModel: speechModel)
+            )
             speechdSupervisor = supervisor
+            speechdLaunchedModel = speechModel
             startStateMirrorIfNeeded(supervisor: supervisor, spec: spec)
             return supervisor
         case BackendCatalog.polishd.id:
@@ -422,7 +687,9 @@ final class BackendManager: ManagedBackendManaging {
                 startStateMirrorIfNeeded(supervisor: polishdSupervisor, spec: spec)
                 return polishdSupervisor
             }
-            let supervisor = supervisorFactory(configuration(for: spec))
+            let supervisor = supervisorFactory(
+                configuration(for: spec, speechModel: speechModel)
+            )
             polishdSupervisor = supervisor
             startStateMirrorIfNeeded(supervisor: supervisor, spec: spec)
             return supervisor
@@ -431,14 +698,19 @@ final class BackendManager: ManagedBackendManaging {
         }
     }
 
-    private func configuration(for spec: ManagedBackendSpec) -> BackendProcessConfiguration {
+    private func configuration(
+        for spec: ManagedBackendSpec,
+        speechModel: SpeechModelOption?
+    ) -> BackendProcessConfiguration {
         BackendProcessConfiguration(
             name: spec.displayName,
             executableURL: executableURL(for: spec),
-            arguments: arguments(for: spec),
+            arguments: arguments(for: spec, speechModel: speechModel),
             environment: processEnvironment(),
             readinessURL: URL(string: "http://127.0.0.1:\(spec.port)/health")!,
-            readinessTimeout: readinessTimeout(for: spec)
+            readinessTimeout: readinessTimeout(for: spec),
+            // Both helpers name their pid on /health (#1760, #1786).
+            readinessReportsOwnerPID: true
         )
     }
 
@@ -454,30 +726,28 @@ final class BackendManager: ManagedBackendManaging {
             .appendingPathComponent(spec.executableName)
     }
 
-    private func arguments(for spec: ManagedBackendSpec) -> [String] {
+    private func arguments(
+        for spec: ManagedBackendSpec,
+        speechModel: SpeechModelOption?
+    ) -> [String] {
         let parentPID = "\(Darwin.getpid())"
         switch spec.id {
         case BackendCatalog.speechd.id:
-            let option = SpeechModelCatalog.defaultOption
-            var arguments = [
+            let option = speechModel ?? speechModelProvider()
+            return [
                 "--model",
                 option.repoID,
                 "--model-revision",
                 option.revision,
+                "--engine",
+                option.engine.rawValue,
                 "--port",
                 "\(spec.port)",
                 "--parent-pid",
                 parentPID,
+                "--cache-limit-mb",
+                "\(Self.speechdCacheLimitMB)",
             ]
-            // Auto (nil) omits the flag so the helper's built-in default applies.
-            if let cacheLimitMB = speechdCacheLimitProvider() {
-                arguments.append(contentsOf: ["--cache-limit-mb", "\(cacheLimitMB)"])
-            }
-            // Same Auto contract as the cache limit.
-            if let stepMilliseconds = speechdStepCadenceProvider() {
-                arguments.append(contentsOf: ["--step-ms", "\(stepMilliseconds)"])
-            }
-            return arguments
         case BackendCatalog.polishd.id:
             let repoID = polishingModelProvider()
             var arguments = [
@@ -500,11 +770,17 @@ final class BackendManager: ManagedBackendManaging {
         }
     }
 
-    private func modelPreparationRequest(for spec: ManagedBackendSpec) -> ModelPreparationRequest {
+    private func modelPreparationRequest(
+        for spec: ManagedBackendSpec,
+        speechModel: SpeechModelOption?
+    ) -> ModelPreparationRequest {
         // Keep these include patterns in sync with:
         // - mlx-audio-swift's VoxtralRealtimeModel.fromDirectory loader:
         //   config.json, every model*.safetensors file, and tekken.json.
         //   The index is included so sharded revisions remain complete.
+        //   NemotronASRModel.fromDirectory reads config.json and the
+        //   safetensors only — its vocabulary is inside config.json — so the
+        //   same list covers both speech engines.
         // - PolishHelper's loader (MLXLLM loadContainer + AutoTokenizer):
         //   config.json, generation_config.json, model*.safetensors,
         //   tokenizer.json/tokenizer_config.json, chat template *.jinja —
@@ -512,7 +788,7 @@ final class BackendManager: ManagedBackendManaging {
         //   one so existing HF snapshots stay valid.
         switch spec.id {
         case BackendCatalog.speechd.id:
-            let option = SpeechModelCatalog.defaultOption
+            let option = speechModel ?? speechModelProvider()
             return ModelPreparationRequest(
                 backendID: spec.id,
                 displayName: spec.displayName,
@@ -551,15 +827,23 @@ final class BackendManager: ManagedBackendManaging {
     }
 
     private func processEnvironment() -> [String: String] {
-        let inherited = ProcessInfo.processInfo.environment
+        Self.helperEnvironment(inherited: ProcessInfo.processInfo.environment)
+    }
+
+    static func helperEnvironment(
+        inherited: [String: String],
+        home: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> [String: String] {
         var environment: [String: String] = [:]
         for key in ["PATH", "HOME"] {
             if let value = inherited[key] {
                 environment[key] = value
             }
         }
-        // Deliberately leave Hugging Face cache variables unset: both helpers
-        // resolve the same default shared cache populated by HFModelDownloader.
+        // The cache HFModelDownloader filled, which honours HF_HUB_CACHE and
+        // HF_HOME. Both helpers read HF_HUB_CACHE first; without it they would
+        // look in the default cache whatever the app downloaded to.
+        environment["HF_HUB_CACHE"] = HFModelDownloader.defaultCacheRoot(environment: inherited, home: home).path
         return environment
     }
 

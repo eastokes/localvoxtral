@@ -19,10 +19,57 @@ public enum ClaudeRemoteEnvironmentField: String, CaseIterable, Sendable {
     case cmuxSurfaceID
     case cmuxSocketPath
     case bridgeSessionID
+    /// `$CLAUDE_CODE_HOST_SESSION_ID`, the `local_<uuid>` handle Claude Desktop
+    /// gives every Code-tab session it hosts, including one it runs on this
+    /// host over its own ssh. Compared by the desktop join arm against the
+    /// session the desktop window shows; never dialed, never a path.
+    case desktopSessionID
     case tmux
     case tmuxPane
+    /// `$STY`, GNU screen's session handle — `<pid>.<tty>.<host>`, set in every
+    /// window it spawns (screen(1), ENVIRONMENT). Published for exactly one
+    /// reason: screen is a multiplexer SERVER, so its windows inherit the
+    /// `$SSH_CONNECTION` of whichever connection started it, and the plain-ssh
+    /// arm must be able to see that this session is one of them.
+    case screenSession
+    /// `$ZELLIJ`, set inside a zellij session. Same architecture, same reason.
+    case zellijSession
     case sshTTY
+    /// `$LC_LVX_TTY` — the LOCAL terminal's tty device, exported by the user's
+    /// own shell on their Mac and carried into the session by ssh itself.
+    ///
+    /// The one allowlisted value that describes THIS machine rather than the
+    /// remote one, and the reason it can: ssh's `SendEnv`/`AcceptEnv` carry it
+    /// per SESSION CHANNEL, so it survives ProxyJump and gives two sessions
+    /// over one ControlMaster connection their own value (both measured,
+    /// 2026-09-06). `LC_` because sshd's Debian/Ubuntu/macOS default is
+    /// `AcceptEnv LANG LC_*` and libc ignores locale names it does not know —
+    /// exactly how iTerm2 ships `LC_TERMINAL`.
+    case localTTY
+    /// `$SSH_CONNECTION`, re-joined with commas by the shim — see
+    /// `ClaudeRemoteSSHConnectionReport`. sshd sets it in every session it
+    /// spawns; it is the only value either side of an ssh connection can name
+    /// that the OTHER side's kernel also knows.
+    case sshConnection
     case hookParentPID
+    /// The basename of the session's repository's main checkout, which the
+    /// shim computes with git on the host (#652). The one value that is not
+    /// read from the environment: `$LVX_PROJECT` is the shim's own variable.
+    /// It keys learned terms in place of the cwd's last component, so every
+    /// worktree of one repository shares one bucket. A label, never a path:
+    /// read it through `ClaudeSessionSnapshot.learnedTermWorkspace`, which
+    /// re-applies `ClaudeWorkspaceReference`'s label rule.
+    case project
+    /// `owner/name` of the session's repository's `origin` when it is on
+    /// github.com (#926), parsed by the shim with `capture.sh repository`.
+    /// A label like `project`: quick capture's filing target, shown to the
+    /// user before File, never a path.
+    case repository
+    /// The branch checked out in the session's cwd (#1020), from
+    /// `git symbolic-ref --short HEAD` on the host; none on a detached HEAD.
+    /// A label that names the session (`SessionDefaultNames.branch`), never
+    /// a path and never a ref the Mac passes to git.
+    case branch
 
     /// The header the shim writes, in its canonical spelling.
     ///
@@ -37,10 +84,18 @@ public enum ClaudeRemoteEnvironmentField: String, CaseIterable, Sendable {
         case .cmuxSurfaceID: return "X-Lvx-Env-Cmux-Surface-Id"
         case .cmuxSocketPath: return "X-Lvx-Env-Cmux-Socket-Path"
         case .bridgeSessionID: return "X-Lvx-Env-Bridge-Session-Id"
+        case .desktopSessionID: return "X-Lvx-Env-Desktop-Session-Id"
         case .tmux: return "X-Lvx-Env-Tmux"
         case .tmuxPane: return "X-Lvx-Env-Tmux-Pane"
+        case .screenSession: return "X-Lvx-Env-Screen-Session"
+        case .zellijSession: return "X-Lvx-Env-Zellij-Session"
         case .sshTTY: return "X-Lvx-Env-Ssh-Tty"
+        case .localTTY: return "X-Lvx-Env-Local-Tty"
+        case .sshConnection: return "X-Lvx-Env-Ssh-Connection"
         case .hookParentPID: return "X-Lvx-Env-Hook-Parent-Pid"
+        case .project: return "X-Lvx-Env-Project"
+        case .repository: return "X-Lvx-Env-Repository"
+        case .branch: return "X-Lvx-Env-Branch"
         }
     }
 
@@ -58,10 +113,18 @@ public enum ClaudeRemoteEnvironmentField: String, CaseIterable, Sendable {
         case .cmuxSurfaceID: return "$CMUX_SURFACE_ID"
         case .cmuxSocketPath: return "$CMUX_SOCKET_PATH"
         case .bridgeSessionID: return "$CLAUDE_CODE_BRIDGE_SESSION_ID"
+        case .desktopSessionID: return "$CLAUDE_CODE_HOST_SESSION_ID"
         case .tmux: return "$TMUX"
         case .tmuxPane: return "$TMUX_PANE"
+        case .screenSession: return "$STY"
+        case .zellijSession: return "$ZELLIJ"
         case .sshTTY: return "$SSH_TTY"
+        case .localTTY: return "$LC_LVX_TTY"
+        case .sshConnection: return "$SSH_CONNECTION"
         case .hookParentPID: return "$PPID"
+        case .project: return "$LVX_PROJECT"
+        case .repository: return "$LVX_REPOSITORY"
+        case .branch: return "$LVX_BRANCH"
         }
     }
 }
@@ -78,14 +141,17 @@ public struct ClaudeRemoteEnvironmentLimits: Sendable, Equatable {
     public var maxValueBytes: Int
     /// Max values retained from one request. The allowlist is smaller than this
     /// today, which is the point: the cap is a belt that survives someone
-    /// growing the allowlist without revisiting the budget.
+    /// growing the allowlist without revisiting the budget. It has to STAY
+    /// above it — a cap at or below the field count silently drops whatever
+    /// sorts last in `allCases`, which is a join arm that quietly never fires.
+    /// `ClaudeRemoteSessionEnvironmentCodecTests` pins the relationship.
     public var maxFieldCount: Int
     /// Max total UTF-8 bytes across all retained values.
     public var maxTotalBytes: Int
 
     public init(
         maxValueBytes: Int = 200,
-        maxFieldCount: Int = 12,
+        maxFieldCount: Int = 20,
         maxTotalBytes: Int = 1024
     ) {
         self.maxValueBytes = maxValueBytes
@@ -125,12 +191,39 @@ public struct ClaudeRemoteSessionEnvironment: Sendable, Equatable {
     public var cmuxSurfaceID: String?
     public var cmuxSocketPath: String?
     public var bridgeSessionID: String?
+    /// Claude Desktop's `local_<uuid>` session handle. A label like the bridge
+    /// id: the desktop app allocates it, and the only thing done with it is an
+    /// equality test against the session the desktop window shows.
+    public var desktopSessionID: String?
     public var tmux: String?
     public var tmuxPane: String?
+    /// GNU screen's `$STY`. A multiplexer label like the tmux pair: never a
+    /// path, never dialed, and read only to REFUSE a join.
+    public var screenSession: String?
+    /// zellij's `$ZELLIJ`. Same.
+    public var zellijSession: String?
     public var sshTTY: String?
+    /// The CLIENT terminal's tty, as the user's own shell exported it. Still
+    /// untrusted — it is a string a remote host wrote — but it is a string the
+    /// remote host received rather than invented, and the arm that reads it
+    /// pins it to the enrolled host the surface's ssh actually goes to.
+    /// Validate with `ClaudeRemoteLocalTTYPath.isAcceptable` before comparing.
+    public var localTTY: String?
+    /// `$SSH_CONNECTION` with its four space-separated fields re-joined by
+    /// commas (space is deliberately outside the header charset). Parse it with
+    /// `ClaudeRemoteSSHConnectionReport.parse` — never split it by hand, and
+    /// never treat it as an address to dial.
+    public var sshConnection: String?
     /// The remote shim's `$PPID` — Claude Code's pid ON THAT HOST. Diagnostics
     /// and cross-checks against another remote report only; never a local pid.
     public var hookParentPID: String?
+    /// The host's name for the session's repository (`X-Lvx-Env-Project`).
+    public var project: String?
+    /// The host's `origin` on GitHub, `owner/name` (`X-Lvx-Env-Repository`).
+    public var repository: String?
+    /// The branch the host has checked out (`X-Lvx-Env-Branch`). A name to
+    /// show, nothing more.
+    public var branch: String?
 
     public init(
         herdrPaneID: String? = nil,
@@ -139,10 +232,18 @@ public struct ClaudeRemoteSessionEnvironment: Sendable, Equatable {
         cmuxSurfaceID: String? = nil,
         cmuxSocketPath: String? = nil,
         bridgeSessionID: String? = nil,
+        desktopSessionID: String? = nil,
         tmux: String? = nil,
         tmuxPane: String? = nil,
+        screenSession: String? = nil,
+        zellijSession: String? = nil,
         sshTTY: String? = nil,
-        hookParentPID: String? = nil
+        localTTY: String? = nil,
+        sshConnection: String? = nil,
+        hookParentPID: String? = nil,
+        project: String? = nil,
+        repository: String? = nil,
+        branch: String? = nil
     ) {
         self.herdrPaneID = herdrPaneID
         self.herdrSocketPath = herdrSocketPath
@@ -150,10 +251,18 @@ public struct ClaudeRemoteSessionEnvironment: Sendable, Equatable {
         self.cmuxSurfaceID = cmuxSurfaceID
         self.cmuxSocketPath = cmuxSocketPath
         self.bridgeSessionID = bridgeSessionID
+        self.desktopSessionID = desktopSessionID
         self.tmux = tmux
         self.tmuxPane = tmuxPane
+        self.screenSession = screenSession
+        self.zellijSession = zellijSession
         self.sshTTY = sshTTY
+        self.localTTY = localTTY
+        self.sshConnection = sshConnection
         self.hookParentPID = hookParentPID
+        self.project = project
+        self.repository = repository
+        self.branch = branch
     }
 
     public var isEmpty: Bool {
@@ -171,10 +280,18 @@ public struct ClaudeRemoteSessionEnvironment: Sendable, Equatable {
             case .cmuxSurfaceID: return cmuxSurfaceID
             case .cmuxSocketPath: return cmuxSocketPath
             case .bridgeSessionID: return bridgeSessionID
+            case .desktopSessionID: return desktopSessionID
             case .tmux: return tmux
             case .tmuxPane: return tmuxPane
+            case .screenSession: return screenSession
+            case .zellijSession: return zellijSession
             case .sshTTY: return sshTTY
+            case .localTTY: return localTTY
+            case .sshConnection: return sshConnection
             case .hookParentPID: return hookParentPID
+            case .project: return project
+            case .repository: return repository
+            case .branch: return branch
             }
         }
         set {
@@ -185,10 +302,18 @@ public struct ClaudeRemoteSessionEnvironment: Sendable, Equatable {
             case .cmuxSurfaceID: cmuxSurfaceID = newValue
             case .cmuxSocketPath: cmuxSocketPath = newValue
             case .bridgeSessionID: bridgeSessionID = newValue
+            case .desktopSessionID: desktopSessionID = newValue
             case .tmux: tmux = newValue
             case .tmuxPane: tmuxPane = newValue
+            case .screenSession: screenSession = newValue
+            case .zellijSession: zellijSession = newValue
             case .sshTTY: sshTTY = newValue
+            case .localTTY: localTTY = newValue
+            case .sshConnection: sshConnection = newValue
             case .hookParentPID: hookParentPID = newValue
+            case .project: project = newValue
+            case .repository: repository = newValue
+            case .branch: branch = newValue
             }
         }
     }

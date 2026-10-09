@@ -1,39 +1,56 @@
 import Foundation
 import XCTest
+import localvoxtralTestSupport
 @testable import localvoxtral
 
+/// The microphone half of the live STT lane's suite. The realtime client half
+/// is the core suite's class of the same name, which also runs on Linux; the
+/// shared name keeps `--filter RealtimeAPIVLLMIntegrationTests` running both.
 final class RealtimeAPIVLLMIntegrationTests: XCTestCase {
-    private static let enableEnv = "VLLM_REALTIME_TEST_ENABLE"
-    private static let endpointEnv = "VLLM_REALTIME_TEST_ENDPOINT"
-    private static let modelEnv = "VLLM_REALTIME_TEST_MODEL"
-    private static let apiKeyEnv = "VLLM_REALTIME_TEST_API_KEY"
     private static let micCaptureEnableEnv = "LOCALVOXTRAL_MIC_CAPTURE_TEST_ENABLE"
     private static let micCaptureDeviceEnv = "LOCALVOXTRAL_MIC_CAPTURE_DEVICE_UID"
 
-    private func integrationConfiguration() throws -> RealtimeSessionConfiguration {
+    /// A voice memo as a phone Shortcut saves it (AAC in .m4a) through the
+    /// app's decoder and the file transcriber into the live speech engine
+    /// (#925): the words come back, and faster than the audio lasts.
+    func testAVoiceMemoFileIsTranscribedThroughTheLiveEngine() async throws {
         let env = ProcessInfo.processInfo.environment
-        guard env[Self.enableEnv] == "1" else {
-            throw XCTSkip(
-                """
-                vLLM realtime integration tests are disabled.
-                Enable with \(Self.enableEnv)=1.
-                Optional env vars:
-                  \(Self.endpointEnv)=ws://127.0.0.1:8000/v1/realtime
-                  \(Self.modelEnv)=mistralai/Voxtral-Mini-4B-Realtime-2602
-                  \(Self.apiKeyEnv)=<api-key>
-                """
-            )
+        guard env["VLLM_REALTIME_TEST_ENABLE"] == "1" else {
+            throw XCTSkip("Live engine test is disabled. Enable with VLLM_REALTIME_TEST_ENABLE=1.")
+        }
+        let endpoint = try XCTUnwrap(URL(string: env["VLLM_REALTIME_TEST_ENDPOINT"] ?? "ws://127.0.0.1:8000/v1/realtime"))
+        let configuration = RealtimeSessionConfiguration(
+            endpoint: endpoint,
+            apiKey: env["VLLM_REALTIME_TEST_API_KEY"] ?? "",
+            model: env["VLLM_REALTIME_TEST_MODEL"] ?? "mistralai/Voxtral-Mini-4B-Realtime-2602"
+        )
+        // The memo's bound covers transcription, not the service's first answer.
+        let warmUp = try await LiveSTTWarmUp.once(configuration: configuration)
+        let phrase = "remember to add a retry button to the inbox page. "
+            + "it should only show when filing failed, and it keeps the draft as it is."
+        let memo = FileManager.default.temporaryDirectory
+            .appendingPathComponent("voice-memo-\(UUID().uuidString).m4a")
+        defer { try? FileManager.default.removeItem(at: memo) }
+        let say = Process()
+        say.executableURL = URL(fileURLWithPath: "/usr/bin/say")
+        say.arguments = ["-o", memo.path, "--file-format=m4af", "--data-format=aac", phrase]
+        try say.run()
+        say.waitUntilExit()
+        guard say.terminationStatus == 0 else {
+            throw SpokenAudioFailure(description: "say could not write an m4a (status \(say.terminationStatus))")
         }
 
-        let endpointString = env[Self.endpointEnv] ?? "ws://127.0.0.1:8000/v1/realtime"
-        guard let endpoint = URL(string: endpointString) else {
-            throw XCTSkip("Invalid \(Self.endpointEnv): \(endpointString)")
-        }
-
-        let model = env[Self.modelEnv] ?? "mistralai/Voxtral-Mini-4B-Realtime-2602"
-        let apiKey = env[Self.apiKeyEnv] ?? env["OPENAI_API_KEY"] ?? ""
-
-        return .init(endpoint: endpoint, apiKey: apiKey, model: model)
+        let pcm = try VoiceMemoAudioDecoder.pcm16(from: memo)
+        let audioSeconds = Double(pcm.count) / Double(AudioChunkBuffer.bytesPerSecond)
+        let started = ContinuousClock.now
+        let text = try await RealtimeFileTranscriber(makeClient: { RealtimeAPIWebSocketClient() })
+            .transcribe(pcm16: pcm, configuration: configuration)
+        let elapsed = ContinuousClock.now - started
+        let accuracy = IntegrationTestSupport.wordAccuracy(expected: phrase, actual: text)
+        print(
+            "voice memo integration: \(String(format: "%.1f", audioSeconds)) s of audio in \(elapsed) "
+                + "after a \(warmUp) warm-up, word accuracy \(String(format: "%.3f", accuracy)); transcript: \(text)")
+        XCTAssertGreaterThanOrEqual(accuracy, 0.55, "Transcript: \(text)")
     }
 
     func testMicrophoneCaptureProducesPCM16Chunks() async throws {
@@ -139,201 +156,6 @@ final class RealtimeAPIVLLMIntegrationTests: XCTestCase {
         }
     }
 
-    func testVLLMHandshakeAndDisconnectCycle() async throws {
-        let configuration = try integrationConfiguration()
-        let client = RealtimeAPIWebSocketClient()
-
-        let connected = expectation(description: "connected")
-        let sessionReady = expectation(description: "session ready")
-        let disconnected = expectation(description: "disconnected")
-        let realtimeError = expectation(description: "realtime error")
-        realtimeError.isInverted = true
-
-        client.setEventHandler { event in
-            switch event {
-            case .connected:
-                connected.fulfill()
-            case .status(let message):
-                if message.localizedCaseInsensitiveContains("session ready") {
-                    sessionReady.fulfill()
-                }
-            case .error:
-                realtimeError.fulfill()
-            case .disconnected:
-                disconnected.fulfill()
-            default:
-                break
-            }
-        }
-
-        try client.connect(configuration: configuration)
-        await fulfillment(of: [connected, sessionReady], timeout: 20.0)
-
-        client.disconnect()
-        await fulfillment(of: [disconnected], timeout: 5.0)
-        await fulfillment(of: [realtimeError], timeout: 0.2)
-    }
-
-    func testVLLMClientCanReconnectAcrossTwoCycles() async throws {
-        let configuration = try integrationConfiguration()
-        let client = RealtimeAPIWebSocketClient()
-
-        try await runHandshakeCycle(client: client, configuration: configuration)
-        try await runHandshakeCycle(client: client, configuration: configuration)
-    }
-
-    func testVLLMDisconnectWithPendingAudio() async throws {
-        let configuration = try integrationConfiguration()
-        let client = RealtimeAPIWebSocketClient()
-
-        let connected = expectation(description: "connected")
-        let sessionReady = expectation(description: "session ready")
-        let disconnected = expectation(description: "disconnected")
-        let realtimeError = expectation(description: "realtime error")
-        realtimeError.isInverted = true
-
-        client.setEventHandler { event in
-            switch event {
-            case .connected:
-                connected.fulfill()
-            case .status(let message):
-                if message.localizedCaseInsensitiveContains("session ready") {
-                    sessionReady.fulfill()
-                }
-            case .error:
-                realtimeError.fulfill()
-            case .disconnected:
-                disconnected.fulfill()
-            default:
-                break
-            }
-        }
-
-        try client.connect(configuration: configuration)
-        await fulfillment(of: [connected, sessionReady], timeout: 20.0)
-
-        client.sendAudioChunk(makeSineWavePCM16Chunk())
-        client.disconnect()
-
-        await fulfillment(of: [disconnected], timeout: 5.0)
-        await fulfillment(of: [realtimeError], timeout: 0.5)
-    }
-
-    /// End-to-end quality check that enforces minimum transcript accuracy
-    /// for synthetic spoken audio streamed over the realtime websocket client.
-    func testVLLMProcessesSpokenSyntheticAudio_meetsExpectedAccuracy() async throws {
-        let configuration = try integrationConfiguration()
-        let longPhrase = [
-            "hello from localvoxtral realtime test.",
-            "this is a longer synthetic audio passage for integration testing.",
-            "we are verifying that the vllm realtime server performs generation and returns transcript text.",
-            "the websocket client sends pcm sixteen audio at sixteen kilohertz in sequential chunks.",
-            "if this transcript is non empty, end to end processing is confirmed.",
-        ].joined(separator: " ")
-        let spokenPCM16 = try makeSpokenPCM16Data(phrase: longPhrase)
-        XCTAssertGreaterThan(
-            spokenPCM16.count,
-            100_000,
-            "Expected a longer spoken synthetic audio clip for this test."
-        )
-        let spokenChunks = IntegrationTestSupport.splitPCM16IntoChunks(spokenPCM16, chunkSizeBytes: 3_200)
-        let client = RealtimeAPIWebSocketClient()
-        let finalTexts = NSLockingStringCollector()
-
-        let connected = expectation(description: "connected")
-        let sessionReady = expectation(description: "session ready")
-        let finalTranscript = expectation(description: "final transcript")
-        finalTranscript.assertForOverFulfill = false
-        let disconnected = expectation(description: "disconnected")
-        let realtimeError = expectation(description: "realtime error")
-        realtimeError.isInverted = true
-
-        client.setEventHandler { event in
-            switch event {
-            case .connected:
-                connected.fulfill()
-                // Safe to enqueue before session.created; client gates outbound sends
-                // until session readiness.
-                for chunk in spokenChunks {
-                    client.sendAudioChunk(chunk)
-                }
-                client.sendCommit(final: false)
-                client.sendCommit(final: true)
-            case .status(let message):
-                guard message.localizedCaseInsensitiveContains("session ready") else { return }
-                sessionReady.fulfill()
-            case .finalTranscript(let text):
-                let normalized = text.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !normalized.isEmpty else { return }
-                finalTexts.append(normalized)
-                finalTranscript.fulfill()
-            case .error:
-                realtimeError.fulfill()
-            case .disconnected:
-                disconnected.fulfill()
-            default:
-                break
-            }
-        }
-
-        try client.connect(configuration: configuration)
-        await fulfillment(of: [connected, sessionReady, finalTranscript], timeout: 60.0)
-        try await Task.sleep(for: .seconds(2))
-
-        client.disconnect()
-        await fulfillment(of: [disconnected], timeout: 5.0)
-        await fulfillment(of: [realtimeError], timeout: 0.2)
-
-        let combinedFinalTranscript = finalTexts.snapshot().joined(separator: " ")
-        let wordAccuracy = IntegrationTestSupport.wordAccuracy(
-            expected: longPhrase,
-            actual: combinedFinalTranscript
-        )
-        print(
-            "speechd integration: word accuracy \(String(format: "%.3f", wordAccuracy)); "
-                + "transcript: \(combinedFinalTranscript)"
-        )
-        XCTAssertGreaterThanOrEqual(
-            wordAccuracy,
-            0.55,
-            "Expected synthetic-audio transcript accuracy >= 0.55. Transcript: \(combinedFinalTranscript)"
-        )
-    }
-
-    private func runHandshakeCycle(
-        client: RealtimeAPIWebSocketClient,
-        configuration: RealtimeSessionConfiguration
-    ) async throws {
-        let connected = expectation(description: "connected")
-        let sessionReady = expectation(description: "session ready")
-        let disconnected = expectation(description: "disconnected")
-        let realtimeError = expectation(description: "realtime error")
-        realtimeError.isInverted = true
-
-        client.setEventHandler { event in
-            switch event {
-            case .connected:
-                connected.fulfill()
-            case .status(let message):
-                if message.localizedCaseInsensitiveContains("session ready") {
-                    sessionReady.fulfill()
-                }
-            case .error:
-                realtimeError.fulfill()
-            case .disconnected:
-                disconnected.fulfill()
-            default:
-                break
-            }
-        }
-
-        try client.connect(configuration: configuration)
-        await fulfillment(of: [connected, sessionReady], timeout: 20.0)
-        client.disconnect()
-        await fulfillment(of: [disconnected], timeout: 5.0)
-        await fulfillment(of: [realtimeError], timeout: 0.2)
-    }
-
     private func ensureMicrophoneAuthorization(_ microphone: MicrophoneCaptureService) async throws {
         switch microphone.authorizationStatus() {
         case .authorized:
@@ -430,56 +252,6 @@ final class RealtimeAPIVLLMIntegrationTests: XCTestCase {
         let transientCodes: Set<Int> = [-10_868, 560_227_702]
         return transientCodes.contains(nsError.code)
     }
-
-    private func makeSineWavePCM16Chunk() -> Data {
-        let sampleRate = 16_000.0
-        let frequency = 440.0
-        let duration = 0.2
-        let amplitude = 12_000.0
-        let frameCount = Int(sampleRate * duration)
-
-        var samples = [Int16]()
-        samples.reserveCapacity(frameCount)
-        for index in 0 ..< frameCount {
-            let time = Double(index) / sampleRate
-            let value = sin(2 * .pi * frequency * time) * amplitude
-            samples.append(Int16(clamping: Int(value)).littleEndian)
-        }
-
-        return samples.withUnsafeBytes { Data($0) }
-    }
-
-    private func makeSpokenPCM16Data(phrase: String) throws -> Data {
-        let tempURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("svxt-tts-\(UUID().uuidString)")
-            .appendingPathExtension("wav")
-
-        defer {
-            try? FileManager.default.removeItem(at: tempURL)
-        }
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/say")
-        process.arguments = [
-            "-o", tempURL.path,
-            "--file-format=WAVE",
-            "--data-format=LEI16@16000",
-            phrase,
-        ]
-
-        do {
-            try process.run()
-        } catch {
-            throw XCTSkip("Failed to execute /usr/bin/say for spoken-audio integration test: \(error.localizedDescription)")
-        }
-        process.waitUntilExit()
-
-        guard process.terminationStatus == 0 else {
-            throw XCTSkip("System TTS (say) failed with status \(process.terminationStatus).")
-        }
-
-        return try IntegrationTestSupport.extractPCMDataFromWAV(at: tempURL)
-    }
 }
 
 private final class NSLockingCounter: @unchecked Sendable {
@@ -496,22 +268,5 @@ private final class NSLockingCounter: @unchecked Sendable {
         lock.lock()
         storage += amount
         lock.unlock()
-    }
-}
-
-private final class NSLockingStringCollector: @unchecked Sendable {
-    private let lock = NSLock()
-    private var values: [String] = []
-
-    func append(_ value: String) {
-        lock.lock()
-        values.append(value)
-        lock.unlock()
-    }
-
-    func snapshot() -> [String] {
-        lock.lock()
-        defer { lock.unlock() }
-        return values
     }
 }

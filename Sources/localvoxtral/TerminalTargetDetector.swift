@@ -14,9 +14,12 @@ enum TerminalTargetDetector {
     enum Reason: String, Sendable {
         /// The frontmost app's bundle ID is on the built-in terminal allowlist.
         case bundleMatch = "bundle-match"
-        /// The frontmost app's bundle ID is in the user's terminal_apps.toml
-        /// list (apps that embed a terminal the built-in detection misses).
+        /// The frontmost app's bundle ID is in the user's added-apps list
+        /// (Settings → Terminals; formerly `terminal_apps.toml`).
         case userBundleMatch = "user-bundle-match"
+        /// The frontmost app is a known text-field app whose AX probe answers
+        /// differently from one dictation to the next (`textFieldBundleIDs`).
+        case textFieldBundleMatch = "text-field-bundle-match"
         /// Unknown bundle, Accessibility trust present, and confirmed that
         /// nothing has AX focus.
         case axProbeNoFocusedElement = "ax-probe-no-focus"
@@ -81,6 +84,16 @@ enum TerminalTargetDetector {
         "dev.warp.Warp",
     ]
 
+    /// Apps whose prompt is a text field but whose AX probe cannot be trusted
+    /// to say so. Claude Desktop (Electron) builds its accessibility tree only
+    /// after an assistive client sets `AXManualAccessibility`, which the join
+    /// read does AFTER this verdict, and a dictation with session context off
+    /// never does: the probe then finds no text field, and the first dictation
+    /// after the app launches would be judged a terminal (#660).
+    private static let textFieldBundleIDs: Set<String> = [
+        ClaudeDesktopAllowlist.bundleID,
+    ]
+
     /// Pure allowlist check: exact match first, then known channel prefixes.
     static func isTerminalLikeBundleID(_ bundleID: String?) -> Bool {
         guard let bundleID, !bundleID.isEmpty else { return false }
@@ -89,11 +102,12 @@ enum TerminalTargetDetector {
     }
 
     /// Core decision: built-in allowlist first, then the user's
-    /// terminal_apps.toml bundle IDs; for unknown bundles fall back to the
+    /// added-apps bundle IDs, then the known text-field apps; for unknown
+    /// bundles fall back to the
     /// AX probe — a confirmed-missing focused element or a confirmed
     /// unsettable value attribute read as terminal-like, while an
     /// inconclusive probe does not. The probe closure is only invoked when
-    /// the bundle is unknown to both lists.
+    /// the bundle is on none of the lists.
     static func decision(
         forBundleID bundleID: String?,
         userBundleIDs: Set<String> = [],
@@ -104,6 +118,9 @@ enum TerminalTargetDetector {
         }
         if let bundleID, userBundleIDs.contains(bundleID) {
             return Decision(isTerminalLike: true, reason: .userBundleMatch)
+        }
+        if let bundleID, textFieldBundleIDs.contains(bundleID) {
+            return Decision(isTerminalLike: false, reason: .textFieldBundleMatch)
         }
         switch focusedElementProbe() {
         case .noFocusedElement:
@@ -131,6 +148,15 @@ enum TerminalTargetDetector {
         return verdict
     }
 
+    /// The same verdict for the target focused right now, without the
+    /// session-start log line: re-checked mid-session before a newline is
+    /// typed (`LiveTerminalNewlineGuard`).
+    static func isCurrentTargetTerminalLike(userBundleIDs: Set<String> = []) -> Bool {
+        decision(forBundleID: currentFrontmostBundleID(), userBundleIDs: userBundleIDs) {
+            probeFocusedElementLive()
+        }.isTerminalLike
+    }
+
     /// True when macOS Secure Keyboard Entry is active (e.g. Ghostty around
     /// password prompts, or enabled manually in Terminal.app/iTerm2). It
     /// blocks synthetic keyboard events, so dictated text silently lands
@@ -145,7 +171,9 @@ enum TerminalTargetDetector {
         return IsSecureEventInputEnabled()
     }
 
-    private static func currentFrontmostBundleID() -> String? {
+    /// The frontmost app's bundle ID. Pinned under XCTest like the other
+    /// live reads (`debugFrontmostBundleIDOverride`, nil by default).
+    static func currentFrontmostBundleID() -> String? {
         #if DEBUG
         if let override = debugFrontmostBundleIDOverride {
             return override()

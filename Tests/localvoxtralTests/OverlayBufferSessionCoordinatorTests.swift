@@ -199,6 +199,28 @@ final class OverlayBufferSessionCoordinatorTests: XCTestCase {
         )
     }
 
+    /// #1074: levels move the bars while the user speaks, and never
+    /// re-render the panel, which would re-measure it 30 times a second.
+    func testMicLevelsReachTheBarsOnlyWhileListeningAndRenderNothing() {
+        let renderer = MockOverlayRenderer()
+        let coordinator = OverlayBufferSessionCoordinator(
+            stateMachine: OverlayBufferStateMachine(),
+            renderer: renderer,
+            anchorResolver: MockOverlayAnchorResolver()
+        )
+        coordinator.updateMicLevel(0.2)
+        coordinator.startSession()
+        let renders = renderer.snapshots.count
+        coordinator.updateMicLevel(0.5)
+        coordinator.updateMicLevel(0.8)
+        XCTAssertEqual(renderer.micLevels, [0.5, 0.8], "none before the session")
+        XCTAssertEqual(renderer.snapshots.count, renders, "a level renders no snapshot")
+
+        coordinator.beginFinalizing(displayBufferText: "hi", commitBufferText: "hi")
+        coordinator.updateMicLevel(0.9)
+        XCTAssertEqual(renderer.micLevels, [0.5, 0.8], "the mic is off once the dictation stops")
+    }
+
     func testCommitUsesPIDCapturedAtStopTime() {
         let renderer = MockOverlayRenderer()
         let anchorResolver = MockOverlayAnchorResolver()
@@ -230,56 +252,39 @@ final class OverlayBufferSessionCoordinatorTests: XCTestCase {
         XCTAssertEqual(committer.insertPreferredPIDs.first ?? nil, 111)
     }
 
-    func testCommitWithAutoCopyCopiesTextToPasteboard() {
-        let renderer = MockOverlayRenderer()
-        let anchorResolver = MockOverlayAnchorResolver()
-        var copiedTexts: [String] = []
-        let coordinator = OverlayBufferSessionCoordinator(
-            stateMachine: OverlayBufferStateMachine(),
-            renderer: renderer,
-            anchorResolver: anchorResolver,
-            copyToPasteboard: { copiedTexts.append($0); return true }
-        )
-        let committer = MockOverlayTextCommitter()
-        committer.insertResult = .insertedByAccessibility
+    func testCommitCopiesToPasteboardOnlyWhenAutoCopyIsEnabled() {
+        let rows: [(autoCopyEnabled: Bool, expectedCopiedTexts: [String])] = [
+            (autoCopyEnabled: true, expectedCopiedTexts: ["copy me"]),
+            (autoCopyEnabled: false, expectedCopiedTexts: []),
+        ]
+        for row in rows {
+            let renderer = MockOverlayRenderer()
+            let anchorResolver = MockOverlayAnchorResolver()
+            var copiedTexts: [String] = []
+            let coordinator = OverlayBufferSessionCoordinator(
+                stateMachine: OverlayBufferStateMachine(),
+                renderer: renderer,
+                anchorResolver: anchorResolver,
+                copyToPasteboard: { copiedTexts.append($0); return true }
+            )
+            let committer = MockOverlayTextCommitter()
+            committer.insertResult = .insertedByAccessibility
 
-        anchorResolver.focusedPID = 111
-        coordinator.startSession()
-        coordinator.beginFinalizing(
-            displayBufferText: "copy me",
-            commitBufferText: "copy me"
-        )
+            anchorResolver.focusedPID = 111
+            coordinator.startSession()
+            coordinator.beginFinalizing(
+                displayBufferText: "copy me",
+                commitBufferText: "copy me"
+            )
 
-        let outcome = coordinator.commitIfNeeded(using: committer, autoCopyEnabled: true)
+            let outcome = coordinator.commitIfNeeded(using: committer, autoCopyEnabled: row.autoCopyEnabled)
 
-        XCTAssertEqual(outcome, .succeeded)
-        XCTAssertEqual(copiedTexts, ["copy me"])
-    }
-
-    func testCommitWithAutoCopyDisabledDoesNotCopyToPasteboard() {
-        let renderer = MockOverlayRenderer()
-        let anchorResolver = MockOverlayAnchorResolver()
-        var copiedTexts: [String] = []
-        let coordinator = OverlayBufferSessionCoordinator(
-            stateMachine: OverlayBufferStateMachine(),
-            renderer: renderer,
-            anchorResolver: anchorResolver,
-            copyToPasteboard: { copiedTexts.append($0); return true }
-        )
-        let committer = MockOverlayTextCommitter()
-        committer.insertResult = .insertedByAccessibility
-
-        anchorResolver.focusedPID = 111
-        coordinator.startSession()
-        coordinator.beginFinalizing(
-            displayBufferText: "do not copy",
-            commitBufferText: "do not copy"
-        )
-
-        let outcome = coordinator.commitIfNeeded(using: committer, autoCopyEnabled: false)
-
-        XCTAssertEqual(outcome, .succeeded)
-        XCTAssertTrue(copiedTexts.isEmpty)
+            XCTAssertEqual(outcome, .succeeded, "auto copy enabled: \(row.autoCopyEnabled)")
+            XCTAssertEqual(
+                copiedTexts, row.expectedCopiedTexts,
+                "auto copy enabled: \(row.autoCopyEnabled)"
+            )
+        }
     }
 
     func testResetHidesRenderer() {
@@ -563,37 +568,6 @@ final class OverlayBufferSessionCoordinatorTests: XCTestCase {
 
         XCTAssertEqual(requestedSleeps, [.seconds(0.05)])
         XCTAssertEqual(renderer.hideCallCount, 1)
-    }
-}
-
-@MainActor
-private final class MockOverlayRenderer: OverlayBufferRendering {
-    var snapshots: [OverlayBufferStateMachine.Snapshot?] = []
-    var hideCallCount = 0
-
-    func render(snapshot: OverlayBufferStateMachine.Snapshot?) {
-        snapshots.append(snapshot)
-    }
-
-    func hide() {
-        hideCallCount += 1
-    }
-}
-
-@MainActor
-private final class MockOverlayAnchorResolver: OverlayAnchorResolving {
-    var focusedPID: pid_t?
-    var anchor = OverlayAnchor(
-        targetRect: CGRect(x: 0, y: 0, width: 80, height: 24),
-        source: .windowCenter
-    )
-
-    func resolveAnchor() -> OverlayAnchor {
-        anchor
-    }
-
-    func resolveFrontmostAppPID() -> pid_t? {
-        focusedPID
     }
 }
 

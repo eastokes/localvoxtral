@@ -3,7 +3,7 @@ import XCTest
 @testable import PolishHelperCore
 
 private final class StubResponder: ChatResponding, @unchecked Sendable {
-    let result: Result<String, Error>
+    let result: Result<ChatReply, Error>
     private(set) var received:
         (
             messages: [ChatCompletionMessage],
@@ -11,7 +11,7 @@ private final class StubResponder: ChatResponding, @unchecked Sendable {
             sampling: ChatSamplingParameters
         )?
 
-    init(result: Result<String, Error> = .success("polished")) {
+    init(result: Result<ChatReply, Error> = .success(ChatReply(content: "polished"))) {
         self.result = result
     }
 
@@ -19,9 +19,14 @@ private final class StubResponder: ChatResponding, @unchecked Sendable {
         to messages: [ChatCompletionMessage],
         chatTemplateArguments: [String: ChatTemplateArgumentValue]?,
         sampling: ChatSamplingParameters
-    ) async throws -> String {
+    ) async throws -> ChatReply {
         received = (messages, chatTemplateArguments, sampling)
         return try result.get()
+    }
+
+    /// One token per whitespace-separated word.
+    func tokenCount(of text: String) async throws -> Int {
+        text.split(whereSeparator: \.isWhitespace).count
     }
 }
 
@@ -30,19 +35,42 @@ final class PolishdRouterTests: XCTestCase {
         HTTPRequest(method: "POST", path: "/v1/chat/completions", body: Data(json.utf8))
     }
 
-    func testHealthAnswersOK() async {
+    func testTokenizeCountsTheTextWithTheModelsTokenizer() async throws {
+        let router = PolishdRouter(responder: StubResponder(), modelName: "m")
+        let response = await router.handle(
+            HTTPRequest(method: "POST", path: "/v1/tokenize", body: Data(#"{"text": "Global terms: Qwen, vLLM"}"#.utf8)))
+
+        XCTAssertEqual(response.status, 200)
+        let decoded = try JSONSerialization.jsonObject(with: response.body) as? [String: Int]
+        XCTAssertEqual(decoded, ["tokens": 4])
+    }
+
+    func testTokenizeRefusesABodyWithoutText() async {
+        let router = PolishdRouter(responder: StubResponder(), modelName: "m")
+        let post = await router.handle(HTTPRequest(method: "POST", path: "/v1/tokenize", body: Data("{}".utf8)))
+        let get = await router.handle(HTTPRequest(method: "GET", path: "/v1/tokenize"))
+
+        XCTAssertEqual(post.status, 400)
+        XCTAssertEqual(get.status, 405)
+    }
+
+    /// The supervisor compares the pid with the child it launched (#1786).
+    func testHealthAnswersOKWithTheHelpersPID() async throws {
         let router = PolishdRouter(responder: StubResponder(), modelName: "m")
         let response = await router.handle(HTTPRequest(method: "GET", path: "/health"))
         XCTAssertEqual(response.status, 200)
+        let body = try XCTUnwrap(JSONSerialization.jsonObject(with: response.body) as? [String: Any])
+        XCTAssertEqual(body["status"] as? String, "ok")
+        XCTAssertEqual(body["pid"] as? Int, Int(ProcessInfo.processInfo.processIdentifier))
     }
 
     func testChatCompletionRoundTripsContentAndParameters() async throws {
-        let responder = StubResponder(result: .success("cleaned text"))
+        let responder = StubResponder(result: .success(ChatReply(content: "cleaned text")))
         let router = PolishdRouter(responder: responder, modelName: "test-model")
         let response = await router.handle(
             chatRequest(
                 """
-                {"model": "x", "temperature": 0.3,
+                {"model": "test-model", "temperature": 0.3,
                  "messages": [{"role": "system", "content": "sys"},
                               {"role": "user", "content": "raw one"},
                               {"role": "user", "content": "raw two"}]}
@@ -54,12 +82,82 @@ final class PolishdRouterTests: XCTestCase {
         let decoded = try JSONDecoder().decode(ChatCompletionResponse.self, from: response.body)
         XCTAssertEqual(decoded.choices.first?.message.content, "cleaned text")
         XCTAssertEqual(decoded.choices.first?.finishReason, "stop")
-        XCTAssertEqual(decoded.model, "x")
+        XCTAssertEqual(decoded.model, "test-model")
         XCTAssertEqual(responder.received?.messages.count, 3)
         XCTAssertEqual(responder.received?.messages[1].content, "raw one")
         XCTAssertNil(responder.received?.chatTemplateArguments)
         XCTAssertEqual(responder.received?.sampling.temperature, 0.3)
         XCTAssertNil(responder.received?.sampling.maxTokens)
+        XCTAssertNil(decoded.timings)
+    }
+
+    /// A request naming another model than the one loaded is refused before
+    /// generation: the loaded model would answer under the requested name
+    /// (#1591).
+    func testAMismatchedModelIsRejectedBeforeGeneration() async throws {
+        let responder = StubResponder()
+        let router = PolishdRouter(responder: responder, modelName: "loaded-model")
+        let response = await router.handle(
+            chatRequest(#"{"model": "other-model", "messages": [{"role": "user", "content": "x"}]}"#)
+        )
+
+        XCTAssertEqual(response.status, 400)
+        XCTAssertNil(responder.received, "the responder is never called")
+        let body = String(decoding: response.body, as: UTF8.self)
+        XCTAssertTrue(body.contains("loaded-model"), body)
+    }
+
+    /// No model, or an empty one, is answered by the loaded model under its
+    /// own name.
+    func testAnOmittedModelIsAnsweredUnderTheLoadedName() async throws {
+        let router = PolishdRouter(responder: StubResponder(), modelName: "loaded-model")
+        for body in [
+            #"{"messages": [{"role": "user", "content": "x"}]}"#,
+            #"{"model": "", "messages": [{"role": "user", "content": "x"}]}"#,
+        ] {
+            let response = await router.handle(chatRequest(body))
+
+            XCTAssertEqual(response.status, 200, body)
+            let decoded = try JSONDecoder().decode(ChatCompletionResponse.self, from: response.body)
+            XCTAssertEqual(decoded.model, "loaded-model", body)
+        }
+    }
+
+    func testChatCompletionReportsAReplyCutOffAtTheTokenLimit() async throws {
+        let router = PolishdRouter(
+            responder: StubResponder(result: .success(ChatReply(content: "So the", finishReason: "length"))),
+            modelName: "m")
+        let response = await router.handle(
+            chatRequest("{\"messages\": [{\"role\": \"user\", \"content\": \"x\"}]}")
+        )
+
+        let decoded = try JSONDecoder().decode(ChatCompletionResponse.self, from: response.body)
+        XCTAssertEqual(decoded.choices.first?.finishReason, "length")
+    }
+
+    func testChatCompletionReturnsTheEngineTimings() async throws {
+        let timings = PolishTimings(
+            firstTokenMilliseconds: 180, totalMilliseconds: 420, promptTokens: 900,
+            cachedPromptTokens: 850, completionTokens: 40, draftTokens: 20,
+            acceptedDraftTokens: 17)
+        let router = PolishdRouter(
+            responder: StubResponder(result: .success(ChatReply(content: "x", timings: timings))),
+            modelName: "m")
+        let response = await router.handle(
+            chatRequest("{\"messages\": [{\"role\": \"user\", \"content\": \"x\"}]}")
+        )
+
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: response.body) as? [String: Any])
+        let wire = try XCTUnwrap(object["timings"] as? [String: Any])
+        XCTAssertEqual(wire["first_token_ms"] as? Double, 180)
+        XCTAssertEqual(wire["total_ms"] as? Double, 420)
+        XCTAssertEqual(wire["cached_prompt_tokens"] as? Int, 850)
+        XCTAssertEqual(wire["accepted_draft_tokens"] as? Int, 17)
+        XCTAssertEqual(
+            timings.summary,
+            "first token 180 ms, total 420 ms, prompt 900 (cached 850), completion 40, "
+                + "drafts accepted 17/20")
     }
 
     func testChatCompletionDecodesChatTemplateKwargs() async throws {

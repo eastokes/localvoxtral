@@ -6,6 +6,7 @@ final class AudioCaptureHealthMonitor {
     struct Callbacks {
         var refreshMicrophoneInputs: () -> Void
         var stopDictation: (String) -> Void
+        var stopForUnavailableInput: () -> Void
         var isDictating: () -> Bool
         var selectedInputDeviceID: () -> String
         var availableInputDevices: () -> [MicrophoneInputDevice]
@@ -15,7 +16,14 @@ final class AudioCaptureHealthMonitor {
     }
 
     private var callbacks: Callbacks?
-    private var microphone: MicrophoneCaptureService?
+    private var microphone: (any MicrophoneCapturing)?
+    /// The input the running capture was started on. The selection cannot
+    /// stand in for it: a device refresh moves the selection to a fallback
+    /// as soon as the selected mic disappears.
+    private var captureInputID = ""
+    /// The session's clock: the health poll and the evaluation debounce
+    /// sleep on it, and the grace and recovery deadlines read its `now`.
+    private var clock = SessionClock.live
     private var captureHealthTask: Task<Void, Never>?
     private var pendingAudioChangeTask: Task<Void, Never>?
     private var captureInterruptionDetectedAt: Date?
@@ -38,11 +46,20 @@ final class AudioCaptureHealthMonitor {
     static let maxCaptureRecoveryAttempts = 3
     static let fastAudioChangeEvaluationDelayMilliseconds = 120
 
-    func start(microphone: MicrophoneCaptureService, callbacks: Callbacks) {
+    var isMonitoring: Bool { callbacks != nil }
+
+    /// `captureInputID` is the input the capture already runs on; nil reads
+    /// the selection.
+    func start(
+        microphone: any MicrophoneCapturing, callbacks: Callbacks, clock: SessionClock,
+        captureInputID: String? = nil
+    ) {
         self.microphone = microphone
         self.callbacks = callbacks
+        self.clock = clock
+        self.captureInputID = captureInputID ?? callbacks.selectedInputDeviceID()
         resetState()
-        startupCaptureGraceUntil = Date().addingTimeInterval(Self.startupCaptureGraceSeconds)
+        startupCaptureGraceUntil = clock.now().addingTimeInterval(Self.startupCaptureGraceSeconds)
         restartCaptureHealthTask()
     }
 
@@ -54,6 +71,7 @@ final class AudioCaptureHealthMonitor {
         resetState()
         callbacks = nil
         microphone = nil
+        captureInputID = ""
     }
 
     func handleConfigurationChange() {
@@ -63,8 +81,8 @@ final class AudioCaptureHealthMonitor {
             debugLog("configuration changed while dictating; deferring to health evaluation")
             if !microphone.hasCapturedAudioInCurrentRun() {
                 startupConfigurationChangeDetected = true
-                startupRouteStabilizationUntil = Date().addingTimeInterval(startupRouteStabilizationSeconds())
-                startupCaptureGraceUntil = Date().addingTimeInterval(Self.startupConfigChangeGraceSeconds)
+                startupRouteStabilizationUntil = clock.now().addingTimeInterval(startupRouteStabilizationSeconds())
+                startupCaptureGraceUntil = clock.now().addingTimeInterval(Self.startupConfigChangeGraceSeconds)
                 startupTapRefreshAttempted = false
                 scheduleAudioChangeEvaluation(delayMilliseconds: Self.fastAudioChangeEvaluationDelayMilliseconds)
                 return
@@ -76,6 +94,15 @@ final class AudioCaptureHealthMonitor {
     func handleInputDevicesChanged() {
         scheduleAudioChangeEvaluation()
     }
+
+    #if DEBUG
+    /// Runs the pending device/route evaluation now instead of after its
+    /// debounce sleep.
+    func debugEvaluateAudioChangeNow() {
+        pendingAudioChangeTask?.cancel()
+        evaluateAudioChange()
+    }
+    #endif
 
     func resetState() {
         captureInterruptionDetectedAt = nil
@@ -99,9 +126,10 @@ final class AudioCaptureHealthMonitor {
     private func restartCaptureHealthTask() {
         captureHealthTask?.cancel()
 
+        let sleep = clock.sleep
         captureHealthTask = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(for: .milliseconds(600))
+                await sleep(.milliseconds(600))
                 guard !Task.isCancelled else { break }
                 guard let self else { break }
                 guard let microphone = self.microphone else { break }
@@ -124,8 +152,9 @@ final class AudioCaptureHealthMonitor {
     private func scheduleAudioChangeEvaluation(delayMilliseconds: Int = 350) {
         pendingAudioChangeTask?.cancel()
 
+        let sleep = clock.sleep
         pendingAudioChangeTask = Task { [weak self] in
-            try? await Task.sleep(for: .milliseconds(delayMilliseconds))
+            await sleep(.milliseconds(delayMilliseconds))
             guard !Task.isCancelled else { return }
             self?.evaluateAudioChange()
         }
@@ -135,7 +164,6 @@ final class AudioCaptureHealthMonitor {
         pendingAudioChangeTask = nil
         guard let microphone, let callbacks else { return }
 
-        let previousSelection = callbacks.selectedInputDeviceID()
         callbacks.refreshMicrophoneInputs()
 
         guard callbacks.isDictating() else {
@@ -143,12 +171,10 @@ final class AudioCaptureHealthMonitor {
             return
         }
 
-        if !previousSelection.isEmpty,
-           callbacks.selectedInputDeviceID() == previousSelection,
-           !callbacks.availableInputDevices().contains(where: { $0.id == previousSelection })
+        if !captureInputID.isEmpty,
+           !callbacks.availableInputDevices().contains(where: { $0.id == captureInputID })
         {
-            callbacks.stopDictation("selected input unavailable")
-            callbacks.setError("Selected microphone became unavailable. Reconnect it or select another input.")
+            callbacks.stopForUnavailableInput()
             return
         }
 
@@ -183,7 +209,7 @@ final class AudioCaptureHealthMonitor {
                 }
 
                 if let stabilizationDeadline = startupRouteStabilizationUntil,
-                   Date() < stabilizationDeadline
+                   clock.now() < stabilizationDeadline
                 {
                     scheduleAudioChangeEvaluation(
                         delayMilliseconds: Self.fastAudioChangeEvaluationDelayMilliseconds
@@ -193,7 +219,7 @@ final class AudioCaptureHealthMonitor {
                 startupRouteStabilizationUntil = nil
             }
 
-            if let graceDeadline = startupCaptureGraceUntil, Date() < graceDeadline {
+            if let graceDeadline = startupCaptureGraceUntil, clock.now() < graceDeadline {
                 scheduleAudioChangeEvaluation(
                     delayMilliseconds: startupConfigurationChangeDetected
                         ? Self.fastAudioChangeEvaluationDelayMilliseconds
@@ -205,7 +231,7 @@ final class AudioCaptureHealthMonitor {
             startupCaptureGraceUntil = nil
 
             if captureInterruptionDetectedAt == nil {
-                captureInterruptionDetectedAt = Date()
+                captureInterruptionDetectedAt = clock.now()
                 scheduleAudioChangeEvaluation(
                     delayMilliseconds: startupConfigurationChangeDetected
                         ? Self.fastAudioChangeEvaluationDelayMilliseconds
@@ -219,7 +245,7 @@ final class AudioCaptureHealthMonitor {
                 : Self.startupNoAudioRecoverySeconds
             if !hasCapturedAnyAudio,
                let detectedAt = captureInterruptionDetectedAt,
-               Date().timeIntervalSince(detectedAt) >= startupRecoverySeconds
+               clock.now().timeIntervalSince(detectedAt) >= startupRecoverySeconds
             {
                 if captureRecoveryAttemptCount < Self.maxCaptureRecoveryAttempts {
                     captureRecoveryAttemptCount += 1
@@ -229,7 +255,7 @@ final class AudioCaptureHealthMonitor {
                     )
                     if attemptMicrophoneRecovery() {
                         captureInterruptionDetectedAt = nil
-                        startupCaptureGraceUntil = Date().addingTimeInterval(
+                        startupCaptureGraceUntil = clock.now().addingTimeInterval(
                             startupConfigurationChangeDetected
                                 ? Self.startupConfigChangeGraceSeconds
                                 : Self.startupCaptureGraceSeconds
@@ -241,7 +267,7 @@ final class AudioCaptureHealthMonitor {
             }
 
             if let detectedAt = captureInterruptionDetectedAt,
-               Date().timeIntervalSince(detectedAt) < Self.captureInterruptionConfirmationSeconds
+               clock.now().timeIntervalSince(detectedAt) < Self.captureInterruptionConfirmationSeconds
             {
                 scheduleAudioChangeEvaluation(
                     delayMilliseconds: startupConfigurationChangeDetected
@@ -254,7 +280,7 @@ final class AudioCaptureHealthMonitor {
             if !isEngineRunning, microphone.resumeIfNeeded() {
                 captureInterruptionDetectedAt = nil
                 captureRecoveryAttemptCount = 0
-                startupCaptureGraceUntil = Date().addingTimeInterval(Self.startupCaptureGraceSeconds)
+                startupCaptureGraceUntil = clock.now().addingTimeInterval(Self.startupCaptureGraceSeconds)
                 scheduleAudioChangeEvaluation()
                 return
             }
@@ -267,7 +293,7 @@ final class AudioCaptureHealthMonitor {
                 )
                 if attemptMicrophoneRecovery() {
                     captureInterruptionDetectedAt = nil
-                    startupCaptureGraceUntil = Date().addingTimeInterval(Self.startupCaptureGraceSeconds)
+                    startupCaptureGraceUntil = clock.now().addingTimeInterval(Self.startupCaptureGraceSeconds)
                     scheduleAudioChangeEvaluation()
                     return
                 }
@@ -306,6 +332,7 @@ final class AudioCaptureHealthMonitor {
         do {
             debugLog("attempting microphone recovery input=\(inputID ?? "default")")
             try callbacks.restartMicrophone(inputID)
+            captureInputID = preferredInputID
             callbacks.setStatus("Listening...")
             debugLog("microphone recovery succeeded")
             return true
@@ -317,7 +344,7 @@ final class AudioCaptureHealthMonitor {
     }
 
     private func shouldEmitNoAudioDiagnosticNow() -> Bool {
-        let now = Date()
+        let now = clock.now()
         if let last = lastNoAudioDiagnosticAt, now.timeIntervalSince(last) < 1.0 {
             return false
         }

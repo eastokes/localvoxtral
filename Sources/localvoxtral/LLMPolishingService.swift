@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import os
 
@@ -19,18 +20,68 @@ struct LLMPolishingRequest: Sendable {
     /// prompt-prefix warmup sets 1 so the throwaway generation costs a
     /// single token.
     let maxTokens: Int?
+    /// Nil for a polish, which the user is waiting on. The term-suggestion
+    /// request reads weeks of dictations in one go and is started from
+    /// Settings, so it may take longer than a polish is allowed to.
+    let timeoutSeconds: TimeInterval?
+    /// False for a polish, which has to be fast. True asks a hosted reasoning
+    /// model to think before answering (`MistralReasoningEffort.high`);
+    /// self-hosted shapes ignore it and keep their configured behaviour.
+    let prefersDeepReasoning: Bool
+    /// The feature the usage ledger charges this request to. Nil records
+    /// nothing: the warmup's one-token throwaway on the bundled helper.
+    let usageFeature: UsageEntry.Feature?
 
     init(
         inputText: String,
         systemPrompt: String,
         userPrompts: [String],
-        maxTokens: Int? = nil
+        maxTokens: Int? = nil,
+        timeoutSeconds: TimeInterval? = nil,
+        prefersDeepReasoning: Bool = false,
+        usageFeature: UsageEntry.Feature? = .polish
     ) {
         self.inputText = inputText
         self.systemPrompt = systemPrompt
         self.userPrompts = userPrompts
         self.maxTokens = maxTokens
+        self.timeoutSeconds = timeoutSeconds
+        self.prefersDeepReasoning = prefersDeepReasoning
+        self.usageFeature = usageFeature
     }
+
+    /// The characters of every message sent, for the usage ledger.
+    var promptCharacters: Int {
+        userPrompts.reduce(systemPrompt.count) { $0 + $1.count }
+    }
+}
+
+/// Which wire dialect one polish request is serialized in. The app talks to
+/// self-hosted OpenAI-compatible servers (llama.cpp, mlx-lm, vLLM, the bundled
+/// polishd) AND to Mistral's hosted API, and the two do not accept the same
+/// body.
+enum LLMPolishingRequestShape: String, Sendable {
+    /// Every self-hosted OpenAI-compatible server. Emits the union of fields
+    /// those servers understand — including the llama.cpp / mlx-lm / Bifrost
+    /// extras (`top_k`, `min_p`, `chat_template_kwargs`,
+    /// `thinking_budget_tokens`, the `x-bf-passthrough-extra-params` header),
+    /// which a server that does not know them ignores.
+    case openAICompatible
+
+    /// Mistral's hosted `/v1/chat/completions`. Its `ChatCompletionRequest`
+    /// schema is closed: it rejects unknown body fields, so this shape emits
+    /// ONLY `model`, `messages`, `temperature`, `top_p`, `presence_penalty`,
+    /// `max_tokens` and `reasoning_effort` — never `top_k`, `min_p`,
+    /// `chat_template_kwargs` or `thinking_budget_tokens`, and never the
+    /// `x-bf-passthrough-extra-params` header, even when the configuration
+    /// carries them (a catalog model's sampling defaults do). Those four are
+    /// llama.cpp / mlx-lm / Bifrost extras with no Mistral equivalent.
+    ///
+    /// `reasoning_effort` asks for the least reasoning the model takes
+    /// (`MistralReasoningEffort`): polishing must never pay a reasoning
+    /// trace's latency or output tokens to insert one space before a question
+    /// mark, and a value the model does not take is a 400.
+    case mistral
 }
 
 struct LLMPolishingConfiguration: Sendable {
@@ -45,6 +96,16 @@ struct LLMPolishingConfiguration: Sendable {
     /// Bifrost drops provider-specific body fields unless this opt-in header
     /// is present. Other OpenAI-compatible servers harmlessly ignore it.
     let passthroughExtraParameters: Bool
+    /// The wire dialect this configuration's requests are serialized in.
+    let requestShape: LLMPolishingRequestShape
+    /// Mistral shape only. Nil derives it from the model id alone
+    /// (`MistralReasoningEffort.forModel`), which is right for every
+    /// reasoning model; Settings passes the catalog's answer so a model
+    /// without reasoning gets no field at all.
+    let mistralReasoningEffort: MistralReasoningEffort?
+    /// Who answers, for the usage ledger. Settings names the bundled helper;
+    /// otherwise the shape decides: Mistral's, or a server the user configured.
+    let usageBackend: UsageEntry.Backend
 
     init(
         endpointURL: URL,
@@ -53,7 +114,10 @@ struct LLMPolishingConfiguration: Sendable {
         samplingDefaults: PolishSamplingDefaults? = nil,
         chatTemplateArguments: [String: Bool]? = nil,
         thinkingBudgetTokens: Int? = nil,
-        passthroughExtraParameters: Bool = false
+        passthroughExtraParameters: Bool = false,
+        requestShape: LLMPolishingRequestShape = .openAICompatible,
+        mistralReasoningEffort: MistralReasoningEffort? = nil,
+        usageBackend: UsageEntry.Backend? = nil
     ) {
         self.endpointURL = endpointURL
         self.apiKey = apiKey
@@ -62,42 +126,71 @@ struct LLMPolishingConfiguration: Sendable {
         self.chatTemplateArguments = chatTemplateArguments
         self.thinkingBudgetTokens = thinkingBudgetTokens
         self.passthroughExtraParameters = passthroughExtraParameters
+        self.requestShape = requestShape
+        self.mistralReasoningEffort = mistralReasoningEffort
+        self.usageBackend = usageBackend ?? (requestShape == .mistral ? .mistral : .userServer)
     }
+}
+
+/// Endpoint and model for Mistral's hosted polishing API. Settings wires these
+/// in separately; they live here so the request shape and its defaults are
+/// stated in one place.
+enum MistralPolishDefaults {
+    /// Base URL — `normalizedChatCompletionsURL` turns it into
+    /// `https://api.mistral.ai/v1/chat/completions`.
+    static let endpoint = URL(string: "https://api.mistral.ai")!
+    /// `mistral-medium-3-5` (aliases `mistral-medium-latest`,
+    /// `mistral-medium-3`).
+    static let model = "mistral-medium-3-5"
 }
 
 struct LLMPolishingResult: Sendable {
     let rawText: String
     let polishedText: String
     let durationSeconds: Double
-}
-
-enum LLMPolishingError: Error, LocalizedError, Sendable {
-    case emptyInput
-    case requestFailed(statusCode: Int, body: String)
-    case invalidResponse
-    case networkError(String)
-
-    var errorDescription: String? {
-        switch self {
-        case .emptyInput:
-            return "No text to polish."
-        case .requestFailed(let statusCode, let body):
-            return "LLM request failed (HTTP \(statusCode)): \(body)"
-        case .invalidResponse:
-            return "LLM returned an invalid or empty response."
-        case .networkError(let message):
-            return "LLM network error: \(message)"
-        }
-    }
+    var usage: LLMTokenUsage? = nil
 }
 
 struct LLMPolishingService: LLMPolishingServicing {
-    /// Polish request timeout. Sized for the managed worst case, not the warm
-    /// path: a 4B model whose polishd prefix-cache checkpoint was invalidated
-    /// re-prefills ~2.3k tokens before generating — a real request took 23.6 s
-    /// and the previous 15 s timeout abandoned it (field, 2026-07-11). Polish
-    /// is async behind the overlay: a slow polish beats a discarded one.
-    static let requestTimeoutInterval: TimeInterval = 40
+    /// Receives one entry per request that carries a usage feature, on every
+    /// backend; only Mistral's are priced. Nil records nothing.
+    var usageRecorder: (any UsageRecording)?
+    let session: URLSession
+    /// Times the request's whole budget (#1688). Injected so tests run it
+    /// on a manual clock.
+    let sleep: @Sendable (Duration) async -> Void
+
+    init(
+        usageRecorder: (any UsageRecording)? = nil,
+        session: URLSession = SameOriginHTTP.shared,
+        sleep: @escaping @Sendable (Duration) async -> Void = SessionClock.live.sleep
+    ) {
+        self.usageRecorder = usageRecorder
+        self.session = session
+        self.sleep = sleep
+    }
+
+    /// One rule for every backend. The timeout is only the client's cap: a
+    /// fast hosted model finishes long before it, and a long transcript takes
+    /// longer on an external server or Mistral too.
+    static func timeoutInterval(for request: LLMPolishingRequest) -> TimeInterval {
+        PolishRequestTimeout.seconds(
+            forInputCharacters: request.inputText.count,
+            override: request.timeoutSeconds
+        )
+    }
+
+    /// Classify a URLSession transport failure. A timeout keeps its own case; every other
+    /// failure stays a network error carrying the system's description.
+    static func polishingError(
+        forTransportError error: Error,
+        timeoutSeconds: TimeInterval
+    ) -> LLMPolishingError {
+        if let urlError = error as? URLError, urlError.code == .timedOut {
+            return .timedOut(afterSeconds: timeoutSeconds)
+        }
+        return .networkError(error.localizedDescription)
+    }
 
     func polish(
         request: LLMPolishingRequest,
@@ -118,9 +211,33 @@ struct LLMPolishingService: LLMPolishingServicing {
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await URLSession.shared.data(for: urlRequest)
+            let session = session
+            (data, response) = try await PolishRequestTimeout.enforcing(
+                seconds: urlRequest.timeoutInterval, sleep: sleep
+            ) {
+                try await session.data(for: urlRequest)
+            }
+        } catch let deadline as PolishDeadlinePassed {
+            // Sent and still answering: it may be billed.
+            Log.backends.error(
+                "Polish: no complete answer from \(urlRequest.url?.host ?? "-", privacy: .public) within its \(Int(deadline.seconds), privacy: .public) s budget; cancelled"
+            )
+            recordUsage(request: request, configuration: configuration, usage: nil)
+            throw LLMPolishingError.timedOut(afterSeconds: deadline.seconds)
         } catch {
-            throw LLMPolishingError.networkError(error.localizedDescription)
+            let polishingError = Self.polishingError(
+                forTransportError: error,
+                timeoutSeconds: urlRequest.timeoutInterval
+            )
+            // A request abandoned after it was sent (timed out, cancelled by
+            // the next dictation, connection dropped) may still be billed, and
+            // Mistral never gets to say for how much: record it as unpriced
+            // rather than let it vanish. One that never left costs nothing
+            // either way — it only shows in the unpriced count.
+            if Self.mayHaveBeenBilled(transportError: error) {
+                recordUsage(request: request, configuration: configuration, usage: nil)
+            }
+            throw polishingError
         }
 
         guard let httpResponse = response as? HTTPURLResponse else {
@@ -135,12 +252,20 @@ struct LLMPolishingService: LLMPolishingServicing {
             )
         }
 
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let choices = json["choices"] as? [[String: Any]],
-              let firstChoice = choices.first,
-              let message = firstChoice["message"] as? [String: Any],
-              let content = message["content"] as? String
-        else {
+        let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        // A 2xx is billed whether or not its content is usable, so usage is
+        // recorded before the content is judged.
+        let usage = json.flatMap(LLMTokenUsage.init(responseObject:))
+        recordUsage(request: request, configuration: configuration, usage: usage)
+
+        // A reply cut off at the backend's output limit is a prefix of the
+        // polish: committing it would drop the rest of the dictation (#1109).
+        // A request that set its own cap (the one-token warmup) asked for it.
+        if request.maxTokens == nil, let json, Self.stoppedAtOutputLimit(responseObject: json) {
+            throw LLMPolishingError.truncated
+        }
+
+        guard let json, let content = Self.assistantText(inResponseObject: json) else {
             throw LLMPolishingError.invalidResponse
         }
 
@@ -154,8 +279,80 @@ struct LLMPolishingService: LLMPolishingServicing {
         return LLMPolishingResult(
             rawText: trimmed,
             polishedText: polished,
-            durationSeconds: duration
+            durationSeconds: duration,
+            usage: usage
         )
+    }
+
+    static func mayHaveBeenBilled(transportError error: Error) -> Bool {
+        guard let urlError = error as? URLError else {
+            return error is CancellationError
+        }
+        switch urlError.code {
+        case .timedOut, .cancelled, .networkConnectionLost:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func recordUsage(
+        request: LLMPolishingRequest,
+        configuration: LLMPolishingConfiguration,
+        usage: LLMTokenUsage?
+    ) {
+        guard let feature = request.usageFeature, let usageRecorder else { return }
+        usageRecorder.record(
+            UsageEntry.chat(
+                date: Date(),
+                feature: feature,
+                backend: configuration.usageBackend,
+                requestedModel: configuration.model,
+                usage: usage,
+                promptCharacters: request.promptCharacters
+            ))
+    }
+
+    /// Whether the first choice ended at a token limit rather than on its
+    /// own: `length` on OpenAI-compatible servers and polishd, and Mistral's
+    /// `model_length` when the context window runs out mid-answer. A missing
+    /// `finish_reason` counts as complete, as servers that omit it always did.
+    static func stoppedAtOutputLimit(responseObject json: [String: Any]) -> Bool {
+        guard let choices = json["choices"] as? [[String: Any]],
+              let reason = choices.first?["finish_reason"] as? String
+        else { return false }
+        return reason == "length" || reason == "model_length"
+    }
+
+    /// Extracts the assistant's answer from a decoded chat/completions
+    /// response object, for every server we talk to.
+    ///
+    /// `choices[0].message.content` is a plain string on every
+    /// OpenAI-compatible server, and on Mistral whenever reasoning is off.
+    /// A reasoning-capable Mistral model instead returns a LIST of content
+    /// chunks: `{"type":"thinking", …}` for the trace and
+    /// `{"type":"text","text":…}` for the answer. We always ask for
+    /// `reasoning_effort: "none"`, but a model that reasons anyway must not
+    /// turn a perfectly good polish into `invalidResponse` — so the list shape
+    /// is accepted defensively, keeping only the `text` chunks and dropping
+    /// the trace (which is never what the user dictated).
+    ///
+    /// Returns nil when no assistant text can be found; the caller maps that
+    /// to `invalidResponse`, as it always has.
+    static func assistantText(inResponseObject json: [String: Any]) -> String? {
+        guard let choices = json["choices"] as? [[String: Any]],
+              let message = choices.first?["message"] as? [String: Any]
+        else { return nil }
+
+        if let content = message["content"] as? String {
+            return content
+        }
+        guard let chunks = message["content"] as? [[String: Any]] else { return nil }
+        let text = chunks
+            .filter { $0["type"] as? String == "text" }
+            .compactMap { $0["text"] as? String }
+            .joined()
+        return text.isEmpty ? nil : text
     }
 
     /// Maps a user-entered polishing endpoint to the effective OpenAI-compatible
@@ -232,10 +429,13 @@ struct LLMPolishingService: LLMPolishingServicing {
         if !configuration.apiKey.isEmpty {
             urlRequest.setValue("Bearer \(configuration.apiKey)", forHTTPHeaderField: "Authorization")
         }
-        if configuration.passthroughExtraParameters {
+        // Bifrost's opt-in header only means anything to Bifrost, and Mistral
+        // is not it: the Mistral shape emits no passthrough extras at all, so
+        // the header would only advertise fields that are not there.
+        if configuration.passthroughExtraParameters, configuration.requestShape != .mistral {
             urlRequest.setValue("true", forHTTPHeaderField: "x-bf-passthrough-extra-params")
         }
-        urlRequest.timeoutInterval = Self.requestTimeoutInterval
+        urlRequest.timeoutInterval = Self.timeoutInterval(for: request)
         urlRequest.httpBody = try requestBody(
             request: request,
             configuration: configuration
@@ -243,11 +443,37 @@ struct LLMPolishingService: LLMPolishingServicing {
         return urlRequest
     }
 
+    /// Mistral caches the shared start of prompts server-side and bills cached
+    /// tokens at 10%; requests carrying the same `prompt_cache_key` are more
+    /// likely to land where that start is cached. The key names the fixed
+    /// start itself (every message but the last), so requests that share it
+    /// share a key. The fixed start includes About you, so the digest is an
+    /// HMAC under a key drawn at launch: a plain hash would let anyone who
+    /// sees the key test guesses at the speaker's text. Nil when there is no
+    /// fixed start: a one-message request.
+    static func mistralPromptCacheKey(for request: LLMPolishingRequest) -> String? {
+        let prefixUserPrompts = request.userPrompts.dropLast()
+        guard !request.systemPrompt.isEmpty || !prefixUserPrompts.isEmpty else { return nil }
+        let prefix = ([request.systemPrompt] + prefixUserPrompts).joined(separator: "\u{0}")
+        let digest = HMAC<SHA256>.authenticationCode(
+            for: Data(prefix.utf8), using: promptCacheKeySalt)
+        return "lvx-polish-" + Data(digest).prefix(8).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static let promptCacheKeySalt = SymmetricKey(size: .bits256)
+
     static func requestBody(
         request: LLMPolishingRequest,
         configuration: LLMPolishingConfiguration
     ) throws -> Data {
-        let messages = [["role": "system", "content": request.systemPrompt]]
+        // An empty system prompt sends no system message. polishd checkpoints
+        // every message but the last as a prompt-cache prefix, and its two
+        // slots belong to the two dictation profiles: a one-message request
+        // (term suggestions) has no prefix, so it cannot evict them.
+        let systemMessages = request.systemPrompt.isEmpty
+            ? []
+            : [["role": "system", "content": request.systemPrompt]]
+        let messages = systemMessages
             + request.userPrompts.map { ["role": "user", "content": $0] }
         var body: [String: Any] = [
             "model": configuration.model,
@@ -261,18 +487,39 @@ struct LLMPolishingService: LLMPolishingServicing {
             if let topP = defaults.topP {
                 body["top_p"] = topP
             }
-            if let topK = defaults.topK {
-                body["top_k"] = topK
-            }
-            if let minP = defaults.minP {
-                body["min_p"] = minP
-            }
             if let presencePenalty = defaults.presencePenalty {
                 body["presence_penalty"] = presencePenalty
             }
         }
         if let maxTokens = request.maxTokens {
             body["max_tokens"] = maxTokens
+        }
+
+        if configuration.requestShape == .mistral {
+            // Mistral's request schema is closed. Everything below this point
+            // is an extension some self-hosted server invented; sending one
+            // costs the whole request (422), so the Mistral shape stops here
+            // with only the fields the schema names.
+            let polishEffort =
+                configuration.mistralReasoningEffort
+                ?? MistralReasoningEffort.forModel(configuration.model)
+            let effort = request.prefersDeepReasoning ? polishEffort.deepened : polishEffort
+            if let wireValue = effort.wireValue {
+                body["reasoning_effort"] = wireValue
+            }
+            if let cacheKey = mistralPromptCacheKey(for: request) {
+                body["prompt_cache_key"] = cacheKey
+            }
+            return try JSONSerialization.data(withJSONObject: body)
+        }
+
+        if let defaults = configuration.samplingDefaults {
+            if let topK = defaults.topK {
+                body["top_k"] = topK
+            }
+            if let minP = defaults.minP {
+                body["min_p"] = minP
+            }
         }
         if let chatTemplateArguments = configuration.chatTemplateArguments {
             body["chat_template_kwargs"] = chatTemplateArguments

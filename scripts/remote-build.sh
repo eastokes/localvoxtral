@@ -6,10 +6,33 @@ set -euo pipefail
 # tree (no commit needed) and runs the toolchain remotely over SSH.
 #
 # Usage:
-#   ./scripts/remote-build.sh [build|test|integration|integration-polishd|integration-speechd|speechd-bench|eval-llm|eval-e2e|dogfood|dogfood-package|package|exec|diag|applog|voxlog|svc-status|disk|gc] [extra args...]
+#   ./scripts/remote-build.sh [build|test|test-cost-budgets|integration|integration-keychain|integration-mistral|integration-polishd|integration-speechd|integration-herdr|speechd-bench|polishd-bench|eval-llm|eval-capture-polish-latency|eval-e2e|eval-term-recall|package|exec|diag|applog|voxlog|svc-status|disk|gc] [extra args...]
 #     build        swift build
-#     test         swift build + unit tests (default; skips live-backend suites)
+#     test         swift build + unit tests (default; needs --filter, or
+#                  LV_ALLOW_HEAVY_MAC_RUN=1 for the full suite; skips live-backend suites
+#                  and the cost-budget suite below). With no extra arguments
+#                  it runs LV_TEST_SHARDS (default 6) xctest processes at once
+#                  and merges their output into one log; any argument (e.g.
+#                  --filter) runs one plain `swift test`. Off a Mac, with a
+#                  Swift toolchain here (SWIFT, else `swift` on PATH), the
+#                  suites that build on Linux run here instead
+#                  (.build/last-linux.log): a --filter naming only those never
+#                  reaches the Mac, and a plain `test` runs them beside the
+#                  Mac's part. LV_TEST_ON_MAC=1 runs everything on the Mac
+#     test-cost-budgets
+#                  PolishContextPreparationTests, the suite whose assertions
+#                  are about how much work a preparation costs (#430)
 #     integration  realtime pipeline tests against the live speechd STT service
+#     integration-keychain
+#                  KeychainSecretStore against the REAL login keychain
+#                  (add/read/update/delete under a throwaway service). Needs a
+#                  GUI login session: over SSH the build user's keychain reads
+#                  but refuses writes with OSStatus -60008, and a merely locked
+#                  one answers -25308 — the suite fails naming the status
+#     integration-mistral
+#                  the realtime client against the LIVE hosted Mistral
+#                  transcription API; needs MISTRAL_API_KEY in this shell's
+#                  environment (spends real money, never runs in CI)
 #     integration-polishd
 #                  spawn the bundled polishing helper (built by `package`)
 #                  with the real model and score it against the polish eval
@@ -18,29 +41,92 @@ set -euo pipefail
 #                  spawn the packaged speech helper (built by `package`),
 #                  transcribe real audio through the production websocket
 #                  client, and assert accuracy + delta + parent-pid contracts
+#     integration-herdr
+#                  the remote-herdr join machinery against a LIVE herdr server
+#                  over a REAL ssh -L forward: real HerdrSocketClient, real
+#                  forward coordinator, real ssh -G canonicalization, real
+#                  herdr config.toml patch (on the fixture's own config home,
+#                  beside any herdr the account runs). With no argument the
+#                  fixture provisions its own loopback sshd (hermetic); pass an
+#                  ssh destination for a true two-host run. Needs `herdr`
+#                  installed on the build host.
 #     speechd-bench run the packaged speech helper's streaming benchmark;
 #                  optional args = seconds (default 60), cadence ms
-#                  (default 100 = the production step cadence), and
-#                  cache-limit-mb (default = the helper's built-in limit);
+#                  (default 80 = the helper's minimum step),
+#                  cache-limit-mb (default = the helper's built-in limit),
+#                  max-utterance-seconds (default = seconds, so a long
+#                  run keeps decoding past the helper's own utterance limit),
+#                  and an HF model repo from the catalog (default = the
+#                  catalog default; its weights must already be in the shared
+#                  cache, which integration-speechd provisions), and the
+#                  audio: `noise` (default, synthetic) or `speech` (a passage
+#                  from the Mac's system voice, needed for the time-to-first-
+#                  text and word timings to mean anything), and a phase in ms
+#                  (default 0) that moves every step that far past a cadence
+#                  multiple (#1670), and a mic buffer in µs (default 0) that
+#                  models the app's sends instead: a timer every cadence that
+#                  drains whole mic buffers, and the helper holding an append
+#                  under its minimum step (10667 = 512 frames at 48 kHz);
 #                  requires a prior `package`
+#     polishd-bench
+#                  time the packaged polishing helper on the polish eval
+#                  corpora, one arm after another per round: greedy, greedy
+#                  with MTP speculative decoding, and the production
+#                  temperature 0.3. Optional args = rounds (default 3) and an
+#                  absolute path on the build host to a baseline helper binary
+#                  (e.g. another LV_BUILD_DIR's packaged one), added as a
+#                  fourth arm at temperature 0.3; requires a prior `package`
+#     eval-capture-polish-latency
+#                  time a quick capture's polish request (#970) on the
+#                  packaged polishing helper; prints model, n, median and
+#                  p90 (QuickCapturePolishLatencyTests). Optional args =
+#                  rounds (default 3) and an absolute path on the build host
+#                  to a JSON-lines file of {"text": ...} captures (default: a
+#                  synthetic set); requires a prior `package`
 #     eval-llm     default-polish-prompt eval against a live chat/completions
 #                  server (the bundled polishd test service by default);
 #                  optional args = chat/completions endpoint and external
 #                  model alias (default endpoint
 #                  http://127.0.0.1:8080/v1/chat/completions, the
-#                  com.localvoxtral.testpolishd service — runbook scripts/mac/README.md)
+#                  com.localvoxtral.testpolishd service — runbook scripts/mac/README.md).
+#                  A model alias may carry a request-shape prefix:
+#                    llamacpp/<model>  llama.cpp via Bifrost (passthrough extras)
+#                    mistral/<model>   Mistral's closed request schema; reads the
+#                                      key from MISTRAL_API_KEY on THIS box, e.g.
+#                                      eval-llm https://api.mistral.ai mistral/mistral-medium-3-5
+#                                      A GLM model bills the Vibe plan key instead:
+#                                      VIBE_MISTRAL_API_KEY, else ~/.vibe/.env.
 #     eval-e2e     agent-dictation end-to-end eval: human WAVs or TTS -> live
-#                  voxmlx ASR -> bundled polishd via the production stop-commit
+#                  speechd ASR -> bundled polishd via the production stop-commit
 #                  path, scored against EvalCorpus/agent-dictation (run
 #                  `package` first; optional arg = a complete recording-set
-#                  directory made by scripts/record-agent-eval.sh)
-#     dogfood      build the instrumented (LOCALVOXTRAL_DOGFOOD) tree and run
-#                  the context-capture suite; the capture is a compile gate, so
-#                  no other lane ever builds it
-#     dogfood-package
-#                  package an instrumented .app for hand-dogfooding (same
-#                  bundle id, so the Accessibility grant survives; the artifact
-#                  is identifiable by LVXDogfoodCapture in its Info.plist)
+#                  directory made by scripts/record-agent-eval.sh).
+#                  `--asr <name>` picks the speech test service by its row in
+#                  scripts/mac/test-speech-models.tsv (default voxtral), e.g.
+#                  eval-e2e --asr nemotron
+#                  `--provider mistral` (or a bare `mistral` argument) runs BOTH
+#                  live stages on Mistral's hosted API instead — no local
+#                  server, no `package` run, needs MISTRAL_API_KEY on THIS box,
+#                  and BILLS the owner's Mistral account (by hand only), e.g.
+#                  MISTRAL_API_KEY=... eval-e2e --provider mistral
+#                  `--replay EvalRecordings/replay/<set>` replays a user's
+#                  stored dictations instead, with and without the learned
+#                  terms (set from scripts/export-dictation-replay.sh)
+#     eval-term-recall
+#                  PRIVATE term-recall eval of the speech engine alone, on
+#                  EvalRecordings/term-recall/cases.json (made by
+#                  scripts/harvest-term-recall-cases.py). Prints a scoreboard
+#                  of counts and copies the run file back to
+#                  EvalRecordings/term-recall/runs/<label>.jsonl. Options:
+#                  `--asr <name>` (a row of scripts/mac/test-speech-models.tsv,
+#                  default voxtral), `--label <name>` (default <asr>-none),
+#                  `--limit N`, `--case <id>` (repeatable),
+#                  `--recordings EvalRecordings/term-recall/<set>` (human WAVs
+#                  in the agent-dictation manifest format), or
+#                  `--hypotheses EvalRecordings/term-recall/<file>.jsonl` to
+#                  score {"id","text"} rows with no speech engine;
+#                  `compare <before> <after>` pairs two runs by label, e.g.
+#                  eval-term-recall --asr nemotron
 #     package      ./scripts/package_app.sh release
 #     exec         run the extra args verbatim in the remote work dir
 #     diag         build-host diagnostic summary (gate v2 required)
@@ -55,10 +141,16 @@ set -euo pipefail
 #                  also fired automatically, best-effort, after every run —
 #                  EvalRecordings inside a stale dir are always preserved)
 #
+# The Mac is the owner's machine (#617), so two kinds of run refuse unless
+# LV_ALLOW_HEAVY_MAC_RUN=1 is set, before any sync: a `test` with neither
+# --filter nor --package-path (the full suite, which the PR's hosted
+# build-test runs anyway), and the live verbs integration*, eval-*,
+# speechd-bench and polishd-bench (AGENTS.md, Build and test, says when one
+# is due).
+#
 # Examples:
-#   ./scripts/remote-build.sh
 #   ./scripts/remote-build.sh test --filter TextMergingAlgorithmsTests
-#   ./scripts/remote-build.sh eval-e2e EvalRecordings/agent-dictation/owner
+#   LV_ALLOW_HEAVY_MAC_RUN=1 ./scripts/remote-build.sh eval-e2e EvalRecordings/agent-dictation/owner
 #   ./scripts/remote-build.sh exec swift test --list-tests
 #
 # The build host is machine-local configuration, never committed. Resolution
@@ -110,6 +202,7 @@ handle_remote_signal() {
   # A second Ctrl-C while the best-effort reap SSH is running must not skip
   # existing EXIT traps that remove transient eval markers.
   trap '' HUP INT TERM
+  declare -F stop_linux_suites >/dev/null && stop_linux_suites
   if [[ "$REMOTE_PAYLOAD_ACTIVE" == "1" ]]; then
     reap_remote_workdir
   fi
@@ -184,6 +277,60 @@ ensure_remote_server() {
 # because a host that died mid-run must not wedge the exit path — the next
 # real sync deletes the marker anyway.
 TREE_SYNCED=0
+
+# The Mistral lanes write MISTRAL_API_KEY into a JSON marker with printf and
+# no escaping. A key is a plain token, so anything else (a pasted quote, a
+# backslash, trailing junk) would produce malformed JSON that the marker
+# reader rejects — and the suite would then SELF-SKIP after a full remote
+# build, with a skip message that never mentions the key. Fail here, first,
+# with the reason (GLM review, 2026-09-16).
+require_mistral_api_key_format() {
+  local key="${1-${MISTRAL_API_KEY:-}}" name="${2:-MISTRAL_API_KEY}"
+  if [[ ! "$key" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo "$name must be a plain token ([A-Za-z0-9._-]); check for stray quotes or whitespace" >&2
+    exit 1
+  fi
+}
+
+# GLM 5.3 on the Mistral API runs on the Vibe plan's monthly allowance, so a
+# GLM eval bills the Vibe key, never an exported MISTRAL_API_KEY: sessions
+# export the pay-per-call Studio key for the other Mistral lanes (#851).
+vibe_mistral_api_key() {
+  if [[ -n "${VIBE_MISTRAL_API_KEY:-}" ]]; then
+    printf '%s' "$VIBE_MISTRAL_API_KEY"
+  else
+    sed -n 's/^MISTRAL_API_KEY=//p' "$HOME/.vibe/.env" 2>/dev/null | tr -d "\"'" || true
+  fi
+}
+
+# The port and pinned repo of a speech test service, from the same list the
+# Mac's services are installed from. Sets SPEECH_MODEL_PORT and
+# SPEECH_MODEL_REPO, or exits naming the verb.
+speech_model_row() {
+  local name="$1" verb="$2"
+  SPEECH_MODEL_PORT=""
+  SPEECH_MODEL_REPO=""
+  if [[ ! "$name" =~ ^[a-z0-9]+$ ]] \
+    || ! read -r SPEECH_MODEL_PORT SPEECH_MODEL_REPO < <(awk -v n="$name" \
+      '$1 == n { print $2, $3; found = 1 } END { exit !found }' \
+      "${LV_TEST_SPEECH_MODELS:-$ROOT_DIR/scripts/mac/test-speech-models.tsv}") \
+    || [[ ! "$SPEECH_MODEL_PORT" =~ ^80[0-7][0-9]$ \
+          || ! "$SPEECH_MODEL_REPO" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
+    echo "$verb: no speech model '$name' in scripts/mac/test-speech-models.tsv" >&2
+    exit 1
+  fi
+}
+
+# The gate's `ensure` name for a speech test service. Voxtral goes by
+# `speechd`, which a gate older than the speech model list also accepts.
+speech_service_name() {
+  if [[ "$1" == "voxtral" ]]; then
+    echo "speechd"
+  else
+    echo "speechd-$1"
+  fi
+}
+
 cleanup_transient_marker() {
   local marker="$1"
   rm -f "$marker"
@@ -197,6 +344,132 @@ cleanup_transient_marker() {
       "$ROOT_DIR/" "$HOST:$DIR/" 2>/dev/null || true
   fi
 }
+
+# The owner's MacBook is the only build host (#617). The full unit suite and
+# the live lanes and evals are the runs agents started most without need, so
+# they take an explicit opt-in; everything else runs as before.
+if [[ "${LV_ALLOW_HEAVY_MAC_RUN:-0}" != 1 ]]; then
+  case "${1:-test}" in
+    test)
+      scoped=0
+      for arg in "${@:2}"; do
+        case "$arg" in --filter|--filter=*|--package-path|--package-path=*) scoped=1 ;; esac
+      done
+      if (( ! scoped )); then
+        echo "remote-build.sh: a plain test runs the full suite on the Mac, and the PR's hosted build-test already runs it (AGENTS.md, Build and test)." >&2
+        echo "Run the suites you touched: $0 test --filter <Suite>; LV_ALLOW_HEAVY_MAC_RUN=1 runs the full suite anyway." >&2
+        exit 2
+      fi
+      ;;
+    integration*|eval-*|speechd-bench|polishd-bench)
+      echo "remote-build.sh: $1 runs live inference on the Mac; AGENTS.md (Build and test) allows it only when a rule requires it, once, on the final diff, and never beside the PR's CI lane." >&2
+      echo "LV_ALLOW_HEAVY_MAC_RUN=1 $0 $1 ... runs it." >&2
+      exit 2
+      ;;
+  esac
+fi
+
+# The Linux suites (#545). On a box that is not a Mac and has a Swift
+# toolchain (SWIFT, else `swift` on PATH), `test` runs the suites that build
+# on Linux here, through scripts/core-tests-linux.sh, and sends only the rest
+# to the Mac: a `--filter` that names Linux suites alone never reaches the
+# Mac, and a plain `test` runs the Linux part here while the Mac runs the
+# rest. scripts/lib/linux-suites.sh says which suites those are.
+# LV_TEST_ON_MAC=1 sends everything to the Mac, as before.
+LINUX_SWIFT=""
+LINUX_RUN=0
+LINUX_ARGS=()
+LINUX_LOG="${LOCALVOXTRAL_LINUX_LOG:-$ROOT_DIR/.build/last-linux.log}"
+if [[ "${1:-test}" == test && "$(uname -s)" != Darwin && "${LV_TEST_ON_MAC:-0}" != 1 ]]; then
+  LINUX_SWIFT="${SWIFT:-$(command -v swift 2>/dev/null || true)}"
+  if [[ -z "$LINUX_SWIFT" ]]; then
+    echo "==> No Swift on this box (SWIFT= names one): the Linux suites run on the Mac" >&2
+  fi
+fi
+
+run_linux_suites() {
+  mkdir -p "$(dirname "$LINUX_LOG")"
+  SWIFT="$LINUX_SWIFT" "$ROOT_DIR/scripts/core-tests-linux.sh" \
+    ${LINUX_ARGS[@]+"${LINUX_ARGS[@]}"} >"$LINUX_LOG" 2>&1
+}
+
+# The run beside the Mac's goes in a process group of its own (job control,
+# `set -m`, as scripts/ci/run-supervised-command.sh does; macOS has no
+# setsid), so a signal to this script can stop the whole of it, swift
+# included, rather than leave a build holding .build/linux;
+# handle_remote_signal does. That also keeps a terminal's Ctrl-C from reaching
+# it twice.
+LINUX_PID=""
+start_linux_suites() {
+  set -m
+  run_linux_suites </dev/null &
+  LINUX_PID=$!
+  set +m
+}
+
+stop_linux_suites() {
+  [[ -n "$LINUX_PID" ]] || return 0
+  kill -TERM -- "-$LINUX_PID" 2>/dev/null || true
+  wait "$LINUX_PID" 2>/dev/null || true
+  LINUX_PID=""
+}
+
+# Prints the outcome of run_linux_suites, given its exit status.
+report_linux_suites() {
+  local status="$1" executed
+  # A build that fails prints no summary: grep finds nothing, and that must
+  # not end the script under pipefail before the failure is reported.
+  executed="$(grep -E 'Executed [0-9]+ tests?, with' "$LINUX_LOG" | tail -n 1 | sed 's/^[[:space:]]*//' || true)"
+  if [[ "$status" == "0" ]]; then
+    echo "==> Linux suites passed here: ${executed:-no XCTest summary}"
+  else
+    tail -n 60 "$LINUX_LOG"
+    echo "==> Linux suites FAILED here (exit $status)"
+  fi
+  echo "==> Full Linux output: $LINUX_LOG"
+}
+
+if [[ -n "$LINUX_SWIFT" ]]; then
+  # shellcheck source=lib/linux-suites.sh
+  . "$ROOT_DIR/scripts/lib/linux-suites.sh"
+  if [[ $# -le 1 ]]; then
+    LINUX_RUN=1
+  else
+    # Only a list of --filter values is split; any other argument keeps the
+    # whole run on the Mac.
+    linux_filters=()
+    mac_filters=()
+    only_filters=1
+    rest=("${@:2}")
+    i=0
+    while (( i < ${#rest[@]} )); do
+      case "${rest[i]}" in
+        --filter) value="${rest[i+1]:-}"; i=$((i + 2)) ;;
+        --filter=*) value="${rest[i]#--filter=}"; i=$((i + 1)) ;;
+        *) only_filters=0; break ;;
+      esac
+      # A --filter with no value goes to the Mac as typed, and fails there.
+      if [[ -z "$value" ]]; then only_filters=0; break; fi
+      if lv_filter_is_linux_only "$value"; then
+        linux_filters+=(--filter "$value")
+      else
+        mac_filters+=(--filter "$value")
+      fi
+    done
+    if (( only_filters && ${#linux_filters[@]} > 0 )); then
+      LINUX_RUN=1
+      LINUX_ARGS=("${linux_filters[@]}")
+      if (( ${#mac_filters[@]} == 0 )); then
+        echo "==> Every suite named runs on Linux: running here with $LINUX_SWIFT"
+        status=0
+        run_linux_suites || status=$?
+        report_linux_suites "$status"
+        exit "$status"
+      fi
+      set -- test "${mac_filters[@]}"
+    fi
+  fi
+fi
 
 if [[ -z "$HOST" ]]; then
   cat >&2 <<'MSG'
@@ -226,6 +499,56 @@ quote_remote_command() {
   fi
 }
 
+# The build host's SSH gate refuses any payload holding a shell metacharacter
+# (`payload_has_safe_chars` in scripts/mac/localvoxtral-build-gate.sh) and
+# writes the reason only to its own log on the Mac. From here that denial
+# reads as a bare exit 126 after a full tree sync, so the same characters are
+# refused locally, before the round trip, with the reason and the workaround
+# (#431). The blocklist stays the gate's; this is a copy of it, kept
+# byte-identical to the pattern that function matches.
+GATE_BLOCKED_CHARS=$'\n\r`$;&|<>(){}[]!*?~#\\'
+GATE_BLOCKED_CHAR=""
+
+# Sets GATE_BLOCKED_CHAR to the first character of $1 the gate refuses.
+find_gate_blocked_char() {
+  local text="$1" i
+  GATE_BLOCKED_CHAR=""
+  for (( i = 0; i < ${#text}; i++ )); do
+    case "$GATE_BLOCKED_CHARS" in
+      *"${text:i:1}"*) GATE_BLOCKED_CHAR="${text:i:1}"; return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# Checked against the argument as the payload will carry it (`printf %q`), so
+# whitespace — which travels as a backslash escape — is caught too.
+reject_gate_blocked_args() {
+  local arg quoted named where
+  for arg in "$@"; do
+    printf -v quoted '%q' "$arg"
+    find_gate_blocked_char "$arg" || find_gate_blocked_char "$quoted" || continue
+    case "$GATE_BLOCKED_CHAR" in
+      $'\n') named="a newline" ;;
+      $'\r') named="a carriage return" ;;
+      *) named="'$GATE_BLOCKED_CHAR'" ;;
+    esac
+    where="it holds $named"
+    [[ "$arg" == *"$GATE_BLOCKED_CHAR"* ]] \
+      || where="quoting it for transport produces $named"
+    {
+      printf "remote-build.sh: the build host's SSH gate would refuse this argument,\n"
+      printf 'because %s and the gate allows no shell metacharacter in a payload:\n\n' "$where"
+      printf '  %s\n' "$arg"
+      if [[ "$GATE_BLOCKED_CHAR" == "|" ]]; then
+        printf '\nFor several suites, pass --filter once per suite:\n\n'
+        printf '  %s %s --filter SuiteA --filter SuiteB\n' "$0" "$CMD"
+      fi
+    } >&2
+    exit 1
+  done
+}
+
 case "$CMD" in
   diag|svc-status|disk|gc)
     if [[ $# -ne 0 ]]; then
@@ -245,9 +568,29 @@ case "$CMD" in
     ;;
 esac
 
-UNIT_TEST_SKIPS=(--skip RealtimeAPIVLLMIntegrationTests --skip LLMPolishPromptEvalTests
-  --skip PolishHelperIntegrationTests --skip SpeechHelperIntegrationTests
-  --skip SpeechdStreamingBenchTests --skip AgentDictationE2EEvalTests)
+# A suite name that must appear in the remote log for the run to count as
+# having proved anything (empty = no such requirement). See test-cost-budgets.
+REQUIRE_SUITE_IN_LOG=""
+TERM_RECALL_RUN_OUT=""
+
+UNIT_TEST_SKIP_NAMES=(RealtimeAPIVLLMIntegrationTests LLMPolishPromptEvalTests
+  PolishHelperIntegrationTests SpeechHelperIntegrationTests
+  SpeechdStreamingBenchTests AgentDictationE2EEvalTests
+  HerdrIntegrationTests MistralRealtimeSoakTests
+  PolishContextPreparationTests)
+if [[ "$LINUX_RUN" == "1" && "$CMD" == test && $# -eq 0 ]]; then
+  # The Linux part of a plain `test` runs here; build-test still runs it on
+  # macOS.
+  for name in $(lv_linux_test_modules); do UNIT_TEST_SKIP_NAMES+=("$name"); done
+fi
+UNIT_TEST_SKIPS=()
+for name in "${UNIT_TEST_SKIP_NAMES[@]}"; do UNIT_TEST_SKIPS+=(--skip "$name"); done
+
+# Plain `test` runs the unit suite as this many xctest processes at once
+# (scripts/lib/unit-test-shards.sh, #442). 1, or any extra argument such as
+# --filter, runs one plain `swift test` instead.
+UNIT_TEST_SHARDS="${LV_TEST_SHARDS:-6}"
+RUN_UNIT_SHARDS=0
 
 # On-demand test server to warm before the suite runs (empty = none). The
 # build host's speechd/polishd launchd test services are launch-on-demand to
@@ -256,13 +599,75 @@ UNIT_TEST_SKIPS=(--skip RealtimeAPIVLLMIntegrationTests --skip LLMPolishPromptEv
 ENSURE_SERVER=""
 
 case "$CMD" in
-  build)   REMOTE_CMD=(swift build "$@") ;;
-  test)    REMOTE_CMD=(swift test "${UNIT_TEST_SKIPS[@]}" "$@") ;;
+  build)   REMOTE_CMD=(swift build --build-system native "$@") ;;
+  test)
+    REMOTE_CMD=(swift test --build-system native "${UNIT_TEST_SKIPS[@]}" "$@")
+    if [[ $# -eq 0 && "$UNIT_TEST_SHARDS" =~ ^[0-9]+$ && "$UNIT_TEST_SHARDS" -gt 1 ]]; then
+      RUN_UNIT_SHARDS=1
+    fi
+    ;;
+  test-cost-budgets)
+    # PolishContextPreparationTests asserts how much work a preparation costs,
+    # so its cases are slow on purpose (#430) and are out of the `test` lane.
+    # CI runs them in their own required step of `build-test`; this is how you
+    # run them here.
+    REMOTE_CMD=(swift test --build-system native --filter PolishContextPreparationTests "$@")
+    # A --filter that matches nothing runs zero tests and exits 0, so a renamed
+    # or split suite would make this lane vacuously green while the `test`
+    # lane's --skip quietly stopped skipping anything. The remote output is
+    # tee'd to $REMOTE_LOG, so the suite has to appear there by name.
+    REQUIRE_SUITE_IN_LOG="PolishContextPreparationTests"
+    ;;
   integration)
     ENSURE_SERVER="speechd"
     REMOTE_CMD=(env VLLM_REALTIME_TEST_ENABLE=1
       VLLM_REALTIME_TEST_MODEL=T0mSIlver/Voxtral-Mini-4B-Realtime-2602-4bit-qhead
-      swift test --filter RealtimeAPIVLLMIntegrationTests "$@")
+      swift test --filter RealtimeAPIVLLMIntegrationTests --build-system native "$@")
+    ;;
+  integration-keychain)
+    # Round-trips the real Security.framework path. Enablement travels as a
+    # gitignored marker inside the synced tree for the same reason the Mistral
+    # lane's key does: the SSH build gate allowlists exact `swift test ...`
+    # payloads and cannot carry a per-run env prefix.
+    #
+    # Deliberately absent from CI: neither the hosted runner nor an SSH
+    # session has an authorised login keychain (writes come back -60008), and
+    # a lane that can only skip proves nothing. Run it from a terminal inside
+    # the owner's GUI session.
+    if [[ $# -gt 0 ]]; then
+      echo "integration-keychain takes no arguments" >&2
+      exit 1
+    fi
+    KEYCHAIN_MARKER="$ROOT_DIR/.keychain-integration-enable.json"
+    trap 'cleanup_transient_marker "$KEYCHAIN_MARKER"' EXIT
+    (umask 077; : >"$KEYCHAIN_MARKER")
+    printf '{"enabled": true}\n' >"$KEYCHAIN_MARKER"
+    REMOTE_CMD=(swift test --build-system native --filter KeychainSecretStoreIntegrationTests)
+    ;;
+  integration-mistral)
+    # Live hosted Mistral realtime transcription API. The key comes from the
+    # dev box's own environment and travels as a gitignored, 0600 marker
+    # inside the synced tree, because the SSH build gate allowlists exact
+    # `swift test ...` payloads and cannot carry a per-run env prefix.
+    # Deliberately absent from CI: it spends real money per minute of audio
+    # and needs a secret the runner does not hold.
+    if [[ $# -gt 0 ]]; then
+      echo "integration-mistral takes no arguments" >&2
+      exit 1
+    fi
+    if [[ -z "${MISTRAL_API_KEY:-}" ]]; then
+      echo "integration-mistral needs MISTRAL_API_KEY in this shell's environment:" >&2
+      echo "  export MISTRAL_API_KEY=... && ./scripts/remote-build.sh integration-mistral" >&2
+      exit 1
+    fi
+    require_mistral_api_key_format
+    MISTRAL_MARKER="$ROOT_DIR/.mistral-integration-enable.json"
+    # Trap registered before the marker exists, so no kill window can strand a
+    # key-bearing file (locally or in the remote work dir).
+    trap 'cleanup_transient_marker "$MISTRAL_MARKER"' EXIT
+    (umask 077; : >"$MISTRAL_MARKER")
+    printf '{"apiKey": "%s"}\n' "$MISTRAL_API_KEY" >"$MISTRAL_MARKER"
+    REMOTE_CMD=(swift test --build-system native --filter MistralRealtimeIntegrationTests)
     ;;
   integration-polishd)
     # Same marker-through-the-tree pattern as eval-llm (the gate pins env
@@ -290,7 +695,7 @@ case "$CMD" in
         "PolishHelper/.build/xcode/Build/Products/Release/localvoxtral-polishd" \
         >"$POLISHD_MARKER"
     fi
-    REMOTE_CMD=(swift test --filter PolishHelperIntegrationTests)
+    REMOTE_CMD=(swift test --build-system native --filter PolishHelperIntegrationTests)
     ;;
   integration-speechd)
     # Enablement travels in the rsynced tree because the SSH gate cannot pass
@@ -313,18 +718,122 @@ case "$CMD" in
         "dist/localvoxtral.app/Contents/MacOS/localvoxtral-speechd" \
         >"$SPEECHD_MARKER"
     fi
-    REMOTE_CMD=(swift test --filter SpeechHelperIntegrationTests)
+    REMOTE_CMD=(swift test --build-system native --filter SpeechHelperIntegrationTests)
+    ;;
+  integration-herdr)
+    # Live herdr join machinery: a real `herdr` server, a real `ssh -L`
+    # forward opened by the app's own coordinator, and the real socket
+    # client/probe/enrollment patch on top of them. Same
+    # marker-through-the-tree shape as the other live lanes, because the SSH
+    # build gate only allowlists exact `swift test ...` payloads and cannot
+    # carry per-command environment.
+    #
+    # With no argument the suite's fixture provisions its OWN loopback sshd
+    # (its own keys, its own authorized_keys file — the account's are never
+    # touched), so the lane is hermetic and needs no second machine. Pass an
+    # ssh destination to run the identical lane against a real second host
+    # you have already configured.
+    #
+    # Requires `herdr` on the build host; its absence fails the lane loudly
+    # rather than skipping (see docs/agent/test-tiers.md).
+    if [[ $# -gt 1 ]]; then
+      echo "integration-herdr accepts at most one argument (ssh destination)" >&2
+      exit 1
+    fi
+    HERDR_DESTINATION="${1:-}"
+    if [[ -n "$HERDR_DESTINATION" && ! "$HERDR_DESTINATION" =~ ^[A-Za-z0-9._-]+$ ]]; then
+      echo "integration-herdr destination must be a plain ssh alias or host" >&2
+      exit 1
+    fi
+    HERDR_MARKER="$ROOT_DIR/.herdr-integration-enable.json"
+    # Registered before the marker exists, so no kill window leaves a stale
+    # marker behind — locally or in the remote work dir.
+    trap 'cleanup_transient_marker "$HERDR_MARKER"' EXIT
+    if [[ -n "$HERDR_DESTINATION" ]]; then
+      printf '{"destination": "%s"}\n' "$HERDR_DESTINATION" >"$HERDR_MARKER"
+    else
+      printf '{}\n' >"$HERDR_MARKER"
+    fi
+    REMOTE_CMD=(swift test --build-system native --filter HerdrIntegrationTests)
+    ;;
+  eval-capture-polish-latency)
+    # Marker-gated XCTest, like polishd-bench: the gate cannot run the
+    # packaged helper directly or pass env vars.
+    if [[ $# -gt 2 ]]; then
+      echo "eval-capture-polish-latency accepts optional rounds and captures-path arguments" >&2
+      exit 1
+    fi
+    CAPTURE_LATENCY_ROUNDS="${1:-3}"
+    CAPTURE_LATENCY_CAPTURES="${2:-}"
+    if [[ ! "$CAPTURE_LATENCY_ROUNDS" =~ ^[1-9][0-9]*$ ]]; then
+      echo "eval-capture-polish-latency rounds must be a positive integer" >&2
+      exit 1
+    fi
+    if [[ -n "$CAPTURE_LATENCY_CAPTURES" && ! "$CAPTURE_LATENCY_CAPTURES" =~ ^/[A-Za-z0-9._/-]+$ ]]; then
+      echo "eval-capture-polish-latency captures-path must be an absolute path on the build host" >&2
+      exit 1
+    fi
+    CAPTURE_LATENCY_MARKER="$ROOT_DIR/.quick-capture-polish-latency-enable.json"
+    trap 'cleanup_transient_marker "$CAPTURE_LATENCY_MARKER"' EXIT
+    CAPTURE_LATENCY_HELPER="PolishHelper/.build/xcode/Build/Products/Release/localvoxtral-polishd"
+    if [[ -n "$CAPTURE_LATENCY_CAPTURES" ]]; then
+      printf '{"helperPath": "%s", "rounds": %s, "capturesPath": "%s"}\n' \
+        "$CAPTURE_LATENCY_HELPER" "$CAPTURE_LATENCY_ROUNDS" "$CAPTURE_LATENCY_CAPTURES" >"$CAPTURE_LATENCY_MARKER"
+    else
+      printf '{"helperPath": "%s", "rounds": %s}\n' \
+        "$CAPTURE_LATENCY_HELPER" "$CAPTURE_LATENCY_ROUNDS" >"$CAPTURE_LATENCY_MARKER"
+    fi
+    REMOTE_CMD=(swift test --build-system native --filter QuickCapturePolishLatencyTests)
+    ;;
+  polishd-bench)
+    # Marker-gated XCTest, like speechd-bench: the gate cannot run the
+    # packaged helper directly.
+    if [[ $# -gt 2 ]]; then
+      echo "polishd-bench accepts optional rounds and baseline-helper-path arguments" >&2
+      exit 1
+    fi
+    POLISHD_BENCH_ROUNDS="${1:-3}"
+    POLISHD_BENCH_BASELINE="${2:-}"
+    if [[ ! "$POLISHD_BENCH_ROUNDS" =~ ^[1-9][0-9]*$ ]]; then
+      echo "polishd-bench rounds must be a positive integer" >&2
+      exit 1
+    fi
+    if [[ -n "$POLISHD_BENCH_BASELINE" && ! "$POLISHD_BENCH_BASELINE" =~ ^/[A-Za-z0-9._/-]+$ ]]; then
+      echo "polishd-bench baseline-helper-path must be an absolute path" >&2
+      exit 1
+    fi
+    POLISHD_BENCH_MARKER="$ROOT_DIR/.polishd-bench-enable.json"
+    trap 'cleanup_transient_marker "$POLISHD_BENCH_MARKER"' EXIT
+    POLISHD_BENCH_HELPER="PolishHelper/.build/xcode/Build/Products/Release/localvoxtral-polishd"
+    # The greedy arm comes first: the report compares every arm's outputs
+    # with the first, and MTP must reproduce greedy decoding exactly.
+    POLISHD_BENCH_ARMS="{\"name\":\"greedy\",\"helperPath\":\"$POLISHD_BENCH_HELPER\",\"temperature\":0}"
+    POLISHD_BENCH_ARMS+=",{\"name\":\"greedy+MTP\",\"helperPath\":\"$POLISHD_BENCH_HELPER\",\"arguments\":[\"--speculative-decoding\",\"mtp\"],\"temperature\":0}"
+    POLISHD_BENCH_ARMS+=",{\"name\":\"temp 0.3\",\"helperPath\":\"$POLISHD_BENCH_HELPER\"}"
+    if [[ -n "$POLISHD_BENCH_BASELINE" ]]; then
+      POLISHD_BENCH_ARMS+=",{\"name\":\"baseline temp 0.3\",\"helperPath\":\"$POLISHD_BENCH_BASELINE\"}"
+    fi
+    printf '{"rounds":%s,"arms":[%s]}\n' "$POLISHD_BENCH_ROUNDS" "$POLISHD_BENCH_ARMS" \
+      >"$POLISHD_BENCH_MARKER"
+    REMOTE_CMD=(swift test --build-system native --filter PolishdSpeculativeBenchTests)
     ;;
   speechd-bench)
     # The SSH gate does not allow arbitrary packaged-binary execution. A marker-gated
     # root XCTest launches the xcodebuild-produced helper and relays its BENCH output.
-    if [[ $# -gt 3 ]]; then
-      echo "speechd-bench accepts optional seconds, cadence-ms, and cache-limit-mb arguments" >&2
+    if [[ $# -gt 8 ]]; then
+      echo "speechd-bench accepts optional seconds, cadence-ms, cache-limit-mb, max-utterance-seconds, model, audio, phase-ms, and mic-buffer-us arguments" >&2
       exit 1
     fi
     SPEECHD_BENCH_SECONDS="${1:-60}"
-    SPEECHD_BENCH_CADENCE="${2:-100}"
+    SPEECHD_BENCH_CADENCE="${2:-80}"
     SPEECHD_BENCH_CACHE_MB="${3:-}"
+    # The helper stops decoding at its utterance limit (#314). By default the benchmark
+    # lifts it to the run length, so a long run measures decoding rather than dead air.
+    SPEECHD_BENCH_MAX_UTTERANCE="${4:-$SPEECHD_BENCH_SECONDS}"
+    SPEECHD_BENCH_MODEL="${5:-}"
+    SPEECHD_BENCH_AUDIO="${6:-noise}"
+    SPEECHD_BENCH_PHASE="${7:-0}"
+    SPEECHD_BENCH_MIC_BUFFER="${8:-0}"
     if [[ ! "$SPEECHD_BENCH_SECONDS" =~ ^[1-9][0-9]*$ ]]; then
       echo "speechd-bench seconds must be a positive integer" >&2
       exit 1
@@ -337,23 +846,181 @@ case "$CMD" in
       echo "speechd-bench cache-limit-mb must be a positive integer" >&2
       exit 1
     fi
+    if [[ ! "$SPEECHD_BENCH_MAX_UTTERANCE" =~ ^[1-9][0-9]*$ ]]; then
+      echo "speechd-bench max-utterance-seconds must be a positive integer" >&2
+      exit 1
+    fi
+    if [[ -n "$SPEECHD_BENCH_MODEL" && ! "$SPEECHD_BENCH_MODEL" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]]; then
+      echo "speechd-bench model must be an owner/name Hugging Face repo id" >&2
+      exit 1
+    fi
+    if [[ "$SPEECHD_BENCH_AUDIO" != noise && "$SPEECHD_BENCH_AUDIO" != speech ]]; then
+      echo "speechd-bench audio must be noise or speech" >&2
+      exit 1
+    fi
+    if [[ ! "$SPEECHD_BENCH_PHASE" =~ ^[0-9]+$ ]]; then
+      echo "speechd-bench phase-ms must be a non-negative integer" >&2
+      exit 1
+    fi
+    if [[ ! "$SPEECHD_BENCH_MIC_BUFFER" =~ ^[0-9]+$ ]]; then
+      echo "speechd-bench mic-buffer-us must be a non-negative integer" >&2
+      exit 1
+    fi
     SPEECHD_BENCH_MARKER="$ROOT_DIR/.speechd-bench-enable.json"
     trap 'cleanup_transient_marker "$SPEECHD_BENCH_MARKER"' EXIT
+    # The optional fields are omitted rather than nulled, so the test's decoder
+    # falls back to its own defaults exactly as it did before they existed.
+    SPEECHD_BENCH_OPTIONAL=""
     if [[ -n "$SPEECHD_BENCH_CACHE_MB" ]]; then
-      printf '{"helperPath":"%s","seconds":%s,"cadenceMilliseconds":%s,"cacheLimitMB":%s}\n' \
-        "dist/localvoxtral.app/Contents/MacOS/localvoxtral-speechd" \
-        "$SPEECHD_BENCH_SECONDS" \
-        "$SPEECHD_BENCH_CADENCE" \
-        "$SPEECHD_BENCH_CACHE_MB" \
-        >"$SPEECHD_BENCH_MARKER"
-    else
-      printf '{"helperPath":"%s","seconds":%s,"cadenceMilliseconds":%s}\n' \
-        "dist/localvoxtral.app/Contents/MacOS/localvoxtral-speechd" \
-        "$SPEECHD_BENCH_SECONDS" \
-        "$SPEECHD_BENCH_CADENCE" \
-        >"$SPEECHD_BENCH_MARKER"
+      SPEECHD_BENCH_OPTIONAL+=",\"cacheLimitMB\":$SPEECHD_BENCH_CACHE_MB"
     fi
-    REMOTE_CMD=(swift test --filter SpeechdStreamingBenchTests)
+    if [[ -n "$SPEECHD_BENCH_MODEL" ]]; then
+      SPEECHD_BENCH_OPTIONAL+=",\"model\":\"$SPEECHD_BENCH_MODEL\""
+    fi
+    if [[ "$SPEECHD_BENCH_AUDIO" == speech ]]; then
+      SPEECHD_BENCH_OPTIONAL+=",\"audio\":\"speech\""
+    fi
+    if [[ "$SPEECHD_BENCH_PHASE" != 0 ]]; then
+      SPEECHD_BENCH_OPTIONAL+=",\"phaseMilliseconds\":$SPEECHD_BENCH_PHASE"
+    fi
+    if [[ "$SPEECHD_BENCH_MIC_BUFFER" != 0 ]]; then
+      SPEECHD_BENCH_OPTIONAL+=",\"micBufferMicroseconds\":$SPEECHD_BENCH_MIC_BUFFER"
+    fi
+    printf '{"helperPath":"%s","seconds":%s,"cadenceMilliseconds":%s,"maxUtteranceSeconds":%s%s}\n' \
+      "dist/localvoxtral.app/Contents/MacOS/localvoxtral-speechd" \
+      "$SPEECHD_BENCH_SECONDS" \
+      "$SPEECHD_BENCH_CADENCE" \
+      "$SPEECHD_BENCH_MAX_UTTERANCE" \
+      "$SPEECHD_BENCH_OPTIONAL" \
+      >"$SPEECHD_BENCH_MARKER"
+    REMOTE_CMD=(swift test --build-system native --filter SpeechdStreamingBenchTests)
+    ;;
+  eval-term-recall)
+    # The term-recall eval (#315): the speech engine alone, scored on the
+    # owner's technical terms. PRIVATE: the cases come from transcripts and
+    # live under the gitignored EvalRecordings/term-recall/; the scoreboard
+    # prints counts only. A marker-gated XCTest does the work, since the
+    # gate runs nothing else (EvalCorpus/term-recall/README.md).
+    TR_DIR="EvalRecordings/term-recall"
+    TR_ASR="voxtral"
+    TR_ASR_GIVEN=0
+    TR_LABEL=""
+    TR_LIMIT=""
+    TR_CASES=()
+    TR_RECORDINGS=""
+    TR_HYPOTHESES=""
+    TR_COMPARE=()
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --asr|--label|--limit|--case|--recordings|--hypotheses)
+          if [[ $# -lt 2 ]]; then
+            echo "eval-term-recall: $1 needs a value" >&2
+            exit 1
+          fi
+          case "$1" in
+            --asr) TR_ASR="$2"; TR_ASR_GIVEN=1 ;;
+            --label) TR_LABEL="$2" ;;
+            --limit) TR_LIMIT="$2" ;;
+            --case) TR_CASES+=("$2") ;;
+            --recordings) TR_RECORDINGS="$2" ;;
+            --hypotheses) TR_HYPOTHESES="$2" ;;
+          esac
+          shift 2
+          ;;
+        compare)
+          if [[ $# -ne 3 ]]; then
+            echo "eval-term-recall compare takes two run labels: compare <before> <after>" >&2
+            exit 1
+          fi
+          TR_COMPARE=("$2" "$3")
+          shift 3
+          ;;
+        *)
+          echo "eval-term-recall: unknown argument $1" >&2
+          exit 1
+          ;;
+      esac
+    done
+    # Names that land in JSON and paths: no quoting to get wrong.
+    for value in "$TR_LABEL" "${TR_CASES[@]+"${TR_CASES[@]}"}" "${TR_COMPARE[@]+"${TR_COMPARE[@]}"}"; do
+      if [[ -n "$value" && ! "$value" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        echo "eval-term-recall: '$value' must be [A-Za-z0-9._-]" >&2
+        exit 1
+      fi
+    done
+    if [[ -n "$TR_LIMIT" && ! "$TR_LIMIT" =~ ^[1-9][0-9]*$ ]]; then
+      echo "eval-term-recall: --limit must be a positive integer" >&2
+      exit 1
+    fi
+    for private_only in session-map.json terms.json; do
+      if [[ -f "$ROOT_DIR/$TR_DIR/$private_only" ]]; then
+        echo "$TR_DIR/$private_only must never leave the harvest machine; the harvester" >&2
+        echo "now writes it outside the repo. Remove it from this tree before syncing." >&2
+        exit 1
+      fi
+    done
+    # Options that one mode would silently ignore are mistakes: refuse them.
+    if [[ ${#TR_COMPARE[@]} -eq 2 && ( "$TR_ASR_GIVEN" == 1 || -n "$TR_LABEL$TR_LIMIT$TR_RECORDINGS$TR_HYPOTHESES" \
+          || ${#TR_CASES[@]} -gt 0 ) ]]; then
+      echo "eval-term-recall compare takes no other options" >&2
+      exit 1
+    fi
+    if [[ -n "$TR_HYPOTHESES" && ( "$TR_ASR_GIVEN" == 1 || -n "$TR_RECORDINGS" ) ]]; then
+      echo "eval-term-recall: --hypotheses scores text, so --asr and --recordings do not apply" >&2
+      exit 1
+    fi
+    TR_MARKER="$ROOT_DIR/.term-recall-eval-enable.json"
+    trap 'cleanup_transient_marker "$TR_MARKER"' EXIT
+    if [[ ${#TR_COMPARE[@]} -eq 2 ]]; then
+      for label in "${TR_COMPARE[@]}"; do
+        if [[ ! -f "$ROOT_DIR/$TR_DIR/runs/$label.jsonl" ]]; then
+          echo "eval-term-recall: no run $TR_DIR/runs/$label.jsonl in this tree" >&2
+          exit 1
+        fi
+      done
+      printf '{"mode":"compare","before":"%s","after":"%s"}\n' \
+        "$TR_DIR/runs/${TR_COMPARE[0]}.jsonl" "$TR_DIR/runs/${TR_COMPARE[1]}.jsonl" >"$TR_MARKER"
+    else
+      if [[ ! -f "$ROOT_DIR/$TR_DIR/cases.json" ]]; then
+        echo "$TR_DIR/cases.json not found; run scripts/harvest-term-recall-cases.py first" >&2
+        exit 1
+      fi
+      TR_OPTIONAL=""
+      if [[ -n "$TR_LIMIT" ]]; then
+        TR_OPTIONAL+=",\"limit\":$TR_LIMIT"
+      fi
+      if [[ ${#TR_CASES[@]} -gt 0 ]]; then
+        TR_OPTIONAL+=",\"caseIDs\":[$(printf '"%s",' "${TR_CASES[@]}" | sed 's/,$//')]"
+      fi
+      if [[ -n "$TR_HYPOTHESES" ]]; then
+        if [[ ! "$TR_HYPOTHESES" =~ ^$TR_DIR/[A-Za-z0-9._-]+\.jsonl$ || ! -f "$ROOT_DIR/$TR_HYPOTHESES" ]]; then
+          echo "eval-term-recall: --hypotheses must be an existing $TR_DIR/<name>.jsonl" >&2
+          exit 1
+        fi
+        TR_LABEL="${TR_LABEL:-$(basename "$TR_HYPOTHESES" .jsonl)}"
+        printf '{"mode":"hypotheses","label":"%s","hypothesesFile":"%s"%s}\n' \
+          "$TR_LABEL" "$TR_HYPOTHESES" "$TR_OPTIONAL" >"$TR_MARKER"
+      else
+        if [[ -n "$TR_RECORDINGS" ]]; then
+          if [[ ! "$TR_RECORDINGS" =~ ^$TR_DIR/[A-Za-z0-9._-]+$ ]]; then
+            echo "eval-term-recall: --recordings must be $TR_DIR/<set>" >&2
+            exit 1
+          fi
+          TR_OPTIONAL+=",\"recordingDirectory\":\"$TR_RECORDINGS\""
+        fi
+        speech_model_row "$TR_ASR" eval-term-recall
+        TR_LABEL="${TR_LABEL:-$TR_ASR-none}"
+        printf '{"mode":"audio","label":"%s","asr":"%s","endpoint":"%s","asrModel":"%s","bias":"none"%s}\n' \
+          "$TR_LABEL" "$TR_ASR" "ws://127.0.0.1:$SPEECH_MODEL_PORT/v1/realtime" "$SPEECH_MODEL_REPO" \
+          "$TR_OPTIONAL" >"$TR_MARKER"
+        ENSURE_SERVER="$(speech_service_name "$TR_ASR")"
+      fi
+      # The run file comes back through the log: the Mac's copy is under a
+      # work dir that a fresh LV_BUILD_DIR or the gc verb can drop.
+      TERM_RECALL_RUN_OUT="$ROOT_DIR/$TR_DIR/runs/$TR_LABEL.jsonl"
+    fi
+    REMOTE_CMD=(swift test --build-system native --filter TermRecallEvalTests)
+    REQUIRE_SUITE_IN_LOG="TermRecallEvalTests"
     ;;
   eval-e2e)
     # Agent-dictation end-to-end eval (nightly + manual, never tier 0):
@@ -365,11 +1032,115 @@ case "$CMD" in
     # pins env prefixes per-command). Expect many minutes: ~150 TTS+ASR cases
     # plus live 4B polish inference (synthesized WAVs are cached on the host
     # under ~/Library/Caches/localvoxtral-eval/wav, so reruns skip TTS).
-    if [[ $# -gt 1 ]]; then
-      echo "eval-e2e accepts at most one argument (recording-set directory)" >&2
+    #
+    # `--provider mistral` (or a bare `mistral` argument) moves BOTH live
+    # stages to Mistral's hosted API instead, exactly as the app's Mistral API
+    # mode drives them. That arm needs no local server and no prior `package`
+    # run — and it BILLS the owner's Mistral account, so it is by-hand only.
+    E2E_RECORDING_DIR=""
+    E2E_REPLAY_DIR=""
+    E2E_PROVIDER=""
+    E2E_ASR=""
+    E2E_ASR_GIVEN=0
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --asr)
+          if [[ $# -lt 2 ]]; then
+            echo "eval-e2e: --asr needs a model name from scripts/mac/test-speech-models.tsv" >&2
+            exit 1
+          fi
+          E2E_ASR="$2"
+          E2E_ASR_GIVEN=1
+          shift 2
+          ;;
+        --asr=*)
+          E2E_ASR="${1#--asr=}"
+          E2E_ASR_GIVEN=1
+          shift
+          ;;
+        --provider)
+          if [[ $# -lt 2 ]]; then
+            echo "eval-e2e: --provider needs a value (mistral)" >&2
+            exit 1
+          fi
+          E2E_PROVIDER="$2"
+          shift 2
+          ;;
+        --provider=*)
+          E2E_PROVIDER="${1#--provider=}"
+          shift
+          ;;
+        mistral)
+          E2E_PROVIDER="mistral"
+          shift
+          ;;
+        --replay)
+          if [[ $# -lt 2 ]]; then
+            echo "eval-e2e: --replay needs a set directory, EvalRecordings/replay/<set>" >&2
+            exit 1
+          fi
+          E2E_REPLAY_DIR="$2"
+          shift 2
+          ;;
+        -*)
+          echo "eval-e2e: unknown option $1" >&2
+          exit 1
+          ;;
+        *)
+          if [[ -n "$E2E_RECORDING_DIR" ]]; then
+            echo "eval-e2e accepts at most one recording-set directory" >&2
+            exit 1
+          fi
+          E2E_RECORDING_DIR="$1"
+          shift
+          ;;
+      esac
+    done
+    if [[ -n "$E2E_PROVIDER" && "$E2E_PROVIDER" != "mistral" ]]; then
+      echo "eval-e2e: unknown provider '$E2E_PROVIDER' (only 'mistral')" >&2
       exit 1
     fi
-    E2E_RECORDING_DIR="${1:-}"
+    if [[ -n "$E2E_REPLAY_DIR" ]]; then
+      # A replay scores a user's stored dictations on the local services; it
+      # takes no corpus recording set and never bills a hosted provider.
+      if [[ -n "$E2E_RECORDING_DIR" || -n "$E2E_PROVIDER" ]]; then
+        echo "eval-e2e: --replay takes no recording set and no --provider" >&2
+        exit 1
+      fi
+      if [[ ! "$E2E_REPLAY_DIR" =~ ^EvalRecordings/replay/[A-Za-z0-9._-]+$ ]]; then
+        echo "eval-e2e replay set must be EvalRecordings/replay/<set>" >&2
+        exit 1
+      fi
+      if [[ ! -f "$ROOT_DIR/$E2E_REPLAY_DIR/default.store" ]]; then
+        echo "replay set not found: $E2E_REPLAY_DIR/default.store" >&2
+        echo "Export one on the Mac that dictated with scripts/export-dictation-replay.sh" >&2
+        exit 1
+      fi
+    fi
+    if [[ "$E2E_PROVIDER" == "mistral" && "$E2E_ASR_GIVEN" == 1 ]]; then
+      echo "eval-e2e: --asr picks a speech test service on the Mac; --provider mistral uses none" >&2
+      exit 1
+    fi
+    if [[ "$E2E_PROVIDER" == "mistral" && -z "${MISTRAL_API_KEY:-}" ]]; then
+      echo "eval-e2e --provider mistral needs MISTRAL_API_KEY in this shell's environment:" >&2
+      echo "  export MISTRAL_API_KEY=... && ./scripts/remote-build.sh eval-e2e --provider mistral" >&2
+      exit 1
+    fi
+    if [[ "$E2E_PROVIDER" == "mistral" ]]; then
+      require_mistral_api_key_format
+    fi
+    # The speech service to score: its port and pinned repo come from the same
+    # list the Mac's services are installed from.
+    if [[ "$E2E_ASR_GIVEN" == 0 ]]; then
+      E2E_ASR="voxtral"
+    fi
+    E2E_ASR_PORT=""
+    E2E_ASR_REPO=""
+    if [[ "$E2E_PROVIDER" != "mistral" ]]; then
+      speech_model_row "$E2E_ASR" eval-e2e
+      E2E_ASR_PORT="$SPEECH_MODEL_PORT"
+      E2E_ASR_REPO="$SPEECH_MODEL_REPO"
+    fi
     if [[ -n "$E2E_RECORDING_DIR" ]]; then
       # Keep the marker JSON trivially safe and make operator mistakes fail
       # before waking/model-loading the Mac. Human mode is strict: the Swift
@@ -384,24 +1155,54 @@ case "$CMD" in
         exit 1
       fi
     fi
-    ENSURE_SERVER="speechd"
+    # The hosted arm touches no local server: warming speechd would load 4B
+    # weights on the Mac that nothing in the run would ever talk to.
+    # Voxtral goes by `speechd`, which a gate older than the speech model list
+    # also accepts.
+    if [[ "$E2E_PROVIDER" != "mistral" ]]; then
+      ENSURE_SERVER="$(speech_service_name "$E2E_ASR")"
+    fi
     E2E_MARKER="$ROOT_DIR/.agent-eval-e2e-enable.json"
     # Trap registered before the marker exists, so no kill window leaves a
-    # stale marker behind (locally or in the remote work dir).
+    # stale marker behind (locally or in the remote work dir) — and in the
+    # Mistral arm that marker carries a real API key.
     trap 'cleanup_transient_marker "$E2E_MARKER"' EXIT
-    if [[ -n "$E2E_RECORDING_DIR" ]]; then
-      printf '{"helperPath": "%s", "asrModel": "%s", "recordingDirectory": "%s"}\n' \
+    if [[ "$E2E_PROVIDER" == "mistral" ]]; then
+      # 0600 before a single byte of the key is written. No helperPath/asrModel:
+      # the harness resolves Mistral's own pins from the provider.
+      (umask 077; : >"$E2E_MARKER")
+      if [[ -n "$E2E_RECORDING_DIR" ]]; then
+        printf '{"provider": "mistral", "apiKey": "%s", "recordingDirectory": "%s"}\n' \
+          "$MISTRAL_API_KEY" \
+          "$E2E_RECORDING_DIR" \
+          >"$E2E_MARKER"
+      else
+        printf '{"provider": "mistral", "apiKey": "%s"}\n' \
+          "$MISTRAL_API_KEY" \
+          >"$E2E_MARKER"
+      fi
+    elif [[ -n "$E2E_REPLAY_DIR" ]]; then
+      printf '{"helperPath": "%s", "voxmlxEndpoint": "%s", "asrModel": "%s", "replayDirectory": "%s"}\n' \
         "PolishHelper/.build/xcode/Build/Products/Release/localvoxtral-polishd" \
-        "T0mSIlver/Voxtral-Mini-4B-Realtime-2602-4bit-qhead" \
+        "ws://127.0.0.1:$E2E_ASR_PORT/v1/realtime" \
+        "$E2E_ASR_REPO" \
+        "$E2E_REPLAY_DIR" \
+        >"$E2E_MARKER"
+    elif [[ -n "$E2E_RECORDING_DIR" ]]; then
+      printf '{"helperPath": "%s", "voxmlxEndpoint": "%s", "asrModel": "%s", "recordingDirectory": "%s"}\n' \
+        "PolishHelper/.build/xcode/Build/Products/Release/localvoxtral-polishd" \
+        "ws://127.0.0.1:$E2E_ASR_PORT/v1/realtime" \
+        "$E2E_ASR_REPO" \
         "$E2E_RECORDING_DIR" \
         >"$E2E_MARKER"
     else
-      printf '{"helperPath": "%s", "asrModel": "%s"}\n' \
+      printf '{"helperPath": "%s", "voxmlxEndpoint": "%s", "asrModel": "%s"}\n' \
         "PolishHelper/.build/xcode/Build/Products/Release/localvoxtral-polishd" \
-        "T0mSIlver/Voxtral-Mini-4B-Realtime-2602-4bit-qhead" \
+        "ws://127.0.0.1:$E2E_ASR_PORT/v1/realtime" \
+        "$E2E_ASR_REPO" \
         >"$E2E_MARKER"
     fi
-    REMOTE_CMD=(swift test --filter AgentDictationE2EEvalTests)
+    REMOTE_CMD=(swift test --build-system native --filter AgentDictationE2EEvalTests)
     ;;
   eval-llm)
     # Enablement travels as a gitignored marker file inside the synced tree
@@ -422,7 +1223,43 @@ case "$CMD" in
     # Trap registered before the marker exists, so no kill window leaves a
     # stale marker behind (locally or in the remote work dir).
     trap 'cleanup_transient_marker "$EVAL_MARKER"' EXIT
-    if [[ "$EVAL_MODEL" == llamacpp/* ]]; then
+    if [[ "$EVAL_MODEL" == mistral/* ]]; then
+      # The key below comes from this shell, not from the caller's endpoint,
+      # so it goes nowhere but Mistral's API (#1622).
+      if [[ ! "$EVAL_ENDPOINT" =~ ^https://api\.mistral\.ai(/[^@]*)?$ ]]; then
+        echo "eval-llm: a mistral/ model sends its key only to https://api.mistral.ai, not $EVAL_ENDPOINT" >&2
+        exit 1
+      fi
+      # Mistral rejects unknown body fields, so the app sends a different
+      # request shape entirely (no top_k/min_p/chat_template_kwargs/
+      # thinking_budget_tokens, reasoning_effort per model). The key is a secret:
+      # it is read from this box's environment into the gitignored marker the
+      # EXIT trap removes — never into the SSH command line or the repo.
+      if [[ "$EVAL_MODEL" == mistral/*glm* ]]; then
+        EVAL_KEY="$(vibe_mistral_api_key)"
+        if [[ -z "$EVAL_KEY" ]]; then
+          echo "eval-llm: a GLM model bills the Vibe plan key; log in with vibe --setup or set VIBE_MISTRAL_API_KEY" >&2
+          exit 1
+        fi
+        require_mistral_api_key_format "$EVAL_KEY" "the Vibe key"
+      else
+        EVAL_KEY="${MISTRAL_API_KEY:-}"
+        if [[ -z "$EVAL_KEY" ]]; then
+          echo "eval-llm: a mistral/ model alias needs MISTRAL_API_KEY set in this shell" >&2
+          echo "  e.g. MISTRAL_API_KEY=... $0 eval-llm https://api.mistral.ai mistral/mistral-medium-3-5" >&2
+          exit 1
+        fi
+        require_mistral_api_key_format
+      fi
+      # 0600 before a single byte of the key is written — the same standard as
+      # the integration-mistral marker (the redirect below keeps the mode).
+      (umask 077; : >"$EVAL_MARKER")
+      # No useDefaultRequestShape: production Mistral mode sends no catalog
+      # sampling defaults (temperature 0.3 + reasoning_effort only), and
+      # the eval must score exactly the request shape the app sends.
+      printf '{"endpoint": "%s", "model": "%s", "requestShape": "mistral", "apiKey": "%s"}\n' \
+        "$EVAL_ENDPOINT" "${EVAL_MODEL#mistral/}" "$EVAL_KEY" >"$EVAL_MARKER"
+    elif [[ "$EVAL_MODEL" == llamacpp/* ]]; then
       # Bifrost requires the passthrough opt-in for llama.cpp-specific fields;
       # current llama.cpp disables Qwen 3.5 reasoning per request with a zero
       # thinking budget. Keep the production catalog's enable_thinking=false
@@ -435,29 +1272,7 @@ case "$CMD" in
     else
       printf '{"endpoint": "%s"}\n' "$EVAL_ENDPOINT" >"$EVAL_MARKER"
     fi
-    REMOTE_CMD=(swift test --filter LLMPolishPromptEvalTests)
-    ;;
-  dogfood|dogfood-package)
-    # The dogfooding capture is a COMPILE gate (Package.swift), and the build
-    # gate allowlists exact payloads, so enablement travels as the same kind of
-    # gitignored marker the eval lanes use rather than an env prefix.
-    #
-    # `dogfood`         — build + run the capture suite in an instrumented tree.
-    # `dogfood-package` — package an instrumented .app for hand-dogfooding.
-    #                     The bundle identifier is unchanged (the TCC grant is
-    #                     part of what is being exercised); the artifact
-    #                     identifies itself through Info.plist's
-    #                     LVXDogfoodCapture, which Settings > About reports.
-    DOGFOOD_MARKER="$ROOT_DIR/.dogfood-capture-enable"
-    # Registered before the marker exists, so no kill window can leave an
-    # instrumented tree behind — locally or in the remote work dir.
-    trap 'cleanup_transient_marker "$DOGFOOD_MARKER"' EXIT
-    printf 'dogfood capture build marker; removed automatically\n' >"$DOGFOOD_MARKER"
-    if [[ "$CMD" == "dogfood-package" ]]; then
-      REMOTE_CMD=(./scripts/package_app.sh release "$@")
-    else
-      REMOTE_CMD=(swift test --filter Dogfood "$@")
-    fi
+    REMOTE_CMD=(swift test --build-system native --filter LLMPolishPromptEvalTests)
     ;;
   package) REMOTE_CMD=(./scripts/package_app.sh release "$@") ;;
   exec)
@@ -468,10 +1283,14 @@ case "$CMD" in
     REMOTE_CMD=("$@")
     ;;
   *)
-    echo "Usage: $0 [build|test|integration|integration-polishd|integration-speechd|speechd-bench|eval-llm|eval-e2e|dogfood|dogfood-package|package|exec|diag|applog|voxlog|svc-status] [extra args...]" >&2
+    echo "Usage: $0 [build|test|test-cost-budgets|integration|integration-polishd|integration-speechd|integration-herdr|speechd-bench|polishd-bench|eval-llm|eval-e2e|eval-term-recall|package|exec|diag|applog|voxlog|svc-status] [extra args...]" >&2
     exit 1
     ;;
 esac
+
+# Checked on the assembled payload, so every command that forwards arguments
+# is covered, and before the first ssh of the run.
+reject_gate_blocked_args "${REMOTE_CMD[@]}"
 
 if [[ -n "$ENSURE_SERVER" ]]; then
   ensure_remote_server "$ENSURE_SERVER"
@@ -494,9 +1313,82 @@ rsync -az --delete \
 # cleanup rsync now has something to delete.
 TREE_SYNCED=1
 
+# Started only now: core-tests-linux.sh removes Package.resolved while it
+# builds, and the sync above must carry it.
+if [[ "$LINUX_RUN" == "1" ]]; then
+  echo "==> Running the Linux suites here with $LINUX_SWIFT, beside the Mac run"
+  start_linux_suites
+fi
+
 PAYLOAD_STATUS=0
-run_remote_payload "cd $(printf '%q' "$DIR") && $(printf '%q ' "${REMOTE_CMD[@]}")" \
-  || PAYLOAD_STATUS=$?
+if [[ "$RUN_UNIT_SHARDS" == "1" ]]; then
+  # shellcheck source=lib/unit-test-shards.sh
+  . "$ROOT_DIR/scripts/lib/unit-test-shards.sh"
+  # One ssh session per swift command: the gate admits only `swift build …`
+  # and `swift test …`, and runs each in a process group of its own. -n keeps
+  # the shards that run side by side off this terminal's stdin.
+  lv_shard_swift() {
+    ssh -n "$HOST" "cd $(printf '%q' "$DIR") && $(quote_remote_command swift "$@" --build-system native)"
+  }
+  echo "==> Running the unit suite on $HOST:$DIR in $UNIT_TEST_SHARDS shards"
+  REMOTE_PAYLOAD_ACTIVE=1
+  lv_run_unit_shards "$UNIT_TEST_SHARDS" "$REMOTE_LOG" "${UNIT_TEST_SKIP_NAMES[@]}" \
+    || PAYLOAD_STATUS=$?
+  REMOTE_PAYLOAD_ACTIVE=0
+  echo "==> Full output: $REMOTE_LOG"
+  # Only once every shard has ended: the reap takes all of the work dir's
+  # processes, so reaping after the first red shard would kill the others.
+  if (( PAYLOAD_STATUS != 0 )); then
+    reap_remote_workdir
+  fi
+else
+  run_remote_payload "cd $(printf '%q' "$DIR") && $(printf '%q ' "${REMOTE_CMD[@]}")" \
+    || PAYLOAD_STATUS=$?
+fi
+
+if [[ -n "$LINUX_PID" ]]; then
+  LINUX_STATUS=0
+  wait "$LINUX_PID" || LINUX_STATUS=$?
+  LINUX_PID=""
+  report_linux_suites "$LINUX_STATUS"
+  if [[ "$PAYLOAD_STATUS" == "0" && "$LINUX_STATUS" != "0" ]]; then
+    PAYLOAD_STATUS="$LINUX_STATUS"
+  fi
+fi
+
+# A lane that names a suite it must have run checks the log for it. Only on an
+# otherwise-successful run: a failing run already says what went wrong.
+if [[ "$PAYLOAD_STATUS" -eq 0 && -n "$REQUIRE_SUITE_IN_LOG" ]]; then
+  if ! grep -q "Test Suite '$REQUIRE_SUITE_IN_LOG'" "$REMOTE_LOG"; then
+    echo "$CMD ran no cases of $REQUIRE_SUITE_IN_LOG: the --filter here and the --skip in the test lane must name the suite as it is spelled now" >&2
+    PAYLOAD_STATUS=1
+  fi
+fi
+
+# eval-term-recall prints its run file between sentinels; keep a local copy,
+# since the Mac's copy lives in a work dir that can be dropped. A run that
+# failed some cases still printed the ones it scored. Only a block with both
+# sentinels is taken: a payload that died mid-print would leave a partial
+# file that a later compare would read as a complete run.
+if [[ -n "$TERM_RECALL_RUN_OUT" ]]; then
+  mkdir -p "$(dirname "$TERM_RECALL_RUN_OUT")"
+  # swift test prints its "--build-system native is deprecated" warning on
+  # stderr while the run file streams on stdout, sometimes mid-line. It is
+  # the one known intruder; drop it before checking the lines.
+  if perl -0pe "s/warning: '--build-system native' has been deprecated[^\\n]*\\n//g" "$REMOTE_LOG" \
+    | awk '/^=== TERM-RECALL-RUN-END ===$/ { if (inside) closed = 1; inside = 0; next }
+          inside { print }
+          /^=== TERM-RECALL-RUN-BEGIN ===$/ { inside = 1 }
+          END { exit !closed }' >"$TERM_RECALL_RUN_OUT.tmp" \
+    && ! grep -qv '^{.*}$' "$TERM_RECALL_RUN_OUT.tmp"; then
+    mv "$TERM_RECALL_RUN_OUT.tmp" "$TERM_RECALL_RUN_OUT"
+    echo "==> Run file: ${TERM_RECALL_RUN_OUT#"$ROOT_DIR/"}"
+  else
+    rm -f "$TERM_RECALL_RUN_OUT.tmp"
+    echo "==> No complete run file in the log, or a line in it is not JSON (a" >&2
+    echo "    diagnostic written into it); nothing copied back" >&2
+  fi
+fi
 
 # Opportunistic remote work-dir GC (gate v4 `gc` verb): reclaim stale sibling
 # dirs while the host is known awake — the disk only fills when agents build,

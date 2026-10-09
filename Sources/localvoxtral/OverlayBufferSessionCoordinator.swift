@@ -6,6 +6,12 @@ import os
 protocol OverlayBufferRendering: AnyObject {
     func render(snapshot: OverlayBufferStateMachine.Snapshot?)
     func hide()
+    /// Moves the level bars without re-rendering the panel (#1074).
+    func updateMicLevel(_ level: Double)
+}
+
+extension OverlayBufferRendering {
+    func updateMicLevel(_ level: Double) {}
 }
 
 extension DictationOverlayController: OverlayBufferRendering {}
@@ -24,6 +30,13 @@ protocol OverlayTextCommitting: AnyObject {
 
     func insertTextPrioritizingKeyboard(_ text: String, preferredAppPID: pid_t?) -> TextInsertResult
     func pasteUsingCommandV(_ text: String, preferredAppPID: pid_t?) -> Bool
+    /// True for a committer that delivers without posting keys (the
+    /// opencode prompt relay), which Secure Keyboard Entry cannot swallow.
+    var postsNoKeys: Bool { get }
+}
+
+extension OverlayTextCommitting {
+    var postsNoKeys: Bool { false }
 }
 
 extension TextInsertionService: OverlayTextCommitting {}
@@ -41,7 +54,11 @@ enum OverlayBufferCommitOutcome: Equatable {
 @MainActor
 protocol OverlayBufferSessionCoordinating: AnyObject {
     func resolveAnchorNow() -> OverlayAnchor
-    func startSession(preResolvedAnchor: OverlayAnchor?)
+    /// Opens the overlay for a session. `claudeJoin` is taken here, not through
+    /// a later setter, because starting a session RESETS the panel state — a
+    /// badge pushed beforehand would be wiped, and one pushed afterwards
+    /// depended on a call order nothing enforced.
+    func startSession(preResolvedAnchor: OverlayAnchor?, claudeJoin: OverlayClaudeJoinBadge)
     func beginFinalizing(displayBufferText: String, commitBufferText: String)
     func refresh(displayBufferText: String, commitBufferText: String)
     @discardableResult
@@ -58,14 +75,35 @@ protocol OverlayBufferSessionCoordinating: AnyObject {
     /// while buffering. Defaulted so test doubles stay unchanged.
     func showSecureInputWarning()
     /// Flags that LLM polishing changed the committed text vs the raw
-    /// transcript, so the overlay shows the "Polished" badge while the polished
-    /// text is held before dismissal. Defaulted so test doubles stay unchanged.
+    /// transcript, so the overlay marks the changed words while the polished
+    /// text is held before dismissal. Call it BEFORE the polished text reaches
+    /// the buffer. Defaulted so test doubles stay unchanged.
     func markPolished(_ polished: Bool)
+    /// The polish request is out, or ended without a polished text (#1074).
+    /// Defaulted so test doubles stay unchanged.
+    func markPolishing(_ polishing: Bool)
+    /// The panel shows words polish changed: its hold is
+    /// `TimingConstants.overlayPolishedVisibility`, long enough to see them.
+    var showsPolishChange: Bool { get }
+    /// The mic's level, 0...1, for the bars while the dictation runs.
+    /// Defaulted so test doubles stay unchanged.
+    func updateMicLevel(_ level: Double)
+    /// Shows the overlay's destinations (#840). Defaulted so test doubles
+    /// stay unchanged.
+    func showDestinations(_ strip: OverlayDestinationStrip?)
+    /// Shows the one draft a review dictation acts on (#927). Defaulted so
+    /// test doubles stay unchanged.
+    func showDraftReview(_ draft: QuickCaptureDraftSnapshot?)
 }
 
 extension OverlayBufferSessionCoordinating {
     func showSecureInputWarning() {}
     func markPolished(_ polished: Bool) {}
+    func markPolishing(_ polishing: Bool) {}
+    var showsPolishChange: Bool { false }
+    func updateMicLevel(_ level: Double) {}
+    func showDestinations(_ strip: OverlayDestinationStrip?) {}
+    func showDraftReview(_ draft: QuickCaptureDraftSnapshot?) {}
 }
 
 @MainActor
@@ -119,7 +157,10 @@ final class OverlayBufferSessionCoordinator: OverlayBufferSessionCoordinating {
         anchorResolver.resolveAnchor()
     }
 
-    func startSession(preResolvedAnchor: OverlayAnchor? = nil) {
+    func startSession(
+        preResolvedAnchor: OverlayAnchor? = nil,
+        claudeJoin: OverlayClaudeJoinBadge = .hidden
+    ) {
         dismissTask?.cancel()
         dismissTask = nil
         commitBufferText = ""
@@ -128,7 +169,7 @@ final class OverlayBufferSessionCoordinator: OverlayBufferSessionCoordinating {
         refreshLiveCommitTargetAppPID()
 
         let anchor = preResolvedAnchor ?? anchorResolver.resolveAnchor()
-        stateMachine.startSession(anchor: anchor)
+        stateMachine.startSession(anchor: anchor, claudeJoin: claudeJoin)
         renderCurrentSnapshot()
         Log.overlay.info("overlay session started (preResolved=\(preResolvedAnchor != nil, privacy: .public))")
     }
@@ -186,14 +227,14 @@ final class OverlayBufferSessionCoordinator: OverlayBufferSessionCoordinating {
         // happily, and the words would be gone. Skip the doomed attempts,
         // put the text on the clipboard unconditionally — losing it is the
         // only alternative — and show the failure state.
-        if TerminalTargetDetector.isSecureKeyboardEntryEnabled() {
+        if !textCommitter.postsNoKeys, TerminalTargetDetector.isSecureKeyboardEntryEnabled() {
             // The clipboard is the ONLY preservation path here: if the write
             // fails, claiming "copied" and dismissing the panel would lose
             // the transcript's last remaining copy — fall back to the
             // persistent failure panel, which keeps the text visible.
             guard copyToPasteboard(commitText) else {
                 let failureMessage =
-                    "Secure input blocked auto-paste and the clipboard copy failed — the text stays visible here."
+                    "Secure input blocked auto-paste, and the clipboard copy failed; the text remains visible."
                 stateMachine.commitFailed(
                     error: failureMessage,
                     anchor: anchorResolver.resolveAnchor()
@@ -202,7 +243,7 @@ final class OverlayBufferSessionCoordinator: OverlayBufferSessionCoordinating {
                 Log.overlay.error("overlay commit skipped: secure input active AND clipboard write failed")
                 return .failed(message: failureMessage)
             }
-            let fallbackMessage = "Secure input blocked auto-paste — text copied, paste it manually."
+            let fallbackMessage = "Secure input blocked auto-paste, so the text was copied for manual paste."
             stateMachine.commitFailed(
                 error: fallbackMessage,
                 anchor: anchorResolver.resolveAnchor()
@@ -265,6 +306,30 @@ final class OverlayBufferSessionCoordinator: OverlayBufferSessionCoordinating {
 
     func markPolished(_ polished: Bool) {
         stateMachine.setPolished(polished)
+        renderCurrentSnapshot()
+    }
+
+    func markPolishing(_ polishing: Bool) {
+        stateMachine.setPolishing(polishing)
+        renderCurrentSnapshot()
+    }
+
+    var showsPolishChange: Bool {
+        stateMachine.polished
+    }
+
+    func updateMicLevel(_ level: Double) {
+        guard stateMachine.phase == .buffering else { return }
+        renderer.updateMicLevel(level)
+    }
+
+    func showDestinations(_ strip: OverlayDestinationStrip?) {
+        stateMachine.setDestinations(strip)
+        renderCurrentSnapshot()
+    }
+
+    func showDraftReview(_ draft: QuickCaptureDraftSnapshot?) {
+        stateMachine.setDraftReview(draft)
         renderCurrentSnapshot()
     }
 

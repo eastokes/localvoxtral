@@ -15,9 +15,29 @@ final class SpeechdStreamingBenchTests: XCTestCase {
         let helperPath: String?
         let seconds: Int
         let cadenceMilliseconds: Int
+        /// Steps land this many ms past each cadence multiple (#1670). Absent means 0.
+        let phaseMilliseconds: Int?
+        /// Nonzero models the app's timer-driven sends of whole mic buffers. Absent means 0.
+        let micBufferMicroseconds: Int?
         let wavPath: String?
         let cacheLimitMB: Int?
+        let maxUtteranceSeconds: Int?
+        /// Catalog repo to benchmark. Absent means the catalog default, which
+        /// is what every run measured before a second model existed.
+        let model: String?
+        /// "speech" feeds a spoken passage from the system voice instead of the
+        /// helper's synthetic noise, which decodes to no words and so cannot show
+        /// when text appears (#486).
+        let audio: String?
     }
+
+    /// About twenty seconds of plain dictation. The bench loops it to fill the run.
+    private static let spokenPassage = """
+        Please open the settings file and change the step interval to two hundred \
+        and forty milliseconds. Then run the benchmark again for each model, write \
+        down the peak memory and the time to first text, and compare the numbers \
+        with the ones from yesterday before we decide what the pane should say.
+        """
 
     private var repoRoot: URL {
         URL(fileURLWithPath: #filePath)
@@ -48,19 +68,35 @@ final class SpeechdStreamingBenchTests: XCTestCase {
             return
         }
 
-        let model = SpeechModelCatalog.defaultOption
+        let model = config.model.flatMap(SpeechModelCatalog.option(forRepoID:))
+            ?? SpeechModelCatalog.defaultOption
+        if let requested = config.model, requested != model.repoID {
+            XCTFail("\(requested) is not in SpeechModelCatalog; nothing to benchmark")
+            return
+        }
+        print("BENCH model=\(model.repoID)")
         var arguments = [
             "--model", model.repoID,
             "--model-revision", model.revision,
             "--bench",
             "--seconds", "\(config.seconds)",
             "--cadence-ms", "\(config.cadenceMilliseconds)",
+            "--phase-ms", "\(config.phaseMilliseconds ?? 0)",
+            "--mic-buffer-us", "\(config.micBufferMicroseconds ?? 0)",
         ]
-        if let wavPath = config.wavPath, !wavPath.isEmpty {
+        let spokenAudio = config.audio == "speech"
+        let spokenWAV = spokenAudio ? try Self.makeSpokenWAV(Self.spokenPassage) : nil
+        defer { spokenWAV.map { try? FileManager.default.removeItem(at: $0) } }
+        if let spokenWAV {
+            arguments.append(contentsOf: ["--wav", spokenWAV.path])
+        } else if let wavPath = config.wavPath, !wavPath.isEmpty {
             arguments.append(contentsOf: ["--wav", wavPath])
         }
         if let cacheLimitMB = config.cacheLimitMB {
             arguments.append(contentsOf: ["--cache-limit-mb", "\(cacheLimitMB)"])
+        }
+        if let maxUtteranceSeconds = config.maxUtteranceSeconds {
+            arguments.append(contentsOf: ["--max-utterance-seconds", "\(maxUtteranceSeconds)"])
         }
 
         let process = Process()
@@ -97,15 +133,56 @@ final class SpeechdStreamingBenchTests: XCTestCase {
             0,
             "speechd bench failed with status \(process.terminationStatus)"
         )
-        let benchLines = lines.filter { $0.hasPrefix("BENCH ") }
-        let expectedMarks = [5, 15, 30, 60].filter { $0 <= config.seconds }
+        let benchLines = lines.filter { $0.hasPrefix("BENCH mark=") }
+        let expectedMarks = ([5, 15, 30, 60] + Array(stride(from: 120, through: config.seconds, by: 60)))
+            .filter { $0 <= config.seconds }
         XCTAssertEqual(benchLines.count, expectedMarks.count, lines.joined(separator: "\n"))
+        XCTAssertTrue(
+            lines.contains { $0.hasPrefix("BENCH done ") },
+            "missing BENCH done summary"
+        )
         for mark in expectedMarks {
             XCTAssertTrue(
                 benchLines.contains { $0.contains("mark=\(mark)s ") },
                 "missing BENCH mark=\(mark)s"
             )
         }
+        XCTAssertTrue(
+            lines.contains { $0.hasPrefix("BENCH transcript sha256=") },
+            "missing BENCH transcript digest"
+        )
+        let timeline = lines.first { $0.hasPrefix("BENCH timeline ") }
+        XCTAssertNotNil(timeline, "missing BENCH timeline summary")
+        if spokenAudio {
+            XCTAssertFalse(
+                timeline?.contains("first_text_s=none") ?? true,
+                "spoken audio decoded to no text; the timing columns measured nothing"
+            )
+        }
+    }
+
+    private static func makeSpokenWAV(_ phrase: String) throws -> URL {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("speechd-bench-\(UUID().uuidString)")
+            .appendingPathExtension("wav")
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/say")
+        process.arguments = [
+            "-o", url.path,
+            "--file-format=WAVE",
+            "--data-format=LEI16@16000",
+            phrase,
+        ]
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            throw NSError(
+                domain: "SpeechdStreamingBenchTests",
+                code: Int(process.terminationStatus),
+                userInfo: [NSLocalizedDescriptionKey: "/usr/bin/say failed; no spoken audio to bench"]
+            )
+        }
+        return url
     }
 }
 

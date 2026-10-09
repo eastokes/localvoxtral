@@ -1,6 +1,7 @@
 .DS_Store
 __pycache__/
 /.build
+/.build-dogfood
 /PolishHelper/.build
 /SpeechHelper/.build
 /Packages
@@ -14,6 +15,8 @@ DerivedData/
 
 # Local human-voice recordings for the agent-dictation eval. These can carry
 # biometric voice data and are synced to the private Mac build host only.
+# Also covers EvalRecordings/term-recall/: transcript-derived term-recall
+# harvest data (private; see EvalCorpus/term-recall/README.md).
 /EvalRecordings/
 
 # Machine-local scratch (setup runbooks, handoff notes, drafts) — never
@@ -27,12 +30,21 @@ DerivedData/
 /.pi-subagents/
 
 # Transient enable markers written by remote-build.sh eval-llm /
-# integration-polishd / integration-speechd / eval-e2e / dogfood
+# integration-polishd / integration-speechd / eval-e2e
 /.llm-polish-eval-enable.json
 /.polishd-integration-enable.json
+/.polishd-bench-enable.json
+/.quick-capture-polish-latency-enable.json
 /.speechd-integration-enable.json
+/.mistral-integration-enable.json
+/.mistral-soak-enable.json
+/.keychain-integration-enable.json
 /.agent-eval-e2e-enable.json
-# Compile gate for the dogfooding context capture (Package.swift reads it).
-# Never commit: its presence changes what the app is compiled to do.
+/.term-recall-eval-enable.json
+/.agent-eval-asr-enable.json
+# Left behind by the removed dogfood build (#792); never commit either.
 /.dogfood-capture-enable
 .fastcontext/
+
+# Transient enable marker for the live herdr integration lane
+/.herdr-integration-enable.json

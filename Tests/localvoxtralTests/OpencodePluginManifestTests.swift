@@ -37,7 +37,8 @@ final class OpencodePluginManifestTests: XCTestCase {
         XCTAssertGreaterThan(bytes, 0)
         // One dependency-free file is the premise; a bundle would mean the
         // premise is gone.
-        XCTAssertLessThan(bytes, 24 * 1024, "the plugin must stay one small auditable file")
+        // 32 KiB since the prompt relay (#719), the plugin's second job.
+        XCTAssertLessThan(bytes, 32 * 1024, "the plugin must stay one small auditable file")
     }
 
     func testNoAwaitAnywhereSoNoHookCanStallTheUsersTurn() throws {
@@ -140,7 +141,7 @@ final class OpencodePluginManifestTests: XCTestCase {
         let text = try source()
         let published = [
             "SessionStart", "UserPromptSubmit", "PostToolUse", "Stop", "SessionEnd",
-            "FocusChanged", "FocusCleared",
+            "FocusChanged", "FocusCleared", "Notification",
         ]
         for event in published {
             XCTAssertTrue(text.contains("\"\(event)\""), "plugin should publish \(event)")
@@ -158,8 +159,9 @@ final class OpencodePluginManifestTests: XCTestCase {
             ("const MAX_PROMPT_BYTES = 8 * 1024;", ClaudeHookLimits.default.maxPromptBytes),
             ("const MAX_PATH_BYTES = 4 * 1024;", ClaudeHookLimits.default.maxPathBytes),
             ("const MAX_FILES_PER_RECORD = 16;", ClaudeHookLimits.default.maxFilePathsPerRecord),
+            ("const MAX_TITLE_BYTES = 320;", ClaudeHookLimits.default.maxTitleBytes),
         ]
-        let values = [64 * 1024, 8 * 1024, 4 * 1024, 16]
+        let values = [64 * 1024, 8 * 1024, 4 * 1024, 16, 320]
         for (index, (line, swiftValue)) in pins.enumerated() {
             XCTAssertTrue(text.contains(line), "missing bound pin: \(line)")
             XCTAssertEqual(swiftValue, values[index], "Swift limit drifted from the plugin's pin")

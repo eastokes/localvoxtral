@@ -2,53 +2,312 @@
 
 ## `ci.yml`
 
-Every non-fast-path PR and push to main: build, advisory format lint (`.swift-format`;
-flips to `--strict` after the one-shot tree reformat), unit tests with a
-coverage summary (`llvm-cov report` over Sources — visibility for the PR
-Proof section, not a gate), live STT-service integration tests, app packaging,
-launch smoke test, an installable app artifact (`localvoxtral-app`, fetch
-with `scripts/try-pr.sh`), and a `localvoxtral-dsym` artifact (30-day
-retention) for symbolicating field crashes. Same-repo branches run on the
-self-hosted Mac runner; fork PRs run on GitHub-hosted macOS.
+`ci.yml` runs **three jobs in parallel**, split by what actually needs the
+owner's Mac (owner decision 2026-09-05):
 
-Opt-in dogfood artifact: with the literal marker `[dogfood-package]` in the
-PR body / head commit message, or a `workflow_dispatch` with `dogfood=true`,
-the job packages a second, `LOCALVOXTRAL_DOGFOOD`-instrumented bundle after
-the launch smoke and uploads it as `localvoxtral-app-dogfood` (7-day
-retention) plus `localvoxtral-dsym-dogfood` (30-day — the instrumented
-binary's UUID differs from the clean dSYM's). Fetch and launch it with
-`scripts/try-pr.sh <pr|main> --dogfood`,
-which also arms the runtime capture default. On manual dispatch the
-conditional live-model lanes (polishd/speechd) skip — the dispatched ref's
-own push/PR run already decided them.
+**`build-test` — GitHub-hosted macOS (`macos-latest`), every event, every
+contributor.** The required status check on main, and the portable half of CI:
+the pure-shell gate/process-cleanup suites, the installer-resolution test,
+advisory format lint (`.swift-format`; flips to `--strict` after the one-shot
+tree reformat), the unit suite with a coverage summary (`llvm-cov report` over
+Sources — visibility for the PR Proof section, not a gate), and the complete
+unit-test log as an artifact. When the unit step fails, the job log also gets
+the exception and crashed-thread frames of any xctest crash report
+(`scripts/ci/xctest-crash-summary.py`, #1162). Same-repo PRs run here too, not just forks: the
+single self-hosted runner was 89 % busy during a four-agent burst and 3.4 h of
+work produced 8.95 h of queue, while a measured hosted run executed the
+identical 2769 test cases in the same wall-clock with an 8 s queue — and
+hosted runners are free for public repositories.
 
-The same `build-test` check takes a docs/scripts-only fast path when every
-changed file passes `scripts/ci/docs-only-filter.sh`; it then skips all Swift,
-helper, packaging, artifact, smoke, warm, and integration steps. The filter
-fails open to the full run for unknown or ambiguous diffs and excludes CI
-control files, packaging inputs (`assets/icons/**`), and every path selected
-by the LLM/speechd lane filters; an explicit `[run-llm-eval]` /
-`[run-speechd-integration]` marker also forces the full run.
+A **fork PR gets only this job** (`mac-lanes` never runs untrusted code on the
+owner's machine), so on a fork it additionally packages, uploads and
+launch-smokes an ad-hoc-signed bundle. Same-repo runs skip those steps here
+because `mac-lanes` does them with the real signing identity. A same-repo
+DRAFT therefore gets no bundle at all, unless its body carries `[mac-lanes]`.
+
+**`mac-lanes` — the self-hosted Mac, same-repo PRs that are not drafts /
+pushes to main / dispatches only.** A draft gets `build-test` alone; marking it
+ready starts `mac-lanes`, and `[mac-lanes]` in a draft's body opts it in. One
+Mac serves every agent, and work in progress was most of its queue (#418). Everything a hosted runner cannot supply: packaging and
+launch-smoking the bundle signed with the stable `localvoxtral-dev` identity
+(an ad-hoc signature would invalidate the owner's Accessibility grant on every
+`scripts/try-pr.sh` install), the installable `localvoxtral-app` artifact and
+`localvoxtral-dsym` (30-day retention) for symbolicating field crashes, the
+live STT-service integration (path-gated on PRs by `scripts/ci/stt-lane-filter.sh`,
+always on dispatches and in every release), the conditional polishd/speechd/herdr live-model
+lanes, the two MLX helper unit suites (kept here for the warm Cmlx build), and
+the process leak check. It keeps `clean: false` — the persistent warm `.build` that makes those
+lanes affordable.
+
+**`linux` — GitHub-hosted Ubuntu, every event, every contributor (#545).**
+Every `scripts/ci/test-*.sh` suite, taken by glob so a new suite needs no
+workflow edit, and `scripts/core-tests-linux.sh` in the `swift:6.2.0` image
+pinned by digest. A required check on main. `build-test` keeps its own
+shell-suite step anyway: the scripts those suites test run on the Mac under
+`/bin/bash` 3.2 and BSD tools, which only a macOS runner reproduces.
+
+The jobs run in parallel and share no artifact; `build-test` and `mac-lanes`
+each compute the docs-only fast-path decision themselves rather than
+serialising behind a `needs:`.
+
+**Any step that launches the app on the self-hosted Mac must set
+`LOCALVOXTRAL_DISABLE_LOGIN_KEYCHAIN: "1"`** (the launch smoke's
+`LOCALVOXTRAL_SUPPRESS_STARTUP_PERMISSION_PROMPTS` already implies it). The app
+carries no Team ID, so macOS keys each Keychain item to the code-signing hash of
+the build that wrote it and a build CI just made never matches: the read raises
+a modal Keychain dialog on the owner's desktop, once per run. Launching through
+`open` needs `scripts/lib/launch-app.sh`'s `lv_open` — LaunchServices does not
+pass the step's environment to the app.
+
+Both lanes build with whatever Xcode toolchain is already on the machine —
+no `Setup Swift` step. Fork PRs previously pinned a separate swift.org
+toolchain (`swift-actions/setup-swift@v2`, `swift-version: "6.2"`), but its
+6.2.1 resolution ships with assertions enabled and asserts compiling this
+app's `@MainActor deinit`; Xcode's bundled toolchain doesn't have that
+problem, so hosted runners now use it too, same as self-hosted. Neither
+lane pins a version, so `build-test` records `xcodebuild -version` and
+`swift --version` in its step summary and keys the SwiftPM cache on them —
+when the image's default Xcode moves, the log says which build ran and no
+`.build` tree crosses toolchains. The cache is saved on every push to main
+(key suffixed with the commit SHA) and restored by prefix on PRs, and
+`scripts/ci/restore-mtimes.sh` runs before `swift test`: a fresh checkout
+stamps every file with the checkout time, and swift-driver would otherwise
+recompile every file against the restored build.
+
+Fetch and launch a PR's or main's signed bundle with `scripts/try-pr.sh
+<pr|main>`. On manual dispatch the conditional live-model lanes
+(polishd/speechd) skip — the dispatched ref's own push/PR run already
+decided them.
+
+`mac-lanes` is ordered in two phases: everything that produces an artifact
+(packaging, uploads, launch smoke) runs first, and the conditional live
+lanes (speechd/polishd/herdr) run after it. A live lane's precondition must
+not cost a run the artifact it was dispatched for — the herdr lane used to
+run before packaging, and while its fixture still refused to start beside a
+herdr the account was running (before #323), a dispatch on the owner's Mac
+never reached the packaging steps at all (run 35084386041).
+
+The live herdr lane is the one lane a dispatch still forces on (it needs no
+weights, and dispatching it is how that external contract gets repeated).
+`-f herdr=false` opts a single dispatch out, which is what
+`scripts/try-pr.sh` passes; pushes and PRs are unaffected and keep
+the `scripts/ci/herdr-lane-filter.sh` path filter plus the
+`[run-herdr-integration]` marker.
+
+The `hosted` dispatch input is a **no-op** now: it existed to force
+`build-test` onto a hosted runner, which is where it always runs. It is kept
+for one release so a scripted `-f hosted=true` does not fail on an unknown
+input, and cannot be repurposed to move `mac-lanes` — that job exists
+precisely because its work needs that Mac.
+
+The docs/scripts-only fast path applies to `build-test` and `mac-lanes` when every changed file
+passes `scripts/ci/docs-only-filter.sh`; they then skip all Swift, helper,
+packaging, artifact, smoke, warm, and integration steps. The filter fails open
+to the full run for unknown or ambiguous diffs and excludes CI control files,
+packaging inputs (`assets/icons/**`), every path selected by the
+LLM/speechd lane filters, and every file a Swift test reads (#707): a path a
+test names outside a comment, or a read declared in `scripts/ci/test-reads.txt`
+(a bare file name joined onto a directory, a directory walk).
+`scripts/ci/test-docs-only-filter.sh` fails when a test adds such a read
+without a line there. An explicit `[run-llm-eval]` /
+`[run-speechd-integration]` / `[run-herdr-integration]` /
+`[run-stt-integration]` / `[mac-lanes]` marker also forces the full run.
+
+The two helper unit suites are additionally path-gated per helper
+(`scripts/ci/helper-lane-filter.sh`): a PR runs a helper's suite only when the
+diff touches that helper's directory or the shared CI plumbing, while
+dispatches run both. Pushes to main skip `mac-lanes` altogether; the daily
+release covers main.
+
+Packaging, the uploads and the launch smoke (about 95 s of the Mac) are
+path-gated on PRs too (`scripts/ci/mac-package-filter.sh`). A PR whose every
+changed path stays out of the bundle (tests, docs, `scripts/` other than
+`package_app.sh`, `clean-stale-outputs.sh` and `launch-smoke.py`, workflows other than
+`ci.yml`'s `mac-lanes` job, eval data, and Markdown under `Sources/` outside
+a `Resources/` directory or in the opencode and vibe integrations) builds no
+bundle, unless a lane that
+reads it runs (polishd, speechd) or its body carries
+`[mac-lanes]`. An unclassified path packages. Such a PR has no
+`localvoxtral-app` artifact for `try-pr.sh`, which says so; its bundle would
+have been main's.
+
+`scripts/ci/lane-diff-facts.sh` reads two facts a file list cannot carry:
+whether a `ci.yml` edit touched the `mac-lanes` job or the file's head
+(triggers, concurrency, env), and whether a `Package.swift` edit touched a
+dependency, pin, platform or build-setting line. An edit to `build-test` or
+`linux` then runs neither the live STT lane, the helper unit
+suites nor packaging, and moving files between targets does not run the STT
+lane. A fact the script cannot read counts as changed.
+
+One tier-0 guard deliberately survives the fast path. `AGENTS.md` and the deep
+guides are `*.md`, so before #707 a diff that touched only them skipped the
+Swift lane, including `AgentsGuideSizeTests`, whose entire job is guarding
+`AGENTS.md`'s 32 KiB Codex truncation budget. That test names those files, so
+such a diff now runs the Swift lane, but
+`scripts/ci/test-agents-guide-budget.sh`, a shell port of that test, still
+runs in the ungated shell-test step. It parses the cap,
+the router targets and the anchors out of `AgentsGuideSizeTests.swift` rather
+than restating them, and fails if that file grows an assertion it has not
+ported — so the two cannot drift.
 
 ## `release.yml`
 
-One-command, gate-then-tag releases on the self-hosted runner:
+One-command, gate-then-tag releases on the self-hosted runner, in two
+channels that share every gate:
 
 ```bash
-./scripts/release.sh            # patch bump
+./scripts/release.sh            # patch bump, stable channel
 ./scripts/release.sh minor      # or major, or an explicit X.Y.Z
+./scripts/release.sh daily      # the 03:15 UTC daily release, on demand
+./scripts/release.sh nightly    # a nightly prerelease of main, on demand
+./scripts/release.sh rehearse [target] [ref]   # all gates, no tag, no release
+./scripts/release.sh publish <tag>             # finish a tagged release that did not publish
 ```
 
 Pipeline: compute next version from the latest `v*` tag → release build →
 unit tests → live integration tests (speechd STT service) → package app bundle → launch
-smoke test → zip + dmg → **create tag** → publish GitHub release with
+smoke test → notarize → zip + dmg → **create tag** → publish GitHub release with
 auto-generated notes and both artifacts.
 
+The publish is `scripts/ci/publish-release.sh` (tested by
+`test-publish-release.sh`): it creates the release as a draft, uploads each
+asset with retries, checks them all, and only then publishes. A run that
+still fails or is cancelled after tagging uploads its notarized assets and
+notes as the `localvoxtral-release-<tag>` artifact (14 days), and
+`./scripts/release.sh publish <tag>` reruns the script on that artifact from
+the dev box, uploading only what the draft lacks, then pins the Homebrew tap
+for a stable tag (#1555).
+
+**Stable** is dispatched by hand from `main` (or from a branch as an
+`X.Y.Z-rc.N` prerelease), and it is what GitHub's `/releases/latest` points
+at, which is what `install.sh` and the Homebrew cask follow.
+`release.sh` refuses it unless the e2e dictation check passed on the release
+commit.
+
+**Daily** runs at 03:15 UTC: the dev box's scheduler dispatches it with `release.sh daily`, and
+the 03:15 cron is the fallback, because GitHub fires it hours late. A
+dispatch always runs; the cron skips as described in
+[test-tiers.md](../../docs/agent/test-tiers.md#scheduled-mac-inference-stays-in-the-night-window). It is a stable
+release with a minor bump (`v0.9.x` → `v0.10.0` → `v0.11.0`), from `main`
+only. Nobody is at the Mac at 03:15, so the gate is applied in the workflow:
+`scripts/ci/daily-release-plan.sh` (tested by `test-daily-release-plan.sh`)
+picks the newest `main` commit that a UI Smoke run scored the e2e dictation
+on, and the run checks out, builds, tags and ships that commit. UI Smoke has
+no schedule; the owner dispatches it on main when he is at the Mac, so the
+release ships `main` as it was then, and what merged later waits for the
+next check. The run skips green, with a step-summary line, when no commit
+since the newest stable tag has passed the check, when `main` is already
+that tag, or, for the cron only, when it cannot end by 07:00 UTC, a release
+run on main already succeeded or is running in the last 20 hours, or the Mac
+is on battery power (`scripts/ci/scheduled-run-guard.sh`). It fails red when it cannot read the UI
+Smoke runs.
+
+**Nightly** runs only on demand with `release.sh nightly`: `main`'s head,
+without the e2e gate, from `main` only. Its version is the
+latest stable tag with the patch bumped and a `-nightly.YYYYMMDD` suffix,
+with `.2`, `.3` and so on for a second build the same day
+(`scripts/ci/nightly-version.sh`, tested by `test-nightly-version.sh`).
+Nightlies publish with `prerelease: true`, so `/releases/latest` keeps
+pointing at the newest stable release, and the stable bump base excludes
+every `v*-*` tag so a nightly can never become the base for the next stable
+version. Users opt in with `LOCALVOXTRAL_CHANNEL=nightly` (see
+[docs/install.md](../../docs/install.md)).
+
+After publishing, a nightly deletes the nightly releases beyond the newest
+7, tags included. The selection is
+`scripts/ci/prune-nightly-releases.sh`: it takes tags on stdin, prints only
+tags matching the nightly shape exactly, and touches no network, so
+`test-prune-nightly-releases.sh` can hold it to the cases that matter (a
+stable or rc tag is invisible to it). The workflow re-checks the shape
+before each delete.
+
+**Rehearsal** (`publish=false`, or `release.sh rehearse`) runs every gate and
+the packaging, then uploads the zip, dmg and checksums as the
+`localvoxtral-release-rehearsal` artifact with 7-day retention. No tag, no
+release, and the step summary says so. Rehearsal is allowed from any ref on
+either channel, which is how a change to this workflow is proved before it
+merges.
+
+The unit-test gate mirrors `ci.yml`'s tier-0 unit step skip for skip, under
+the same supervisor. Two of those skips are load-bearing:
+`HerdrIntegrationTests` starts a live herdr server and carries no `XCTSkip`
+by design, and `AgentDictationE2EEvalTests` is the dispatched eval lane. A
+release gate must not start either by accident.
+
+Release notes: GitHub's generated PR list is always included, and a release
+may additionally ship a **hand-written summary** committed ahead of time at
+`docs/release-notes/<tag>.md` (e.g. `docs/release-notes/v0.9.0.md`, using the
+exact tag release.yml computes). When that file exists it becomes the top of
+the release body and the generated changelog is appended below it;
+`scripts/ci/resolve-release-notes.sh` decides, and its self-test runs in CI's
+shell-test step. The file is optional — with none, the release publishes with
+generated notes exactly as before — but a file that exists and is empty is a
+hard failure rather than a release with a blank human section. A nightly body
+also opens with a fixed header saying which commit it is, how to install it,
+and that it is not a stable release; a hand-written nightly file lands under
+that header.
+
 The tag is created only after every gate passes, so a failed release leaves
-no orphan tag. Releases are ad-hoc signed on purpose (a local signing cert
-means nothing on users' machines); proper distribution signing needs a
-Developer ID cert. Dispatch-only: pushing tags by hand no longer triggers a
+no orphan tag. The Tag step pushes with the `RELEASE_TAG_TOKEN` repo secret,
+a fine-grained token with Contents and Workflows read/write on this repo only,
+because `GITHUB_TOKEN` may not push a tag whose commit touches
+`.github/workflows` (#964). The token expires; when it does, or when the
+secret is missing, the release fails at the Tag step with an error naming the
+secret, or with GitHub's "refusing to allow ... without workflows permission",
+and needs a new token. Dispatch-only: pushing tags by hand no longer triggers a
 release.
+
+Releases are signed with the owner's Developer ID identity and notarized
+(#1430, #1842). Both credentials live on the Mac Mini, never in the repo or in
+GitHub secrets: the "Developer ID Application" identity and the notarytool
+profile `localvoxtral-notary`, in a keychain file of their own
+(`localvoxtral-release.keychain-db`). The runner's `.env` names it in
+`NOTARY_KEYCHAIN` and its password file in `RELEASE_KEYCHAIN_PASSWORD_FILE`;
+the signing check unlocks it, since it is locked after a reboot. A keychain
+of its own, because its partition list (`security
+set-key-partition-list` and `set-generic-password-partition-list`, with
+`apple-tool:,apple:`) can be set with its own password, so codesign and
+notarytool read it without a prompt; the login keychain's needs the owner's
+login password. Store the profile with `xcrun notarytool store-credentials
+localvoxtral-notary ... --keychain <that file>`, and read it with that
+`--keychain` too. Without it, notarytool uses the data-protection keychain,
+which macOS makes unreadable while the screen is locked, and fails with "No
+Keychain password item found" although the profile is still there. The job
+names both credentials in its `env`. The
+"Check the signing credentials" step fails a stable or daily release when
+either is missing or does not authenticate; a nightly falls back to ad-hoc
+signing with a warning in its summary and its release notes.
+`scripts/ci/notarize.sh` submits the app, then the DMG, and prints Apple's log
+on a rejection. It prints each submission id as soon as Apple assigns it and
+waits up to 3 h for each, because Apple can hold a team's submissions for
+hours, the DMG's too after the app's was accepted. A daily release that
+started inside the night window waits only until 07:00 UTC
+(`scripts/ci/night-deadline.sh`). A run that times out fails before the Tag
+step, with the id,
+and `xcrun notarytool info <id> --keychain-profile localvoxtral-notary
+--keychain "$NOTARY_KEYCHAIN"` on the Mini follows it from there.
+
+## `cask.yml`
+
+Pins the Homebrew tap,
+[T0mSIlver/homebrew-localvoxtral](https://github.com/T0mSIlver/homebrew-localvoxtral),
+to a stable release. `release.yml` calls it once a stable release is public;
+nightlies and rc builds never reach it, because `brew upgrade` follows the tap.
+It runs on a GitHub-hosted Mac, which has never had the app. In order: it
+requires a published stable release, hashes the published zip and checks it
+against the `.sha256` asset, renders the cask with `scripts/ci/render-cask.sh`,
+installs and zaps that cask from a throwaway local tap
+(`scripts/ci/verify-cask-install.sh`), pushes it with the
+`HOMEBREW_TAP_DEPLOY_KEY` secret (a write deploy key on the tap), and installs
+once more from the public tap. It refuses to move the tap to an older version.
+
+The cask's text lives in the renderer, not in the tap: edit it there, and the
+next release or dispatch carries it over. A run that goes red before the push
+leaves a good release and a tap on the previous version. Repair it with:
+
+```bash
+gh workflow run cask.yml -f tag=v0.9.0
+```
 
 ## `dmg-test.yml`
 
@@ -57,34 +316,63 @@ builds the styled DMG, verifies it with `hdiutil`, and uploads it for eyeballing
 
 ## `ui-smoke.yml`
 
-Lock-aware evening AX smoke drill on the self-hosted Mac runner: three
-scheduled slots (18:00/19:30/21:00 UTC, 20:00 Paris anchor), each gated by
-`scripts/ci/ui-smoke-guard.sh` — a slot skips green when the Mac is on
-battery power (scheduled lanes never drain the owner's MacBook,
-`scripts/ci/ac-power-guard.sh`, shared with eval-e2e.yml's nightly), when
-the screen is locked (the drill needs an unlocked GUI session), or when a
-slot's drill already ran and passed that day, so at most one real drill runs
-per day. Manual dispatch bypasses the guard.
-Also runs on same-repo PRs when the `needs-ui-smoke` label is added — the
-on-demand proof path for UI-affecting PRs (re-add the label to rerun after
-new pushes; fork PRs never reach the self-hosted runner, label or no label).
-It packages the app, launches a fresh menu bar instance, verifies the status
-item, checks that launch alone does not spawn managed backend processes, opens
-Settings from the status menu, selects the three settings tabs, checks the
-managed backend rows, and verifies clean quit. Failure uploads
-`ui-smoke-log`.
+Two jobs. Both run on manual dispatch and on same-repo PRs when the owner adds
+the `needs-ui-smoke` label (re-add it to rerun after new pushes); a dispatch
+with `-f drill_only=true` runs `ax-drill` alone and leaves the Mac free. Agents
+dispatch through `scripts/ui-smoke-dispatch.sh`, which refuses a run the diff
+does not need, a second run on one commit and a run within an hour of the last
+(rules in `docs/agent/test-tiers.md`, "Proving a change with the e2e dictation
+check"). `scripts/release.sh` refuses a stable release unless a run on the
+release commit has its `E2E dictation scored` step green (#574).
 
-One-time runner TCC grants are required because the runner is a launchd agent
-inside the owner's GUI session:
+`ax-drill` runs the AX drill (`scripts/ui-smoke.sh`) on a GitHub-hosted
+`macos-latest` runner on every dispatch or label,
+fork PRs included. It packages the app ad-hoc signed and without the MLX
+helpers, copies the bundle out of the workspace and hides `.build` (the #87
+launch check), then launches a fresh menu bar instance, verifies the status
+item, checks that launch in External URL mode neither logs a managed warmup
+request (`log stream`, started before the launch) nor spawns a managed
+backend,
+opens Settings from the status menu, asserts every settings pane, and
+verifies a clean quit. The drill starts no dictation and has polishing off,
+so it reaches no server and needs no microphone; about 30 % of hosted runners
+have no audio device, and the job summary says which kind ran. The hosted
+image pre-grants Accessibility and Screen Recording to `bash` and
+`osascript`. The ad-hoc bundle has no Team ID, so the drill runs with
+`LOCALVOXTRAL_DISABLE_LOGIN_KEYCHAIN=1` as it did on the Mac. Failure uploads
+`ui-smoke-log` with a screenshot.
+
+`e2e-dictation` stays on the self-hosted Mac: it repackages the app as a
+signed harness build and runs `scripts/e2e-dictation.sh`, where the packaged
+app dictates from a WAV in place of the microphone into a throwaway target
+window, once per scenario in `scripts/e2e/scenarios/`, and the inserted text
+is scored against the spoken phrase. It has no schedule: GitHub cron starts
+up to an hour late, so the old evening slots took the owner's Mac at
+unpredictable times. The owner dispatches it on main when he is at the Mac
+(the GitHub app's "Run workflow" button, or `gh workflow run ui-smoke.yml`),
+and the daily release ships the commit that run scored. That dispatch is
+gated by `scripts/ci/ui-smoke-guard.sh`: it skips green when the Mac is on
+battery power (`scripts/ci/ac-power-guard.sh`, shared with eval-e2e.yml's
+weekly run) or the screen is locked (the check needs an unlocked GUI
+session). Branch dispatches and the label bypass the guard; fork PRs never
+reach this job. The script exits 3 when the Mac could not run it (locked, no
+STT server), which the owner's dispatch on main reports as a warning and a
+branch dispatch or label reports as a failure. It exits 4 when the app under
+test has no Accessibility grant, which fails every run: the grant does not
+come back by itself.
+`e2e-dictation-log` is uploaded on every run.
+
+The GUI lanes on the self-hosted runner (`e2e-dictation` here,
+`capture-assets.yml`) need one-time TCC grants, because the runner is a
+launchd agent inside the owner's GUI session:
 
 - Accessibility: allow the self-hosted runner process so System Events can
-  drive the menu bar and settings window.
+  drive the app's windows.
 - Screen Recording: allow the self-hosted runner process so CoreGraphics
   preflight and screenshot capture can read window contents.
 
-When either grant is missing, the smoke script fails immediately with an
-actionable TCC message. Grant it once in System Settings > Privacy & Security,
-then rerun the workflow.
+Grant each once in System Settings > Privacy & Security, then rerun the
+workflow.
 
 ## `capture-assets.yml`
 
@@ -94,5 +382,79 @@ the selected ref, then uploads `assets/*.png` as the `readme-screenshots`
 artifact. Before the screenshot script lands, the workflow intentionally
 prints a clear skip message and exits successfully.
 
-It needs the same one-time Accessibility and Screen Recording TCC grants as
-`ui-smoke.yml`.
+It needs the one-time Accessibility and Screen Recording TCC grants described
+under `ui-smoke.yml`.
+
+## `view-snapshots.yml`
+
+Manual dispatch on a GitHub-hosted macOS runner, never the Mac. It runs
+`ViewSnapshotTests` (or one of its cases, the `filter` input) and uploads the
+PNGs as the `view-snapshots` artifact. Agents dispatch it through
+`scripts/view-snapshots.sh`, which finds the run by the `request_id` input
+echoed in the run name and downloads the PNGs. It restores `build-test`'s
+SwiftPM cache but never saves one. A PR that edits the workflow file runs it
+too, which is how a change to it gets proved before it reaches main (dispatch
+works only once a workflow is on the default branch). See
+`docs/agent/view-snapshots.md`.
+
+## `codeql.yml`
+
+Code scanning of the workflows themselves, on Ubuntu, on every push to main,
+every same-repo PR that changes `.github/workflows/**` or
+`.github/actions/**`, and Mondays at 06:23 UTC. The repo is public,
+`mac-lanes` runs on the owner's machine with the signing identity and the
+login keychain, and `release.yml` holds the token that publishes the DMG, so
+an injectable `${{ }}` expression or an over-scoped `permissions:` block is
+the failure worth catching. A fork PR is skipped: its token cannot write
+security events, so the upload would fail. Workflow changes from a fork are
+analysed by the push run once merged.
+
+Swift is not analysed. On `macos-latest` the traced `swift build` of the root
+package, about 3 minutes untraced, ran past a 45-minute limit and GitHub kept
+no log (#470). Retrying it belongs on a hosted runner too: never move code
+scanning to `[self-hosted, macOS, ARM64]`, the one Mac every agent queues
+behind (#418).
+
+## `docs-site.yml`
+
+Builds the user docs into t0msilver.github.io/localvoxtral on hosted Ubuntu,
+then deploys it on pushes to main. `scripts/docs-site/stage.py` copies only
+the public pages (README, `docs/*.md` without `docs/agent/`, the integration
+READMEs) because Zensical has no `exclude_docs` yet. `check-app-links.py` then
+fails the run when a `DocsLink.page` path or anchor in `Sources/` is missing
+from the built site, and `check-human-links.py` when a site link in README,
+an integration README, the release notes or another human-facing file it
+lists names a missing page or anchor. A PR gets the build, the check and the site as the
+`github-pages` artifact. Zensical is pinned in the workflow; after a bump,
+look at the built site before merging. Build it locally with
+`scripts/docs-site/build.sh` (needs `zensical` on `PATH`).
+
+## `pr-waits-labels.yml`
+
+Adds `waits:mac-llm`, `waits:mac-voxtral` and `waits:stack` to a same-repo PR
+on open, push, and body or base edits, from `scripts/ci/waits-labels.sh`,
+which runs the same lane filters `ci.yml` does. Hosted Ubuntu, a few seconds,
+not a required check. It only adds labels. What each label means and who
+removes it: `docs/agent/test-tiers.md`, "Why a PR waits: the waits labels".
+
+## Action pins
+
+Every `uses:` names a 40-character commit SHA with the tag in a trailing
+comment (`@<sha> # v4.4.0`). A tag is mutable, and an action step on
+`mac-lanes` runs on the owner's Mac with the signing identity, the login
+keychain and the tier-2 TCC grants — in `release.yml`, next to the token that
+publishes the DMG. `WorkflowActionPinningTests` (tier 0) fails on any ref that
+is not a SHA, so a new lane must resolve one:
+
+```bash
+git ls-remote https://github.com/actions/checkout \
+  'refs/tags/v4' 'refs/tags/v4^{}' | tail -1 | cut -f1
+```
+
+Not `gh api …/git/ref/tags/<tag>`: on an ANNOTATED tag that returns the tag
+object's SHA, which is 40 hex characters the pin test accepts and Actions then
+refuses at run time, because it is not a commit. `ls-remote` prints the peeled
+`^{}` ref last when there is one, so the line above yields the commit for
+either kind of tag.
+
+`.github/dependabot.yml` bumps them monthly, grouped into a single PR.

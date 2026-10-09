@@ -139,6 +139,19 @@ public enum ClaudeRemoteHookPayloadParser {
             limits: limits
         ) else { return nil }
 
+        // The remote Vibe shim names the log message a submit carries, so the
+        // registry counts it once however many hooks re-read it (#1285). The
+        // registry reads it on Vibe records only.
+        if record.event == .userPromptSubmit {
+            var record = record
+            if data.count <= limits.maxLineBytes,
+               let object = try? JSONSerialization.jsonObject(with: data),
+               let payload = object as? [String: Any] {
+                record.promptID = ClaudeHookWireCodec.cleanPromptID(payload["prompt_id"] as? String)
+            }
+            return Payload(record: record, snippets: [])
+        }
+
         // Only tool events carry content worth excerpting. Re-decoding is cheap
         // next to a network round trip, and it keeps the local parser — which
         // must never learn to extract content — untouched.
@@ -220,13 +233,36 @@ public enum ClaudeRemoteSessionScope {
         "\(prefix)\(hostID):\(sessionID)"
     }
 
-    public static func isScoped(_ sessionID: String) -> Bool {
-        sessionID.hasPrefix(prefix)
-    }
-
     /// Transport channel label for a host, used as `ClaudeTransportOrigin.remote`'s
     /// channel. Identifies WHICH remote, so two hosts never share an origin.
     public static func channel(hostID: String) -> String {
         "ssh:\(hostID)"
+    }
+
+    /// The host a `channel(hostID:)` label names, nil for any other label.
+    public static func hostID(fromChannel channel: String) -> String? {
+        guard channel.hasPrefix("ssh:"), channel.count > 4 else { return nil }
+        return String(channel.dropFirst(4))
+    }
+
+    /// The host a scoped session id belongs to (`remote:<hostID>:<sessionID>`
+    /// → `<hostID>`), or nil for anything else. The inverse of
+    /// `scopedSessionID(hostID:sessionID:)`, for read-side surfaces that
+    /// report per host (the Settings herdr row). Host ids are minted by
+    /// `ClaudeRemoteHostRegistry.makeHostID` (`h` + 8 hex, no separators), so
+    /// splitting at the first separator cannot cut one short.
+    public static func hostID(fromScopedSessionID sessionID: String) -> String? {
+        // The registry puts a non-Claude agent's prefix in FRONT of the remote
+        // scope (`vibe:remote:<hostID>:<sessionID>`).
+        var sessionID = Substring(sessionID)
+        if let agentPrefix = ClaudeAgentSessionScope.agentPrefixes.first(where: sessionID.hasPrefix) {
+            sessionID = sessionID.dropFirst(agentPrefix.count)
+        }
+        guard sessionID.hasPrefix(prefix) else { return nil }
+        let remainder = sessionID.dropFirst(prefix.count)
+        guard let separator = remainder.firstIndex(of: ":") else { return nil }
+        let hostID = remainder[..<separator]
+        guard !hostID.isEmpty else { return nil }
+        return String(hostID)
     }
 }

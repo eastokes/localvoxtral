@@ -1,70 +1,8 @@
 import Carbon.HIToolbox
+import CoreGraphics
 import Foundation
 import Observation
 import Synchronization
-
-struct DictationShortcut: Equatable, Sendable {
-    var keyCode: UInt32
-    var carbonModifierFlags: UInt32
-
-    var normalized: DictationShortcut {
-        DictationShortcut(
-            keyCode: keyCode,
-            carbonModifierFlags: DictationShortcutValidation.normalizedModifierFlags(
-                carbonModifierFlags)
-        )
-    }
-}
-
-enum DictationOutputMode: String, CaseIterable, Identifiable, Sendable {
-    case overlayBuffer = "overlay_buffer"
-    case liveAutoPaste = "live_auto_paste"
-
-    var id: String { rawValue }
-
-    var displayName: String {
-        switch self {
-        case .overlayBuffer:
-            return "Overlay Buffer"
-        case .liveAutoPaste:
-            return "Live Auto-Paste"
-        }
-    }
-
-    var description: String {
-        switch self {
-        case .overlayBuffer:
-            return "Keeps text in an on-screen buffer until stop."
-        case .liveAutoPaste:
-            return "Streams text directly into the focused app."
-        }
-    }
-}
-
-enum DictationShortcutMode: String, CaseIterable, Identifiable {
-    case toggle = "toggle"
-    case pushToTalk = "push_to_talk"
-
-    var id: String { rawValue }
-
-    var displayName: String {
-        switch self {
-        case .toggle:
-            return "Toggle"
-        case .pushToTalk:
-            return "Push to Talk"
-        }
-    }
-
-    var description: String {
-        switch self {
-        case .toggle:
-            return "Press once to start dictation, press again to stop."
-        case .pushToTalk:
-            return "Hold the shortcut to dictate, release to stop."
-        }
-    }
-}
 
 enum SendNowTargetApp: String, CaseIterable, Identifiable {
     case ghostty
@@ -96,182 +34,6 @@ enum SendNowTargetApp: String, CaseIterable, Identifiable {
     }
 }
 
-enum BackendMode: String, CaseIterable, Identifiable {
-    case managedLocal = "managed_local"
-    case externalURL = "external_url"
-
-    var id: String { rawValue }
-
-    var displayName: String {
-        switch self {
-        case .managedLocal:
-            return "Managed local"
-        case .externalURL:
-            return "External URL"
-        }
-    }
-
-    var dictationDescription: String {
-        switch self {
-        case .managedLocal:
-            return "Runs the bundled dictation engine on this Mac."
-        case .externalURL:
-            return "Use an OpenAI Realtime-compatible endpoint you run yourself."
-        }
-    }
-
-    var polishingDescription: String {
-        switch self {
-        case .managedLocal:
-            return "Runs the bundled polishing engine on this Mac."
-        case .externalURL:
-            return "Use an OpenAI-compatible chat completions endpoint you run yourself."
-        }
-    }
-}
-
-/// Metal buffer-pool cache limit for the managed dictation helper. `Auto`
-/// omits the `--cache-limit-mb` flag so the helper's built-in default applies;
-/// every other case pins an explicit ceiling.
-enum SpeechdCacheLimit: String, CaseIterable, Identifiable, Sendable {
-    case auto
-    case gb2 = "2gb"
-    case gb4 = "4gb"
-    case gb6 = "6gb"
-    case gb8 = "8gb"
-
-    var id: String { rawValue }
-
-    var displayName: String {
-        switch self {
-        case .auto: return "Auto"
-        case .gb2: return "2 GB"
-        case .gb4: return "4 GB"
-        case .gb6: return "6 GB"
-        case .gb8: return "8 GB"
-        }
-    }
-
-    /// Megabytes to pass via `--cache-limit-mb`, or nil for `Auto` (the flag is
-    /// omitted and the helper's built-in default applies).
-    var megabytes: Int? {
-        switch self {
-        case .auto: return nil
-        case .gb2: return 2048
-        case .gb4: return 4096
-        case .gb6: return 6144
-        case .gb8: return 8192
-        }
-    }
-}
-
-/// Streaming step cadence for the managed dictation helper: how much audio is
-/// batched before each incremental transcription step. Lower values show words
-/// sooner; higher values leave more compute headroom. `Auto` omits the
-/// `--step-ms` flag so the helper's built-in default applies.
-enum SpeechdStepCadence: String, CaseIterable, Identifiable, Sendable {
-    case auto
-    case ms100 = "100ms"
-    case ms240 = "240ms"
-    case ms480 = "480ms"
-
-    var id: String { rawValue }
-
-    var displayName: String {
-        switch self {
-        case .auto: return "Auto"
-        case .ms100: return "100 ms"
-        case .ms240: return "240 ms"
-        case .ms480: return "480 ms"
-        }
-    }
-
-    /// Milliseconds to pass via `--step-ms`, or nil for `Auto` (the flag is
-    /// omitted and the helper's built-in default applies).
-    var milliseconds: Int? {
-        switch self {
-        case .auto: return nil
-        case .ms100: return 100
-        case .ms240: return 240
-        case .ms480: return 480
-        }
-    }
-}
-
-enum DictationShortcutValidation {
-    static let allowedModifierFlagsMask = UInt32(cmdKey | optionKey | shiftKey | controlKey)
-
-    static func normalizedModifierFlags(_ flags: UInt32) -> UInt32 {
-        flags & allowedModifierFlagsMask
-    }
-
-    static func persistenceErrorMessage(for shortcut: DictationShortcut) -> String? {
-        if shortcut.keyCode > UInt32(UInt16.max) {
-            return "Shortcut key is not supported."
-        }
-
-        if normalizedModifierFlags(shortcut.carbonModifierFlags) == 0,
-           !isFunctionKey(shortcut.keyCode)
-        {
-            return "Shortcut must include at least one modifier key unless it is a function key."
-        }
-
-        return nil
-    }
-
-    static func isFunctionKey(_ keyCode: UInt32) -> Bool {
-        switch keyCode {
-        case UInt32(kVK_F1), UInt32(kVK_F2), UInt32(kVK_F3), UInt32(kVK_F4),
-             UInt32(kVK_F5), UInt32(kVK_F6), UInt32(kVK_F7), UInt32(kVK_F8),
-             UInt32(kVK_F9), UInt32(kVK_F10), UInt32(kVK_F11), UInt32(kVK_F12),
-             UInt32(kVK_F13), UInt32(kVK_F14), UInt32(kVK_F15), UInt32(kVK_F16),
-             UInt32(kVK_F17), UInt32(kVK_F18), UInt32(kVK_F19), UInt32(kVK_F20):
-            return true
-        default:
-            return false
-        }
-    }
-
-    static func validationErrorMessage(for shortcut: DictationShortcut) -> String? {
-        if let persistenceError = persistenceErrorMessage(for: shortcut) {
-            return persistenceError
-        }
-
-        let normalized = shortcut.normalized
-        switch (normalized.keyCode, normalized.carbonModifierFlags) {
-        case (UInt32(kVK_Space), UInt32(cmdKey)):
-            return "Command-Space is reserved by Spotlight."
-        case (UInt32(kVK_Tab), UInt32(cmdKey)):
-            return "Command-Tab is reserved for app switching."
-        case (UInt32(kVK_ANSI_Q), UInt32(cmdKey)):
-            return "Command-Q is reserved for quitting apps."
-        case (UInt32(kVK_ANSI_W), UInt32(cmdKey)):
-            return "Command-W is reserved for closing windows."
-        default:
-            return nil
-        }
-    }
-}
-
-/// Sendable bridge from the main-actor settings model to the broker's POSIX
-/// connection threads. A reference wrapper is intentional: `Mutex` itself is
-/// noncopyable, while the broker predicate needs to retain shared state.
-private final class ClaudeLocalTitleMarkerFallbackState: Sendable {
-    private let enabled: Mutex<Bool>
-
-    init(_ enabled: Bool = false) {
-        self.enabled = Mutex(enabled)
-    }
-
-    func get() -> Bool {
-        enabled.withLock { $0 }
-    }
-
-    func set(_ value: Bool) {
-        enabled.withLock { $0 = value }
-    }
-}
-
 @MainActor
 @Observable
 final class SettingsStore {
@@ -291,43 +53,90 @@ final class SettingsStore {
         var defaultModelName: String { "T0mSIlver/Voxtral-Mini-4B-Realtime-2602-4bit-qhead" }
     }
 
-    private enum Keys {
+    enum Keys {
         static let realtimeProvider = "settings.realtime_provider"
         static let realtimeAPIEndpointURL = "settings.realtime_api_endpoint_url"
+        /// LEGACY. The three API keys now live in the login Keychain
+        /// (`SecretKey` / `KeychainSecretStore`); these defaults keys exist
+        /// only so `migrateLegacySecrets` can find and remove a value
+        /// written by a build that predates the move. Nothing else may read
+        /// or write them.
         static let apiKey = "settings.api_key"
         static let realtimeAPIModelName = "settings.realtime_api_model_name"
+        /// LEGACY, see `apiKey`. ONE key for both Mistral engines — the account
+        /// is one account, and asking for the same secret twice is how a
+        /// working dictation ends up beside a 401-ing polish.
+        static let mistralAPIKey = "settings.mistral_api_key"
+        /// Set once the whole sweep out of UserDefaults succeeded, so later
+        /// launches never re-read the plist. Deliberately not cleared by
+        /// anything: a false value only costs one extra (cheap) sweep.
+        static let apiKeysMigratedToKeychain = "settings.api_keys_migrated_to_keychain"
+        static let mistralDictationModel = "settings.mistral_dictation_model"
+        static let mistralPolishingModel = "settings.mistral_polishing_model"
+        static let mistralModelCatalog = "settings.mistral_model_catalog"
         static let dictationBackendMode = "settings.dictation_backend_mode"
-        static let speechdCacheLimit = "settings.speechd_cache_limit"
-        static let speechdStepCadence = "settings.speechd_step_cadence"
+        static let managedSpeechModel = "settings.managed_speech_model"
         static let polishingBackendMode = "settings.polishing_backend_mode"
         // Legacy global backend mode. Read only for one-time migration.
         static let backendMode = "settings.backend_mode"
         static let onboardingCompleted = "settings.onboarding_completed"
+        static let onboardingPolishingBeforeMistralChoice = "settings.onboarding_polishing_before_mistral_choice"
+        static let opensWindowAtLaunch = "settings.opens_window_at_launch"
         static let dictationOutputMode = "settings.dictation_output_mode"
         static let dictationShortcutMode = "settings.dictation_shortcut_mode"
         static let autoCopyEnabled = "settings.auto_copy_enabled"
+        static let overlaySpokenSendEnabled = "settings.overlay_spoken_send_enabled"
+        static let liveSpokenSendEnabled = "settings.live_spoken_send_enabled"
+        static let spokenSendTriggerPhrases = "settings.spoken_send_trigger_phrases"
+        static let spokenAbortPhrases = "settings.spoken_abort_phrases"
+        static let spokenStopWait = "settings.spoken_stop_wait_ms"
+        static let audioDuckingEnabled = "settings.audio_ducking_enabled"
+        static let audioDuckingFadeDuration = "settings.audio_ducking_fade_duration"
+        /// The device and volume a launch ducked away from, written at the
+        /// duck and cleared when a restore lands. Present at startup only when
+        /// the previous launch died mid-session. Both keys or neither.
+        static let audioDuckingPendingRestoreVolume =
+            "settings.audio_ducking_pending_restore_volume"
+        static let audioDuckingPendingRestoreDeviceUID =
+            "settings.audio_ducking_pending_restore_device_uid"
         static let selectedInputDeviceUID = "settings.selected_input_device_uid"
+        static let selectedInputChannel = "settings.selected_input_channel"
         static let dictationShortcutEnabled = "settings.dictation_shortcut_enabled"
         static let dictationShortcutKeyCode = "settings.dictation_shortcut_key_code"
         static let dictationShortcutCarbonModifierFlags =
             "settings.dictation_shortcut_carbon_modifiers"
         static let llmPolishingEnabled = "settings.llm_polishing_enabled"
         static let llmPolishingEndpointURL = "settings.llm_polishing_endpoint_url"
+        /// LEGACY, see `apiKey`.
         static let llmPolishingAPIKey = "settings.llm_polishing_api_key"
         static let llmPolishingModel = "settings.llm_polishing_model"
         static let managedLLMPolishingModel = "settings.managed_llm_polishing_model"
         static let replacementDictionaryEnabled = "settings.replacement_dictionary_enabled"
         static let agentPolishProfileEnabled = "settings.agent_polish_profile_enabled"
+        static let earlyPolishEnabled = "settings.early_polish_enabled"
         static let polishClipboardContextEnabled = "settings.polish_clipboard_context_enabled"
+        static let polishSpeakerProfile = "settings.polish_speaker_profile"
+        static let polishSpeakerTerms = "settings.polish_speaker_terms"
+        static let polishDismissedTermSuggestions = "settings.polish_dismissed_term_suggestions"
+        static let projectTermProposalsEnabled = "settings.project_term_proposals_enabled"
+        static let termSuggestionInterval = "settings.term_suggestion_interval"
+        static let termSuggestionDictationsSinceRun = "settings.term_suggestion_dictations_since_run"
+        static let termSuggestionRetryAt = "settings.term_suggestion_retry_at"
+        static let dictationHistoryRetention = "settings.dictation_history_retention"
+        static let dictationAudioEnabled = "settings.dictation_audio_enabled"
+        static let diagnosticRecordsEnabled = "settings.diagnostic_records_enabled"
         static let clipboardPayloadMacroEnabled = "settings.clipboard_payload_macro_enabled"
         static let terminalScreenContextEnabled = "settings.terminal_screen_context_enabled"
         static let repoVocabularyEnabled = "settings.repo_vocabulary_enabled"
+        static let mistralStopSecondPassEnabled = "settings.mistral_stop_second_pass_enabled"
         static let claudeRepoContextEnabled = "settings.claude_repo_context_enabled"
-        static let claudeLocalTitleMarkerFallbackEnabled =
-            "settings.claude_local_title_marker_fallback_enabled"
         static let cmuxSurfaceJoinEnabled = "settings.cmux_surface_join_enabled"
         static let polishContextTrustedEndpointEnabled =
             "settings.polish_context_trusted_endpoint_enabled"
+        /// User-added terminal apps (Settings → Terminals → Add app…), stored
+        /// as a JSON array of `UserTerminalApp`. Seeded from the legacy
+        /// `terminal_apps.toml` once at startup (`UserTerminalAppsMigrator`).
+        static let userTerminalApps = "settings.user_terminal_apps"
         /// Hidden debug toggle (no UI). When true, every received realtime
         /// event's raw payload is logged to the `Deltas` category before any
         /// merge/preprocess/insertion processing — instrumentation for
@@ -335,20 +144,29 @@ final class SettingsStore {
         /// Note the `debug.` prefix (not `settings.`): this is not a
         /// user-facing preference and must never surface in the settings UI.
         static let debugLogRealtimeDeltas = "debug.log_realtime_deltas"
-        #if LOCALVOXTRAL_DOGFOOD
-        /// The runtime half of the dogfooding gate. `debug.` prefixed like the
-        /// flag above: it exists only in an instrumented build and is not a
-        /// product preference.
-        static let dogfoodCaptureEnabled = "debug.dogfood_capture_enabled"
+        #if DEBUG || LOCALVOXTRAL_E2E_HARNESS
+        /// The runtime half of the control-socket gate, kept SEPARATE from the
+        /// capture one: writing records and opening a socket that can start
+        /// dictations are different consents, and an owner running an
+        /// instrumented build for capture must not silently acquire a listener.
+        static let dogfoodControlSocketEnabled = "debug.dogfood_control_socket_enabled"
         #endif
         static let modifierOnlyHotKeyEnabled = "settings.modifier_only_hotkey_enabled"
         static let modifierOnlyHotKeyModifier = "settings.modifier_only_hotkey_modifier"
         static let modifierOnlyHoldDelay = "settings.modifier_only_hold_delay"
+        static let modifierOnlyHotKeyChord = "settings.modifier_only_hotkey_chord"
         static let overlayBufferShortcutKeyCode = "settings.overlay_buffer_shortcut_key_code"
         static let overlayBufferShortcutModifiers =
             "settings.overlay_buffer_shortcut_carbon_modifiers"
         static let overlayBufferShortcutEnabled = "settings.overlay_buffer_shortcut_enabled"
         static let overlayBufferFontSize = "settings.overlay_buffer_font_size"
+        static let overlayBufferVisibleLines = "settings.overlay_buffer_visible_lines"
+        static let overlayBufferSilenceAutoStop = "settings.overlay_buffer_silence_auto_stop"
+        static let overlayBufferWordHold = "settings.overlay_buffer_word_hold"
+        static let overlayBufferPolishColor = "settings.overlay_buffer_polish_color"
+        static let overlayBufferPositionScreenID = "settings.overlay_buffer_position_screen_id"
+        static let overlayBufferPositionOffsetX = "settings.overlay_buffer_position_offset_x"
+        static let overlayBufferPositionOffsetY = "settings.overlay_buffer_position_offset_y"
         static let livePasteShortcutKeyCode = "settings.live_paste_shortcut_key_code"
         static let livePasteShortcutModifiers = "settings.live_paste_shortcut_carbon_modifiers"
         static let livePasteShortcutEnabled = "settings.live_paste_shortcut_enabled"
@@ -356,11 +174,63 @@ final class SettingsStore {
         static let sendNowTriggerPhrase = "settings.send_now_trigger_phrase"
         static let sendNowTargetAppIDs = "settings.send_now_target_app_ids"
         static let legacyGhosttyAgentModeEnabled = "settings.ghostty_agent_mode_enabled"
+        static let copyLastDictationShortcutKeyCode = "settings.copy_last_dictation_shortcut_key_code"
+        static let copyLastDictationShortcutModifiers =
+            "settings.copy_last_dictation_shortcut_carbon_modifiers"
+        static let copyLastDictationShortcutEnabled = "settings.copy_last_dictation_shortcut_enabled"
+        static let copyLastDictationShortcutChord = "settings.copy_last_dictation_shortcut_chord"
+        static let answerAgentShortcutKeyCode = "settings.answer_agent_shortcut_key_code"
+        static let answerAgentShortcutModifiers = "settings.answer_agent_shortcut_carbon_modifiers"
+        static let answerAgentShortcutEnabled = "settings.answer_agent_shortcut_enabled"
+        static let answerAgentShortcutChord = "settings.answer_agent_shortcut_chord"
+        static let agentAttentionEnabled = "settings.agent_attention_enabled"
+        static let agentAttentionMark = "settings.agent_attention_mark"
+        static let modifierHoldLiveAutoPaste = "settings.modifier_hold_live_auto_paste"
+        static let quickCaptureShortcutKeyCode = "settings.quick_capture_shortcut_key_code"
+        static let quickCaptureShortcutModifiers = "settings.quick_capture_shortcut_carbon_modifiers"
+        static let quickCaptureShortcutEnabled = "settings.quick_capture_shortcut_enabled"
+        static let quickCaptureShortcutChord = "settings.quick_capture_shortcut_chord"
+        /// Retired with #918: its "on" meant Jev first, and the polishing
+        /// model is now everyone's router until they pick Jev.
+        static let quickCaptureJevEnabled = "settings.quick_capture_jev_enabled"
+        static let quickCaptureRouter = "settings.quick_capture_router"
+        static let voiceMemosEnabled = "settings.voice_memos_enabled"
+        static let quickCaptureProjectLines = "settings.quick_capture_project_lines"
+        static let jevAPIKeyNeverStored = "settings.jev_api_key"
     }
 
-    private let defaults: UserDefaults
-    @ObservationIgnored private let claudeLocalTitleMarkerFallbackState =
-        ClaudeLocalTitleMarkerFallbackState()
+    let defaults: UserDefaults
+    /// Where the three API keys live. Injected so tests and previews can never
+    /// reach the real login keychain (`KeychainSecretStore.init` traps under
+    /// XCTest as a backstop).
+    let secretStore: any SecretStoring
+    /// Kept past init for the deferred secret reads: an env-provided key has to
+    /// resolve the same way later as it does at launch.
+    @ObservationIgnored
+    private let environment: [String: String]
+    /// The secrets already read out of the store, whatever the read returned.
+    /// A key not in here has never been fetched — see `ensureSecretsLoaded`.
+    @ObservationIgnored
+    var loadedSecretKeys: Set<SecretKey> = []
+    /// True only while a fetched value is being assigned to its property, so
+    /// the `didSet` write-through does not push it straight back into the
+    /// store (a write prompts exactly like a read).
+    @ObservationIgnored
+    var isApplyingStoredSecret = false
+
+    /// One short sentence when the secret store refused an operation, else nil.
+    /// Rendered in the Engines pane so a locked or broken keychain reads as
+    /// exactly that, instead of every key silently looking "not set".
+    ///
+    /// Sticky for the life of the process on purpose: a later successful write
+    /// proves only that ONE key round-tripped, while the others are still blank
+    /// in memory, and clearing the warning there would restore the very lie
+    /// this property exists to prevent.
+    var secretStoreFailureSummary: String?
+
+    /// Keys whose latest write the store refused: the value lives in this
+    /// process only and is gone at the next launch.
+    var unsavedSecretKeys: Set<SecretKey> = []
 
     static let defaultDictationShortcut = DictationShortcut(
         keyCode: UInt32(kVK_Space),
@@ -379,33 +249,66 @@ final class SettingsStore {
     }
 
     var dictationBackendMode: BackendMode {
-        didSet { defaults.set(dictationBackendMode.rawValue, forKey: Keys.dictationBackendMode) }
+        didSet {
+            defaults.set(dictationBackendMode.rawValue, forKey: Keys.dictationBackendMode)
+            // The newly selected engine may need a key this process has never
+            // read (`ensureSecretsLoaded`).
+            ensureSecretsForSelectedEnginesLoaded()
+        }
     }
 
     var polishingBackendMode: BackendMode {
-        didSet { defaults.set(polishingBackendMode.rawValue, forKey: Keys.polishingBackendMode) }
+        didSet {
+            defaults.set(polishingBackendMode.rawValue, forKey: Keys.polishingBackendMode)
+            ensureSecretsForSelectedEnginesLoaded()
+        }
     }
 
-    /// Metal buffer-pool cache limit for the managed dictation helper. Changing
-    /// it from Settings restarts the engine so the new argv applies immediately
-    /// (`DictationViewModel.applySpeechdCacheLimitChange`); direct writes apply
-    /// on the next (re)start.
-    var speechdCacheLimit: SpeechdCacheLimit {
-        didSet { defaults.set(speechdCacheLimit.rawValue, forKey: Keys.speechdCacheLimit) }
-    }
-
-    /// Streaming step cadence for the managed dictation helper. Same restart
-    /// contract as `speechdCacheLimit`.
-    var speechdStepCadence: SpeechdStepCadence {
-        didSet { defaults.set(speechdStepCadence.rawValue, forKey: Keys.speechdStepCadence) }
+    /// Hugging Face repo the managed dictation helper loads, chosen from
+    /// `SpeechModelCatalog`. Changing it from Settings restarts the engine
+    /// (`EnginesModel.applyManagedSpeechModelChange`). External URL mode keeps
+    /// its own server-side model NAME in `realtimeAPIModelName`; separate keys
+    /// so a leftover external value can never leak into a managed launch.
+    var managedSpeechModel: String {
+        didSet { defaults.set(managedSpeechModel, forKey: Keys.managedSpeechModel) }
     }
 
     /// True once the user has completed (or skipped) the first-launch onboarding
     /// wizard. Resolved once at init (see `resolveOnboardingCompleted`) and
     /// persisted immediately so the wizard shows exactly once for fresh installs.
-    /// The General settings pane's "Re-run Setup…" resets it to false.
+    /// The General settings pane's "Re-run setup…" resets it to false.
     var onboardingCompleted: Bool {
         didSet { defaults.set(onboardingCompleted, forKey: Keys.onboardingCompleted) }
+    }
+
+    /// Polishing as it stood before an unfinished setup wizard's Mistral
+    /// choice turned hosted polishing on. Stored, not held by the wizard, so a
+    /// force-quit before the wizard closes still lets the next launch's
+    /// wizard put it back (#1761). Cleared when onboarding completes.
+    var onboardingPolishingBeforeMistralChoice: PolishingSnapshot? {
+        didSet {
+            if let snapshot = onboardingPolishingBeforeMistralChoice {
+                defaults.set(
+                    ["mode": snapshot.mode.rawValue, "enabled": snapshot.enabled],
+                    forKey: Keys.onboardingPolishingBeforeMistralChoice
+                )
+            } else {
+                defaults.removeObject(forKey: Keys.onboardingPolishingBeforeMistralChoice)
+            }
+        }
+    }
+
+    struct PolishingSnapshot: Equatable {
+        let mode: BackendMode
+        let enabled: Bool
+    }
+
+    /// Whether a finished launch opens the localvoxtral window on History.
+    /// Off by default: the app is a menu bar app, and a login-item launch
+    /// would otherwise put a window on screen at every login (#449). A first
+    /// launch ignores it — the onboarding wizard is the only window it shows.
+    var opensWindowAtLaunch: Bool {
+        didSet { defaults.set(opensWindowAtLaunch, forKey: Keys.opensWindowAtLaunch) }
     }
 
     var realtimeAPIEndpointURL: String {
@@ -413,15 +316,166 @@ final class SettingsStore {
     }
 
     var apiKey: String {
-        didSet { defaults.set(apiKey, forKey: Keys.apiKey) }
+        didSet { persistSecret(apiKey, for: .realtimeAPIKey) }
     }
 
     var realtimeAPIModelName: String {
         didSet { defaults.set(realtimeAPIModelName, forKey: Keys.realtimeAPIModelName) }
     }
 
+    /// The Mistral API key, shared by the dictation socket and the polishing
+    /// request. Stored in the login Keychain like the other two API keys this
+    /// app holds — never in UserDefaults.
+    var mistralAPIKey: String {
+        didSet { persistSecret(mistralAPIKey, for: .mistralAPIKey) }
+    }
+
+    /// Jev's key for quick capture routing (#725), in the Keychain.
+    var jevAPIKey: String {
+        didSet { persistSecret(jevAPIKey, for: .jevAPIKey) }
+    }
+
+    /// Which model routes quick captures (#918): the polishing model unless
+    /// the user picks Jev, a hosted service like every other off by default.
+    enum QuickCaptureRouterChoice: String, CaseIterable, Sendable {
+        case polishingModel = "polishing_model"
+        case jev
+    }
+
+    var quickCaptureRouter: QuickCaptureRouterChoice {
+        didSet {
+            defaults.set(quickCaptureRouter.rawValue, forKey: Keys.quickCaptureRouter)
+            if quickCaptureRouter == .jev { ensureSecretsLoaded([.jevAPIKey]) }
+        }
+    }
+
+    /// "Transcribe voice memos stored in iCloud Drive" (#925): off until the
+    /// user turns it on, since the audio sits in Apple's cloud.
+    var voiceMemosEnabled: Bool {
+        didSet { defaults.set(voiceMemosEnabled, forKey: Keys.voiceMemosEnabled) }
+    }
+
+    /// Jev routes, so its key is read.
+    var quickCaptureJevEnabled: Bool { quickCaptureRouter == .jev }
+
+    /// The line the user wrote about each project, by project key, which
+    /// the quick capture router reads with the README summary (#811).
+    var quickCaptureProjectLines: [String: String] {
+        didSet { defaults.set(quickCaptureProjectLines, forKey: Keys.quickCaptureProjectLines) }
+    }
+
+    /// Stores `line` for `projectKey`, cut to what the router reads; a blank
+    /// line removes it. Kept untrimmed, since it is stored as the user types
+    /// (a trailing space is the next word's); the router trims it. Applied to
+    /// the dictionary saved now, which another running copy may have changed
+    /// since this one read it (#1773).
+    func setQuickCaptureProjectLine(_ line: String, for projectKey: String) {
+        let cut = String(line.prefix(QuickCaptureProjects.maxUserLineCharacters))
+        var lines = defaults.dictionary(forKey: Keys.quickCaptureProjectLines) as? [String: String]
+            ?? quickCaptureProjectLines
+        lines[projectKey] = cut.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : cut
+        quickCaptureProjectLines = lines
+    }
+
+    /// Hosted transcription model. Empty means
+    /// `MistralRealtimeWebSocketClient.defaultModel`.
+    var mistralDictationModel: String {
+        didSet { defaults.set(mistralDictationModel, forKey: Keys.mistralDictationModel) }
+    }
+
+    /// Hosted polishing model. Empty means `MistralPolishDefaults.model`.
+    var mistralPolishingModel: String {
+        didSet { defaults.set(mistralPolishingModel, forKey: Keys.mistralPolishingModel) }
+    }
+
+    /// The models the Mistral key last listed. Kept across launches so the
+    /// model pickers are whole before (or without) the next fetch, and so a
+    /// polish request knows whether its model takes `reasoning_effort`.
+    var mistralModelCatalog: [MistralModel] {
+        didSet { persistMistralModelCatalog() }
+    }
+
     var autoCopyEnabled: Bool {
         didSet { defaults.set(autoCopyEnabled, forKey: Keys.autoCopyEnabled) }
+    }
+
+    /// Overlay Buffer: a dictation that ends in "send it" or "send now" is
+    /// committed without those words, then Return is pressed in the same app.
+    /// Terminals only. Off by default (#318).
+    var overlaySpokenSendEnabled: Bool {
+        didSet { defaults.set(overlaySpokenSendEnabled, forKey: Keys.overlaySpokenSendEnabled) }
+    }
+
+    /// Live Auto-Paste: the same trigger, per segment. Live typing cannot take
+    /// words back, so while this is on in a terminal each segment is typed
+    /// when its final arrives instead of as the words come. Off by default.
+    var liveSpokenSendEnabled: Bool {
+        didSet { defaults.set(liveSpokenSendEnabled, forKey: Keys.liveSpokenSendEnabled) }
+    }
+
+    /// The phrases both modes listen for (#839), "send it" and "send now"
+    /// unless the user set their own. Only a list `SendTriggerPhrases`
+    /// accepted is ever assigned; one read back that no longer validates
+    /// loads as the default.
+    var spokenSendTriggerPhrases: [String] {
+        didSet { defaults.set(spokenSendTriggerPhrases, forKey: Keys.spokenSendTriggerPhrases) }
+    }
+
+    /// The phrases that, said alone, end the joined Claude Code session's
+    /// running turn (#1696). Empty, and so off, unless the user set some;
+    /// only a list `SpokenAbortPhrases` accepted is ever assigned.
+    var spokenAbortPhrases: [String] {
+        didSet { defaults.set(spokenAbortPhrases, forKey: Keys.spokenAbortPhrases) }
+    }
+
+    /// How long an Overlay Buffer dictation that ends in a send phrase waits
+    /// for new words before it stops (#1009). Read when the wait starts.
+    var spokenStopWait: SpokenStopWait {
+        didSet { defaults.set(spokenStopWait.rawValue, forKey: Keys.spokenStopWait) }
+    }
+
+    /// Lower other audio while dictating, and fade it back on stop. On by
+    /// default (owner ruling, 2026-09-21, after hand-testing it): dictating
+    /// over music is the common case, and the fade makes it unobtrusive
+    /// enough not to need discovering first.
+    var audioDuckingEnabled: Bool {
+        didSet { defaults.set(audioDuckingEnabled, forKey: Keys.audioDuckingEnabled) }
+    }
+
+    /// Seconds each ducking fade takes, in both directions
+    /// (`audioDuckingFadeDurationRange`).
+    var audioDuckingFadeDuration: Double {
+        didSet { defaults.set(audioDuckingFadeDuration, forKey: Keys.audioDuckingFadeDuration) }
+    }
+
+    static let audioDuckingFadeDurationRange: ClosedRange<Double> = 0.1...2.0
+    static let defaultAudioDuckingFadeDuration: Double = 0.4
+
+    /// The device and volume to put back at the next launch when this one dies
+    /// ducked. Not surfaced in Settings — `AudioDuckingController` owns both
+    /// ends. The device is stored with the volume because a restore aimed at
+    /// whatever is default by then would push one device's level onto another.
+    var audioDuckingPendingRestore: OutputVolumeReading? {
+        get {
+            guard let deviceUID = defaults.string(
+                forKey: Keys.audioDuckingPendingRestoreDeviceUID), !deviceUID.isEmpty,
+                defaults.object(forKey: Keys.audioDuckingPendingRestoreVolume) != nil
+            else { return nil }
+            let stored = defaults.double(forKey: Keys.audioDuckingPendingRestoreVolume)
+            guard (0...1).contains(stored) else { return nil }
+            return OutputVolumeReading(deviceUID: deviceUID, volume: Float(stored))
+        }
+        set {
+            if let newValue {
+                defaults.set(
+                    newValue.deviceUID, forKey: Keys.audioDuckingPendingRestoreDeviceUID)
+                defaults.set(
+                    Double(newValue.volume), forKey: Keys.audioDuckingPendingRestoreVolume)
+            } else {
+                defaults.removeObject(forKey: Keys.audioDuckingPendingRestoreDeviceUID)
+                defaults.removeObject(forKey: Keys.audioDuckingPendingRestoreVolume)
+            }
+        }
     }
 
     var dictationOutputMode: DictationOutputMode {
@@ -436,15 +490,24 @@ final class SettingsStore {
         didSet { defaults.set(selectedInputDeviceUID, forKey: Keys.selectedInputDeviceUID) }
     }
 
+    /// Which input channel of a multi-channel device carries the microphone,
+    /// zero-based. Only consulted for devices above stereo, where there is no
+    /// meaningful downmix to mono (see `MicrophoneCaptureService`). Kept as a
+    /// single global rather than per-device: users have one interface, and a
+    /// stale index for another device is clamped away at capture start.
+    var selectedInputChannel: Int {
+        didSet { defaults.set(selectedInputChannel, forKey: Keys.selectedInputChannel) }
+    }
+
     var dictationShortcutEnabled: Bool {
         didSet { defaults.set(dictationShortcutEnabled, forKey: Keys.dictationShortcutEnabled) }
     }
 
-    private var dictationShortcutKeyCode: UInt32 {
+    var dictationShortcutKeyCode: UInt32 {
         didSet { defaults.set(dictationShortcutKeyCode, forKey: Keys.dictationShortcutKeyCode) }
     }
 
-    private var dictationShortcutCarbonModifierFlags: UInt32 {
+    var dictationShortcutCarbonModifierFlags: UInt32 {
         didSet {
             defaults.set(
                 dictationShortcutCarbonModifierFlags,
@@ -453,7 +516,10 @@ final class SettingsStore {
     }
 
     var llmPolishingEnabled: Bool {
-        didSet { defaults.set(llmPolishingEnabled, forKey: Keys.llmPolishingEnabled) }
+        didSet {
+            defaults.set(llmPolishingEnabled, forKey: Keys.llmPolishingEnabled)
+            ensureSecretsForSelectedEnginesLoaded()
+        }
     }
 
     var llmPolishingEndpointURL: String {
@@ -461,7 +527,7 @@ final class SettingsStore {
     }
 
     var llmPolishingAPIKey: String {
-        didSet { defaults.set(llmPolishingAPIKey, forKey: Keys.llmPolishingAPIKey) }
+        didSet { persistSecret(llmPolishingAPIKey, for: .llmPolishingAPIKey) }
     }
 
     var llmPolishingModel: String {
@@ -489,6 +555,174 @@ final class SettingsStore {
         }
     }
 
+    /// The user's own choice for early polish (#709), nil until they flip the
+    /// toggle. See `earlyPolishEnabled` for the default.
+    var earlyPolishChoice: Bool? {
+        didSet {
+            if let earlyPolishChoice {
+                defaults.set(earlyPolishChoice, forKey: Keys.earlyPolishEnabled)
+            } else {
+                defaults.removeObject(forKey: Keys.earlyPolishEnabled)
+            }
+        }
+    }
+
+    /// Whether Overlay Buffer polishes settled pieces while the user speaks
+    /// (#709). Until the user chooses, on for the bundled helper only: early
+    /// polish sends about 3 times the input characters per dictation, which
+    /// costs money on a paid endpoint and nothing on the helper.
+    var earlyPolishEnabled: Bool {
+        get { earlyPolishChoice ?? (polishingBackendMode == .managedLocal) }
+        set { earlyPolishChoice = newValue }
+    }
+
+    /// The user's own description of who they are and the names they use,
+    /// sent with every polish request (any app, any endpoint — like the
+    /// replacement dictionary, it is text they typed for this purpose).
+    var polishSpeakerProfile: String {
+        didSet {
+            defaults.set(polishSpeakerProfile, forKey: Keys.polishSpeakerProfile)
+        }
+    }
+
+    /// The user's global terms, correct spelling only (`SpeakerTerms`).
+    /// An ABSENT key means "never set", which is what lets the one-time import
+    /// from the replacement dictionary tell a new install from an emptied list.
+    /// A change merges into the saved list, which another running copy may
+    /// have changed since (#1575).
+    var polishSpeakerTerms: [String] {
+        didSet {
+            var terms = polishSpeakerTerms
+            if let saved = defaults.stringArray(forKey: Keys.polishSpeakerTerms) {
+                // Capped and deduplicated as a launch reads it, or the next
+                // launch's shorter base takes the overflow for another copy's.
+                // At the cap, this copy's addition goes, not a saved term.
+                terms = SpeakerTerms.sanitized(
+                    ListSettingMerge.merge(base: oldValue, ours: terms, saved: saved),
+                    keeping: saved)
+            }
+            // Saved first: the assignment below re-enters this observer
+            // (`@Observable`), which must find the merge already saved.
+            defaults.set(terms, forKey: Keys.polishSpeakerTerms)
+            if terms != polishSpeakerTerms { polishSpeakerTerms = terms }
+            // A term the user adds by hand is no longer a refusal.
+            let added = Set(polishSpeakerTerms.map(SpeakerTermSuggestions.key))
+            if polishDismissedTermSuggestions.contains(where: {
+                added.contains(SpeakerTermSuggestions.key($0))
+            }) {
+                polishDismissedTermSuggestions.removeAll {
+                    added.contains(SpeakerTermSuggestions.key($0))
+                }
+            }
+        }
+    }
+
+    /// Suggested terms the user refused, oldest first. Never expires; only
+    /// adding the term by hand or "Forget dismissed suggestions" removes one.
+    /// Merged into the saved list like `polishSpeakerTerms`.
+    var polishDismissedTermSuggestions: [String] {
+        didSet {
+            var dismissed = polishDismissedTermSuggestions
+            if let saved = defaults.stringArray(forKey: Keys.polishDismissedTermSuggestions) {
+                dismissed = Array(
+                    ListSettingMerge.merge(base: oldValue, ours: dismissed, saved: saved)
+                        .suffix(SpeakerTermSuggestions.maxDismissed))
+            }
+            defaults.set(dismissed, forKey: Keys.polishDismissedTermSuggestions)
+            if dismissed != polishDismissedTermSuggestions { polishDismissedTermSuggestions = dismissed }
+        }
+    }
+
+    /// An absent key is `every50`: the pass runs by itself unless the user
+    /// picks Never (owner ruling, 2026-09-21).
+    var termSuggestionInterval: TermSuggestionInterval {
+        didSet { defaults.set(termSuggestionInterval.rawValue, forKey: Keys.termSuggestionInterval) }
+    }
+
+    /// Dictations saved since the last completed suggestion run. Persisted:
+    /// at fifty per run, a counter that restarted with the app would never
+    /// get there.
+    var termSuggestionDictationsSinceRun: Int {
+        didSet {
+            defaults.set(
+                termSuggestionDictationsSinceRun, forKey: Keys.termSuggestionDictationsSinceRun)
+        }
+    }
+
+    /// The counter value a failed background run waits for before the next
+    /// attempt; 0 when nothing failed. Persisted, or a relaunch would retry
+    /// at once against an API that is still down.
+    var termSuggestionRetryAt: Int {
+        didSet { defaults.set(termSuggestionRetryAt, forKey: Keys.termSuggestionRetryAt) }
+    }
+
+    /// Forever by default: an update must not delete what an earlier build
+    /// saved without the user asking for it.
+    var dictationHistoryRetention: DictationHistoryRetention {
+        didSet {
+            defaults.set(dictationHistoryRetention.rawValue, forKey: Keys.dictationHistoryRetention)
+        }
+    }
+
+    /// The History storage settings as saved now: retention, audio and
+    /// diagnostic records, which another running copy may have changed
+    /// since this one launched. What deletes by them reads them here, or a
+    /// copy still holding Don't keep or a switch off deletes what the other
+    /// copy keeps (#1569). Returns the retention.
+    func reloadHistoryStorageSettings() -> DictationHistoryRetention {
+        let saved = defaults.string(forKey: Keys.dictationHistoryRetention)
+            .flatMap(DictationHistoryRetention.init(rawValue:)) ?? .forever
+        if saved != dictationHistoryRetention { dictationHistoryRetention = saved }
+        let audio = Self.loadBool(defaults: defaults, key: Keys.dictationAudioEnabled, fallback: false)
+        if audio != dictationAudioEnabled { dictationAudioEnabled = audio }
+        let records = Self.loadBool(defaults: defaults, key: Keys.diagnosticRecordsEnabled, fallback: true)
+        if records != diagnosticRecordsEnabled { diagnosticRecordsEnabled = records }
+        return saved
+    }
+
+    /// Transcribe each Overlay Buffer dictation on the Mistral API engine a
+    /// second time on stop (#317). On by default: it is the only thing that
+    /// recovers speech lost in a stream stall (symptom D in
+    /// docs/agent/mistral-realtime-stall.md), at half the realtime price
+    /// again (#1678).
+    var mistralStopSecondPassEnabled: Bool {
+        didSet {
+            defaults.set(mistralStopSecondPassEnabled, forKey: Keys.mistralStopSecondPassEnabled)
+        }
+    }
+
+    /// Keep each saved dictation's audio on this Mac, for the replay eval.
+    /// Off by default: audio is the most sensitive thing the app could keep.
+    var dictationAudioEnabled: Bool {
+        didSet { defaults.set(dictationAudioEnabled, forKey: Keys.dictationAudioEnabled) }
+    }
+
+    /// Keeps a diagnostic record of each polished dictation beside its History
+    /// entry, and watches the seconds after its insertion for an erase
+    /// (`DiagnosticRecord`, `EditSignalWatcher`). On by default; History >
+    /// Storage turns it off, which deletes the records. Nothing is kept while
+    /// History is "Don't keep", whatever this says.
+    var diagnosticRecordsEnabled: Bool {
+        didSet { defaults.set(diagnosticRecordsEnabled, forKey: Keys.diagnosticRecordsEnabled) }
+    }
+
+    func dismissTermSuggestion(_ term: String) {
+        let key = SpeakerTermSuggestions.key(term)
+        guard !key.isEmpty,
+              !polishDismissedTermSuggestions.contains(where: {
+                  SpeakerTermSuggestions.key($0) == key
+              })
+        else { return }
+        polishDismissedTermSuggestions = Array(
+            (polishDismissedTermSuggestions + [term])
+                .suffix(SpeakerTermSuggestions.maxDismissed)
+        )
+    }
+
+    var hasStoredPolishSpeakerTerms: Bool {
+        defaults.object(forKey: Keys.polishSpeakerTerms) != nil
+    }
+
     /// When true, a capped, sanitized excerpt of the clipboard is fed to the
     /// polish LLM as reference context so it can ground near-miss STT of
     /// technical terms (file names, identifiers, URLs, error names) to their
@@ -501,6 +735,17 @@ final class SettingsStore {
     var polishClipboardContextEnabled: Bool {
         didSet {
             defaults.set(polishClipboardContextEnabled, forKey: Keys.polishClipboardContextEnabled)
+        }
+    }
+
+    /// When true, the first dictation that joins a local Claude Code, Vibe
+    /// or opencode session in a project the app has not asked about runs
+    /// that agent headless in the project for its terms (#609, #642,
+    /// `ProjectTermProposer`). Off by default: each run spends the user's
+    /// Claude quota, Mistral credits or opencode provider's tokens.
+    var projectTermProposalsEnabled: Bool {
+        didSet {
+            defaults.set(projectTermProposalsEnabled, forKey: Keys.projectTermProposalsEnabled)
         }
     }
 
@@ -531,7 +776,7 @@ final class SettingsStore {
     /// the endpoint is not permitted, or an unlisted app is focused, the
     /// screen is never read at all (`TerminalScreenContext.shouldAttemptRead`).
     ///
-    /// Scope, in two tiers — and the help text must state the second one,
+    /// Scope, in two tiers — and the row's title must state the second one,
     /// because it is the one that SENDS text:
     ///
     /// 1. Always: the screen feeds the deterministic vocabulary MATCHER, which
@@ -543,7 +788,7 @@ final class SettingsStore {
     /// Tier 2 is live (the broker configures the authorizer); an unjoined pane
     /// still contributes vocabulary only. Consent is asked for the union: a user
     /// who reads "fixes spellings" has not agreed to have their screen sent, so
-    /// the help text names it.
+    /// the title says "Send agent's terminal screen".
     var terminalScreenContextEnabled: Bool {
         didSet {
             defaults.set(terminalScreenContextEnabled, forKey: Keys.terminalScreenContextEnabled)
@@ -597,14 +842,6 @@ final class SettingsStore {
         }
     }
 
-    /// Whether LOCAL Claude Code hook responses may write the broker-allocated
-    /// session marker into the terminal window title. Opt-in (default false):
-    /// focused-pane TTY is the normal local join, while users on terminals
-    /// without that capability can explicitly restore the title fallback.
-    ///
-    /// This preference does not govern remote hook responses. SSH sessions can
-    /// only join through their title marker, so the remote listener always
-    /// emits one independently.
     /// Whether the cmux surface join arm may dial cmux's control socket.
     ///
     /// Off by default and separate from every other context toggle, because it
@@ -618,14 +855,21 @@ final class SettingsStore {
         }
     }
 
-    var claudeLocalTitleMarkerFallbackEnabled: Bool {
-        didSet {
-            claudeLocalTitleMarkerFallbackState.set(claudeLocalTitleMarkerFallbackEnabled)
-            defaults.set(
-                claudeLocalTitleMarkerFallbackEnabled,
-                forKey: Keys.claudeLocalTitleMarkerFallbackEnabled
-            )
-        }
+    /// Terminal apps the user added in Settings → Terminals (plus the
+    /// one-time import from the legacy `terminal_apps.toml`). Insertion
+    /// treats these bundle ids exactly as the TOML entries were treated:
+    /// terminal-like for live dictation and the agent polish profile —
+    /// nothing more (`TerminalScreenAllowlist` still excludes them from
+    /// screen reads, which a user list was never able to grant).
+    var userTerminalApps: [UserTerminalApp] {
+        didSet { persistUserTerminalApps() }
+    }
+
+    /// The user-added apps' bundle ids — the runtime half of the old
+    /// `terminal_apps.toml` list. Seeded once at launch by
+    /// `UserTerminalAppsMigrator`, then owned by Settings → Terminals.
+    var userTerminalAppBundleIDs: Set<String> {
+        Set(userTerminalApps.map(\.bundleID))
     }
 
     /// The remote listen port this Mac's SSH `RemoteForward` binds on an
@@ -645,15 +889,6 @@ final class SettingsStore {
         ClaudeRemoteForwardPortAllocator(legacyDefaults: defaults).allocatedPort()
     }
 
-    /// A sendable, live view of the preference for the broker's background
-    /// connection threads. The synchronized mirror keeps actor-isolated UI
-    /// state and non-Sendable `UserDefaults` out of the socket service, while a
-    /// Settings toggle still takes effect without restarting the app.
-    func makeClaudeLocalTitleMarkerFallbackProvider() -> @Sendable () -> Bool {
-        let state = claudeLocalTitleMarkerFallbackState
-        return { state.get() }
-    }
-
     /// When true, the loopback-only endpoint gate that every polish-context
     /// surface shares (clipboard, terminal screen, repo vocabulary, Claude
     /// repo/session blocks — `PolishContextClipboardReader
@@ -665,7 +900,7 @@ final class SettingsStore {
     /// context toggle: those decide WHAT may be collected, this decides WHERE
     /// it may be sent. Off, the per-surface promises ("local polishing
     /// endpoints only") hold unconditionally; on, the user has explicitly
-    /// traded them for their chosen endpoint, and the Settings row's help text
+    /// traded them for their chosen endpoint, and the Settings row's title
     /// names exactly that trade. Each surface's own toggle still gates
     /// collection — this flag alone never causes a read.
     var polishContextTrustedEndpointEnabled: Bool {
@@ -693,25 +928,22 @@ final class SettingsStore {
         didSet { defaults.set(debugLogRealtimeDeltas, forKey: Keys.debugLogRealtimeDeltas) }
     }
 
-    #if LOCALVOXTRAL_DOGFOOD
-    /// Arms the dogfooding context capture. Default false, and it exists at all
-    /// only in a build compiled with `LOCALVOXTRAL_DOGFOOD` (see `Package.swift`
-    /// for why that gate is a compile flag rather than this toggle alone).
+    #if DEBUG || LOCALVOXTRAL_E2E_HARNESS
+    /// Whether this instrumented build opens its local control socket
+    /// (`DogfoodControlSocket`), which can start and stop dictations and report
+    /// what the context pipeline resolved.
     ///
-    /// While armed, every polished dictation writes a record containing the raw
-    /// transcript, the harvested context, the rendered prompts, and the model's
-    /// reply to `~/Library/Application Support/localvoxtral/dogfood`. That is
-    /// content the shipped app deliberately never writes anywhere, which is why
-    /// arming it is a deliberate act rather than a side effect of running an
-    /// instrumented build.
-    ///
-    /// No UI yet — like `debugLogRealtimeDeltas`, and toggled the same way:
-    ///   `defaults write com.localvoxtral.app debug.dogfood_capture_enabled -bool true`
-    /// A Settings row and a status-item indicator belong with the flag-this-
-    /// dictation affordance; until they exist, an armed build is only
-    /// discoverable from this default and the capture directory.
-    var dogfoodCaptureEnabled: Bool {
-        didSet { defaults.set(dogfoodCaptureEnabled, forKey: Keys.dogfoodCaptureEnabled) }
+    /// Off by default, and separate from `diagnosticRecordsEnabled` on purpose: a
+    /// record is a file, a socket accepts commands, and consenting to the
+    /// first is not consenting to the second. Toggled the same way:
+    ///   `defaults write com.localvoxtral.app debug.dogfood_control_socket_enabled -bool true`
+    /// Read once at launch — the socket binds in `applicationDidFinishLaunching`
+    /// or not at all, so flipping this needs a relaunch, which is the point:
+    /// a listener must not appear under a running app.
+    var dogfoodControlSocketEnabled: Bool {
+        didSet {
+            defaults.set(dogfoodControlSocketEnabled, forKey: Keys.dogfoodControlSocketEnabled)
+        }
     }
     #endif
 
@@ -725,6 +957,13 @@ final class SettingsStore {
         }
     }
 
+    /// The dictation key's chord when `modifierOnlyHotKeyModifier` is
+    /// `.chord` (#863), in `ModifierChord.storageValue` form; empty when none
+    /// is recorded. Both Shifts until the user records another.
+    var modifierOnlyHotKeyChord: String {
+        didSet { defaults.set(modifierOnlyHotKeyChord, forKey: Keys.modifierOnlyHotKeyChord) }
+    }
+
     /// Seconds to hold modifier before it triggers live auto-paste (0.1-0.8).
     var modifierOnlyHoldDelay: Double {
         didSet { defaults.set(modifierOnlyHoldDelay, forKey: Keys.modifierOnlyHoldDelay) }
@@ -734,11 +973,11 @@ final class SettingsStore {
         didSet { defaults.set(overlayBufferShortcutEnabled, forKey: Keys.overlayBufferShortcutEnabled) }
     }
 
-    private var overlayBufferShortcutKeyCode: UInt32 {
+    var overlayBufferShortcutKeyCode: UInt32 {
         didSet { defaults.set(overlayBufferShortcutKeyCode, forKey: Keys.overlayBufferShortcutKeyCode) }
     }
 
-    private var overlayBufferShortcutCarbonModifierFlags: UInt32 {
+    var overlayBufferShortcutCarbonModifierFlags: UInt32 {
         didSet {
             defaults.set(
                 overlayBufferShortcutCarbonModifierFlags,
@@ -752,15 +991,124 @@ final class SettingsStore {
         didSet { defaults.set(overlayBufferFontSize, forKey: Keys.overlayBufferFontSize) }
     }
 
+    /// Body lines the Overlay Buffer panel shows before its text scrolls.
+    var overlayBufferVisibleLines: Int {
+        didSet { defaults.set(overlayBufferVisibleLines, forKey: Keys.overlayBufferVisibleLines) }
+    }
+
+    /// Whether the Overlay Buffer keeps a word still being dictated on its
+    /// line, and up to what length (see `OverlayWordHold`).
+    var overlayBufferWordHold: OverlayWordHold {
+        didSet { defaults.set(overlayBufferWordHold.rawValue, forKey: Keys.overlayBufferWordHold) }
+    }
+
+    /// The color the overlay shows polish in: the sweep and the changed
+    /// words (#1074).
+    var overlayBufferPolishColor: OverlayPolishColor {
+        didSet { defaults.set(overlayBufferPolishColor.rawValue, forKey: Keys.overlayBufferPolishColor) }
+    }
+
+    /// Stop an Overlay Buffer tap session after this long without new text.
+    var overlayBufferSilenceAutoStop: SilenceAutoStop {
+        didSet { defaults.set(overlayBufferSilenceAutoStop.rawValue, forKey: Keys.overlayBufferSilenceAutoStop) }
+    }
+
+    /// Where the user dragged the Overlay Buffer panel, or nil for the
+    /// anchored position. Stored against the display it was on and
+    /// re-validated against the attached displays on every use — see
+    /// `OverlayManualPlacementResolver`.
+    var overlayBufferPlacement: OverlayManualPlacement? {
+        didSet { persistOverlayBufferPlacement() }
+    }
+
     var livePasteShortcutEnabled: Bool {
         didSet { defaults.set(livePasteShortcutEnabled, forKey: Keys.livePasteShortcutEnabled) }
     }
 
-    private var livePasteShortcutKeyCode: UInt32 {
+    var answerAgentShortcutEnabled: Bool {
+        didSet { defaults.set(answerAgentShortcutEnabled, forKey: Keys.answerAgentShortcutEnabled) }
+    }
+
+    /// Advanced → "Hold the key for Live Auto-Paste" (#840). Off, a hold of
+    /// the single modifier key is an Overlay Buffer push to talk.
+    var modifierHoldLiveAutoPaste: Bool {
+        didSet { defaults.set(modifierHoldLiveAutoPaste, forKey: Keys.modifierHoldLiveAutoPaste) }
+    }
+
+    /// "Tell me when an agent needs you" (#840): the needs-you cue and the
+    /// waiting sessions in the overlay's destinations. Off by default.
+    var agentAttentionEnabled: Bool {
+        didSet { defaults.set(agentAttentionEnabled, forKey: Keys.agentAttentionEnabled) }
+    }
+
+    /// The mark the menu bar icon gets while an agent needs you.
+    var agentAttentionMark: AgentAttentionMark {
+        didSet { defaults.set(agentAttentionMark.rawValue, forKey: Keys.agentAttentionMark) }
+    }
+
+    var answerAgentShortcutKeyCode: UInt32 {
+        didSet { defaults.set(answerAgentShortcutKeyCode, forKey: Keys.answerAgentShortcutKeyCode) }
+    }
+
+    var answerAgentShortcutCarbonModifierFlags: UInt32 {
+        didSet {
+            defaults.set(answerAgentShortcutCarbonModifierFlags, forKey: Keys.answerAgentShortcutModifiers)
+        }
+    }
+
+    var copyLastDictationShortcutEnabled: Bool {
+        didSet {
+            defaults.set(copyLastDictationShortcutEnabled, forKey: Keys.copyLastDictationShortcutEnabled)
+        }
+    }
+
+    var copyLastDictationShortcutKeyCode: UInt32 {
+        didSet {
+            defaults.set(copyLastDictationShortcutKeyCode, forKey: Keys.copyLastDictationShortcutKeyCode)
+        }
+    }
+
+    var copyLastDictationShortcutCarbonModifierFlags: UInt32 {
+        didSet {
+            defaults.set(
+                copyLastDictationShortcutCarbonModifierFlags,
+                forKey: Keys.copyLastDictationShortcutModifiers)
+        }
+    }
+
+    var quickCaptureShortcutEnabled: Bool {
+        didSet { defaults.set(quickCaptureShortcutEnabled, forKey: Keys.quickCaptureShortcutEnabled) }
+    }
+
+    var quickCaptureShortcutKeyCode: UInt32 {
+        didSet { defaults.set(quickCaptureShortcutKeyCode, forKey: Keys.quickCaptureShortcutKeyCode) }
+    }
+
+    var quickCaptureShortcutCarbonModifierFlags: UInt32 {
+        didSet {
+            defaults.set(quickCaptureShortcutCarbonModifierFlags, forKey: Keys.quickCaptureShortcutModifiers)
+        }
+    }
+
+    /// A modifier-only chord in an action slot (#831), in
+    /// `ModifierChord.storageValue` form; empty when the slot holds a key.
+    var copyLastDictationShortcutChord: String {
+        didSet { defaults.set(copyLastDictationShortcutChord, forKey: Keys.copyLastDictationShortcutChord) }
+    }
+
+    var answerAgentShortcutChord: String {
+        didSet { defaults.set(answerAgentShortcutChord, forKey: Keys.answerAgentShortcutChord) }
+    }
+
+    var quickCaptureShortcutChord: String {
+        didSet { defaults.set(quickCaptureShortcutChord, forKey: Keys.quickCaptureShortcutChord) }
+    }
+
+    var livePasteShortcutKeyCode: UInt32 {
         didSet { defaults.set(livePasteShortcutKeyCode, forKey: Keys.livePasteShortcutKeyCode) }
     }
 
-    private var livePasteShortcutCarbonModifierFlags: UInt32 {
+    var livePasteShortcutCarbonModifierFlags: UInt32 {
         didSet {
             defaults.set(
                 livePasteShortcutCarbonModifierFlags,
@@ -781,10 +1129,17 @@ final class SettingsStore {
     }
 
     init(
-        defaults: UserDefaults = .standard,
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        defaults: UserDefaults = AppDefaults.shared,
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        secretStore: (any SecretStoring)? = nil
     ) {
+        // Resolved from the INJECTED environment, not `ProcessInfo` — a test
+        // that passes a suppressing environment must get the process-local
+        // store, not the real keychain.
+        let secretStore = secretStore ?? DefaultSecretStore.make(environment: environment)
         self.defaults = defaults
+        self.secretStore = secretStore
+        self.environment = environment
 
         // Resolve onboarding completion BEFORE any migration below persists the
         // per-backend mode keys — the freshness heuristic reads whether those
@@ -798,7 +1153,7 @@ final class SettingsStore {
         // values back off.
         //
         // The gate needs the onboarding key to be ABSENT, not merely resolved
-        // false. "Re-run Setup…" resets that flag to false on an existing
+        // false. "Re-run setup…" resets that flag to false on an existing
         // install (DictationViewModel.reRunOnboarding), so a crash or force-quit
         // before the wizard closes would otherwise leave a configured user
         // looking fresh on the next launch — and claim Right Command from them.
@@ -813,23 +1168,27 @@ final class SettingsStore {
         let resolvedBackendModes = Self.resolveBackendModes(defaults: defaults, environment: environment)
         dictationBackendMode = resolvedBackendModes.dictation
         polishingBackendMode = resolvedBackendModes.polishing
-        defaults.set(resolvedBackendModes.dictation.rawValue, forKey: Keys.dictationBackendMode)
-        defaults.set(resolvedBackendModes.polishing.rawValue, forKey: Keys.polishingBackendMode)
-
-        if let storedCacheLimit = defaults.string(forKey: Keys.speechdCacheLimit),
-            let parsedCacheLimit = SpeechdCacheLimit(rawValue: storedCacheLimit)
-        {
-            speechdCacheLimit = parsedCacheLimit
-        } else {
-            speechdCacheLimit = .auto
+        // Only a missing mode is persisted. One this build can't parse may
+        // come from a newer build, and saving the migrated mode over it would
+        // erase that choice (#1040).
+        if defaults.object(forKey: Keys.dictationBackendMode) == nil {
+            defaults.set(resolvedBackendModes.dictation.rawValue, forKey: Keys.dictationBackendMode)
+        }
+        if defaults.object(forKey: Keys.polishingBackendMode) == nil {
+            defaults.set(resolvedBackendModes.polishing.rawValue, forKey: Keys.polishingBackendMode)
         }
 
-        if let storedStepCadence = defaults.string(forKey: Keys.speechdStepCadence),
-            let parsedStepCadence = SpeechdStepCadence(rawValue: storedStepCadence)
-        {
-            speechdStepCadence = parsedStepCadence
+        // A repo outside this build's catalog must never reach a helper
+        // launch, so the default runs instead. The stored repo stays: a newer
+        // build may have added it (#1040).
+        let storedSpeechModel = defaults.string(forKey: Keys.managedSpeechModel)?.trimmed ?? ""
+        if let option = SpeechModelCatalog.option(forRepoID: storedSpeechModel) {
+            managedSpeechModel = option.repoID
         } else {
-            speechdStepCadence = .auto
+            managedSpeechModel = SpeechModelCatalog.defaultOption.repoID
+            if storedSpeechModel.isEmpty {
+                defaults.set(SpeechModelCatalog.defaultOption.repoID, forKey: Keys.managedSpeechModel)
+            }
         }
 
         let configuredProvider = Self.loadString(
@@ -845,6 +1204,8 @@ final class SettingsStore {
         // The commit interval setting was removed. Clean up stale persisted
         // values so future defaults migrations do not preserve dead state.
         defaults.removeObject(forKey: "settings.commit_interval_seconds")
+        // So was the step interval: the helper sizes its steps itself (#639).
+        defaults.removeObject(forKey: "settings.speechd_step_cadence")
 
         realtimeAPIEndpointURL = Self.loadString(
             defaults: defaults, key: Keys.realtimeAPIEndpointURL,
@@ -852,11 +1213,22 @@ final class SettingsStore {
             environment: environment
         )
 
-        apiKey = Self.loadString(
-            defaults: defaults, key: Keys.apiKey,
-            envKey: "OPENAI_API_KEY", fallback: "",
-            environment: environment
-        )
+        // One sweep out of UserDefaults, then the keychain is the only source
+        // of truth. Done here rather than lazily so a plist copy of a secret
+        // stops existing at the first launch that can remove it. Reading the
+        // keys back is NOT done here — see `ensureSecretsLoaded`.
+        // ... but NOT on a run whose secret store dies with the process: the
+        // sweep removes the plist copy once the write "succeeds", and an
+        // in-memory write always succeeds. A CI launch would take the user's
+        // only copy of a not-yet-migrated key with it.
+        let secrets =
+            StartupPermissionSuppression.loginKeychainIsDisabled(environment: environment)
+            ? ResolvedSecrets()
+            : Self.migrateLegacySecrets(defaults: defaults, secretStore: secretStore)
+        secretStoreFailureSummary = secrets.failureSummary
+
+        apiKey = Self.resolveSecret(
+            secrets, .realtimeAPIKey, envKey: "OPENAI_API_KEY", environment: environment)
 
         realtimeAPIModelName = Self.loadModelName(
             defaults: defaults, key: Keys.realtimeAPIModelName,
@@ -864,8 +1236,57 @@ final class SettingsStore {
             environment: environment
         )
 
+        mistralAPIKey = Self.resolveSecret(
+            secrets, .mistralAPIKey, envKey: "MISTRAL_API_KEY", environment: environment)
+        jevAPIKey = Self.resolveSecret(
+            secrets, .jevAPIKey, envKey: "TYPESAFE_API_KEY", environment: environment)
+        quickCaptureRouter = defaults.string(forKey: Keys.quickCaptureRouter)
+            .flatMap(QuickCaptureRouterChoice.init(rawValue:)) ?? .polishingModel
+        voiceMemosEnabled = Self.loadBool(
+            defaults: defaults, key: Keys.voiceMemosEnabled, fallback: false)
+        quickCaptureProjectLines =
+            defaults.dictionary(forKey: Keys.quickCaptureProjectLines) as? [String: String] ?? [:]
+        // Empty is the stored form of "use the pinned default": the defaults
+        // live in one place (the client / MistralPolishDefaults) and a user who
+        // clears the field gets them back, rather than a blank model name.
+        mistralDictationModel = Self.loadString(
+            defaults: defaults, key: Keys.mistralDictationModel,
+            envKey: "MISTRAL_DICTATION_MODEL", fallback: "",
+            environment: environment
+        )
+        mistralPolishingModel = Self.loadString(
+            defaults: defaults, key: Keys.mistralPolishingModel,
+            envKey: "MISTRAL_POLISHING_MODEL", fallback: "",
+            environment: environment
+        )
+        mistralModelCatalog = Self.loadMistralModelCatalog(from: defaults)
+
+        opensWindowAtLaunch = Self.loadBool(
+            defaults: defaults, key: Keys.opensWindowAtLaunch, fallback: false)
+        onboardingPolishingBeforeMistralChoice = Self.loadPolishingSnapshot(
+            defaults: defaults, key: Keys.onboardingPolishingBeforeMistralChoice)
         autoCopyEnabled = Self.loadBool(
             defaults: defaults, key: Keys.autoCopyEnabled, fallback: false)
+        overlaySpokenSendEnabled = Self.loadBool(
+            defaults: defaults, key: Keys.overlaySpokenSendEnabled, fallback: false)
+        liveSpokenSendEnabled = Self.loadBool(
+            defaults: defaults, key: Keys.liveSpokenSendEnabled, fallback: false)
+        let sendPhrases = SendTriggerPhrases.loaded(defaults.stringArray(forKey: Keys.spokenSendTriggerPhrases))
+        spokenSendTriggerPhrases = sendPhrases
+        spokenAbortPhrases = SpokenAbortPhrases.loaded(
+            defaults.stringArray(forKey: Keys.spokenAbortPhrases), sendPhrases: sendPhrases)
+        spokenStopWait =
+            (defaults.object(forKey: Keys.spokenStopWait) as? Int)
+            .flatMap(SpokenStopWait.init(rawValue:)) ?? .default
+        audioDuckingEnabled = Self.loadBool(
+            defaults: defaults, key: Keys.audioDuckingEnabled, fallback: true)
+        let storedDuckingFade = defaults.object(forKey: Keys.audioDuckingFadeDuration) != nil
+            ? defaults.double(forKey: Keys.audioDuckingFadeDuration)
+            : Self.defaultAudioDuckingFadeDuration
+        audioDuckingFadeDuration = min(
+            max(storedDuckingFade, Self.audioDuckingFadeDurationRange.lowerBound),
+            Self.audioDuckingFadeDurationRange.upperBound
+        )
         if let storedOutputMode = defaults.string(forKey: Keys.dictationOutputMode),
             let parsedMode = DictationOutputMode(rawValue: storedOutputMode)
         {
@@ -914,11 +1335,9 @@ final class SettingsStore {
             fallback: "http://127.0.0.1:8080/v1/chat/completions",
             environment: environment
         )
-        llmPolishingAPIKey = Self.loadString(
-            defaults: defaults, key: Keys.llmPolishingAPIKey,
-            envKey: "LLM_POLISHING_API_KEY", fallback: "",
-            environment: environment
-        )
+        llmPolishingAPIKey = Self.resolveSecret(
+            secrets, .llmPolishingAPIKey, envKey: "LLM_POLISHING_API_KEY",
+            environment: environment)
         llmPolishingModel = Self.loadString(
             defaults: defaults, key: Keys.llmPolishingModel,
             envKey: "LLM_POLISHING_MODEL", fallback: Self.defaultLLMPolishingModel,
@@ -933,30 +1352,49 @@ final class SettingsStore {
             defaults: defaults, key: Keys.replacementDictionaryEnabled, fallback: false)
         agentPolishProfileEnabled = Self.loadBool(
             defaults: defaults, key: Keys.agentPolishProfileEnabled, fallback: true)
+        earlyPolishChoice = defaults.object(forKey: Keys.earlyPolishEnabled) as? Bool
+        polishSpeakerProfile = defaults.string(forKey: Keys.polishSpeakerProfile) ?? ""
+        polishDismissedTermSuggestions =
+            defaults.stringArray(forKey: Keys.polishDismissedTermSuggestions) ?? []
+        termSuggestionInterval =
+            (defaults.object(forKey: Keys.termSuggestionInterval) as? Int)
+            .flatMap(TermSuggestionInterval.init(rawValue:)) ?? .every50
+        dictationHistoryRetention =
+            defaults.string(forKey: Keys.dictationHistoryRetention)
+            .flatMap(DictationHistoryRetention.init(rawValue:)) ?? .forever
+        dictationAudioEnabled = Self.loadBool(
+            defaults: defaults, key: Keys.dictationAudioEnabled, fallback: false)
+        termSuggestionRetryAt = max(0, defaults.integer(forKey: Keys.termSuggestionRetryAt))
+        termSuggestionDictationsSinceRun = max(
+            0, defaults.integer(forKey: Keys.termSuggestionDictationsSinceRun))
+        polishSpeakerTerms = SpeakerTerms.sanitized(
+            defaults.stringArray(forKey: Keys.polishSpeakerTerms) ?? [])
         polishClipboardContextEnabled = Self.loadBool(
             defaults: defaults, key: Keys.polishClipboardContextEnabled, fallback: false)
+        projectTermProposalsEnabled = Self.loadBool(
+            defaults: defaults, key: Keys.projectTermProposalsEnabled, fallback: false)
         clipboardPayloadMacroEnabled = Self.loadBool(
             defaults: defaults, key: Keys.clipboardPayloadMacroEnabled, fallback: true)
         terminalScreenContextEnabled = Self.loadBool(
             defaults: defaults, key: Keys.terminalScreenContextEnabled, fallback: false)
         repoVocabularyEnabled = Self.loadBool(
             defaults: defaults, key: Keys.repoVocabularyEnabled, fallback: false)
+        mistralStopSecondPassEnabled = Self.loadBool(
+            defaults: defaults, key: Keys.mistralStopSecondPassEnabled, fallback: true)
         claudeRepoContextEnabled = Self.loadBool(
             defaults: defaults, key: Keys.claudeRepoContextEnabled, fallback: false)
-        claudeLocalTitleMarkerFallbackEnabled = Self.loadBool(
-            defaults: defaults,
-            key: Keys.claudeLocalTitleMarkerFallbackEnabled,
-            fallback: false
-        )
         cmuxSurfaceJoinEnabled = Self.loadBool(
             defaults: defaults, key: Keys.cmuxSurfaceJoinEnabled, fallback: false)
+        userTerminalApps = Self.loadUserTerminalApps(from: defaults)
         polishContextTrustedEndpointEnabled = Self.loadBool(
             defaults: defaults, key: Keys.polishContextTrustedEndpointEnabled, fallback: false)
         debugLogRealtimeDeltas = Self.loadBool(
             defaults: defaults, key: Keys.debugLogRealtimeDeltas, fallback: false)
-        #if LOCALVOXTRAL_DOGFOOD
-        dogfoodCaptureEnabled = Self.loadBool(
-            defaults: defaults, key: Keys.dogfoodCaptureEnabled, fallback: false)
+        diagnosticRecordsEnabled = Self.loadBool(
+            defaults: defaults, key: Keys.diagnosticRecordsEnabled, fallback: true)
+        #if DEBUG || LOCALVOXTRAL_E2E_HARNESS
+        dogfoodControlSocketEnabled = Self.loadBool(
+            defaults: defaults, key: Keys.dogfoodControlSocketEnabled, fallback: false)
         #endif
         modifierOnlyHotKeyEnabled = Self.loadBool(
             defaults: defaults, key: Keys.modifierOnlyHotKeyEnabled, fallback: false)
@@ -967,6 +1405,8 @@ final class SettingsStore {
         } else {
             modifierOnlyHotKeyModifier = .fn
         }
+        modifierOnlyHotKeyChord = defaults.string(forKey: Keys.modifierOnlyHotKeyChord)
+            ?? ModifierChord.bothShifts.storageValue
         let storedHoldDelay = defaults.object(forKey: Keys.modifierOnlyHoldDelay) != nil
             ? defaults.double(forKey: Keys.modifierOnlyHoldDelay)
             : 0.35
@@ -976,6 +1416,27 @@ final class SettingsStore {
             ? defaults.double(forKey: Keys.overlayBufferFontSize)
             : OverlayLayoutMetrics.defaultBodyFontSize
         overlayBufferFontSize = OverlayLayoutMetrics.clampedBodyFontSize(storedOverlayFontSize)
+
+        let storedOverlayVisibleLines = defaults.object(forKey: Keys.overlayBufferVisibleLines) != nil
+            ? defaults.integer(forKey: Keys.overlayBufferVisibleLines)
+            : OverlayLayoutMetrics.defaultVisibleLines
+        overlayBufferVisibleLines = OverlayLayoutMetrics.clampedVisibleLines(storedOverlayVisibleLines)
+        overlayBufferWordHold =
+            (defaults.object(forKey: Keys.overlayBufferWordHold) as? Int)
+            .flatMap(OverlayWordHold.init(rawValue:)) ?? .off
+        overlayBufferPolishColor =
+            defaults.string(forKey: Keys.overlayBufferPolishColor)
+            .flatMap(OverlayPolishColor.init(rawValue:)) ?? .teal
+        overlayBufferSilenceAutoStop =
+            (defaults.object(forKey: Keys.overlayBufferSilenceAutoStop) as? Int)
+            .flatMap(SilenceAutoStop.init(rawValue:)) ?? .off
+
+        overlayBufferPlacement = Self.loadOverlayBufferPlacement(defaults: defaults)
+
+        // Zero-based; negatives are meaningless and an index past the device's
+        // channel count is clamped again at capture start (the device can
+        // change between launches).
+        selectedInputChannel = max(0, defaults.integer(forKey: Keys.selectedInputChannel))
 
         // --- Dual shortcut keys ---
         let hasExistingOverlayKeys = defaults.object(forKey: Keys.overlayBufferShortcutKeyCode) != nil
@@ -1005,7 +1466,9 @@ final class SettingsStore {
         } else {
             overlayBufferShortcutKeyCode = Self.defaultDictationShortcut.keyCode
             overlayBufferShortcutCarbonModifierFlags = Self.defaultDictationShortcut.carbonModifierFlags
-            overlayBufferShortcutEnabled = true
+            // Clearing the untouched default stores only this flag (#1269).
+            overlayBufferShortcutEnabled = Self.loadBool(
+                defaults: defaults, key: Keys.overlayBufferShortcutEnabled, fallback: true)
         }
 
         let hasExistingLivePasteKeys = defaults.object(forKey: Keys.livePasteShortcutKeyCode) != nil
@@ -1039,8 +1502,36 @@ final class SettingsStore {
             ?? Self.defaultSendNowTriggerPhrase
         sendNowTargetAppIDs = Self.loadSendNowTargetAppIDs(defaults: defaults)
 
-        // All stored properties are initialized above. Property reads used to
-        // persist migrations are safe from this point onward.
+        // Off until the user records one.
+        copyLastDictationShortcutKeyCode =
+            (defaults.object(forKey: Keys.copyLastDictationShortcutKeyCode) as? NSNumber)?.uint32Value ?? 0
+        copyLastDictationShortcutCarbonModifierFlags =
+            (defaults.object(forKey: Keys.copyLastDictationShortcutModifiers) as? NSNumber)?.uint32Value ?? 0
+        copyLastDictationShortcutEnabled = Self.loadBool(
+            defaults: defaults, key: Keys.copyLastDictationShortcutEnabled, fallback: false)
+        answerAgentShortcutKeyCode =
+            (defaults.object(forKey: Keys.answerAgentShortcutKeyCode) as? NSNumber)?.uint32Value ?? 0
+        answerAgentShortcutCarbonModifierFlags =
+            (defaults.object(forKey: Keys.answerAgentShortcutModifiers) as? NSNumber)?.uint32Value ?? 0
+        answerAgentShortcutEnabled = Self.loadBool(
+            defaults: defaults, key: Keys.answerAgentShortcutEnabled, fallback: false)
+        agentAttentionEnabled = Self.loadBool(
+            defaults: defaults, key: Keys.agentAttentionEnabled, fallback: false)
+        agentAttentionMark =
+            defaults.string(forKey: Keys.agentAttentionMark)
+            .flatMap(AgentAttentionMark.init(rawValue:)) ?? .dot
+        modifierHoldLiveAutoPaste = Self.loadBool(
+            defaults: defaults, key: Keys.modifierHoldLiveAutoPaste, fallback: false)
+        quickCaptureShortcutKeyCode =
+            (defaults.object(forKey: Keys.quickCaptureShortcutKeyCode) as? NSNumber)?.uint32Value ?? 0
+        quickCaptureShortcutCarbonModifierFlags =
+            (defaults.object(forKey: Keys.quickCaptureShortcutModifiers) as? NSNumber)?.uint32Value ?? 0
+        quickCaptureShortcutEnabled = Self.loadBool(
+            defaults: defaults, key: Keys.quickCaptureShortcutEnabled, fallback: false)
+        copyLastDictationShortcutChord = defaults.string(forKey: Keys.copyLastDictationShortcutChord) ?? ""
+        answerAgentShortcutChord = defaults.string(forKey: Keys.answerAgentShortcutChord) ?? ""
+        quickCaptureShortcutChord = defaults.string(forKey: Keys.quickCaptureShortcutChord) ?? ""
+
         if needsOverlayMigrationPersist {
             defaults.set(overlayBufferShortcutKeyCode, forKey: Keys.overlayBufferShortcutKeyCode)
             defaults.set(
@@ -1052,7 +1543,48 @@ final class SettingsStore {
             defaults.set(sendNowCommandEnabled, forKey: Keys.sendNowCommandEnabled)
         }
 
-        claudeLocalTitleMarkerFallbackState.set(claudeLocalTitleMarkerFallbackEnabled)
+        // The sweep above already holds these values; reading them back would
+        // be a second keychain operation for nothing.
+        loadedSecretKeys = Set(secrets.values.keys)
+        ensureSecretsForSelectedEnginesLoaded()
+    }
+
+    var effectiveSendNowTriggerPhrase: String {
+        let trigger = sendNowTriggerPhrase.trimmed
+        return trigger.isEmpty ? Self.defaultSendNowTriggerPhrase : trigger
+    }
+
+    var selectedSendNowTargetApps: [SendNowTargetApp] {
+        let selected = Set(sendNowTargetAppIDs)
+        return SendNowTargetApp.allCases.filter { selected.contains($0.rawValue) }
+    }
+
+    func isSendNowTargetAppSelected(_ app: SendNowTargetApp) -> Bool {
+        sendNowTargetAppIDs.contains(app.rawValue)
+    }
+
+    func setSendNowTargetApp(_ app: SendNowTargetApp, isSelected: Bool) {
+        var selected = Set(sendNowTargetAppIDs)
+        if isSelected {
+            selected.insert(app.rawValue)
+        } else {
+            selected.remove(app.rawValue)
+        }
+        sendNowTargetAppIDs = SendNowTargetApp.allCases
+            .map(\.rawValue)
+            .filter(selected.contains)
+    }
+
+    func sendNowTargetApp(for bundleIdentifier: String) -> SendNowTargetApp? {
+        selectedSendNowTargetApps.first { $0.bundleIdentifiers.contains(bundleIdentifier) }
+    }
+
+    private static func loadSendNowTargetAppIDs(defaults: UserDefaults) -> [String] {
+        guard let stored = defaults.array(forKey: Keys.sendNowTargetAppIDs) as? [String] else {
+            return defaultSendNowTargetApps.map(\.rawValue)
+        }
+        let known = Set(SendNowTargetApp.allCases.map(\.rawValue))
+        return stored.filter(known.contains)
     }
 
     // MARK: - Init Helpers
@@ -1064,6 +1596,15 @@ final class SettingsStore {
         defaults.string(forKey: key)
             ?? environment[envKey]
             ?? fallback
+    }
+
+    private static func loadPolishingSnapshot(defaults: UserDefaults, key: String) -> PolishingSnapshot? {
+        guard let stored = defaults.dictionary(forKey: key),
+              let rawMode = stored["mode"] as? String,
+              let mode = BackendMode(rawValue: rawMode),
+              let enabled = stored["enabled"] as? Bool
+        else { return nil }
+        return PolishingSnapshot(mode: mode, enabled: enabled)
     }
 
     private static func loadBool(
@@ -1172,286 +1713,5 @@ final class SettingsStore {
         )
         let normalized = normalizedModelName(from: configured)
         return normalized.isEmpty ? provider.defaultModelName : normalized
-    }
-
-    var trimmedAPIKey: String {
-        // `trimmedAPIKey` is only ever used as the realtime connection bearer
-        // token (see RealtimeAPIWebSocketClient, which omits the Authorization
-        // header when it is empty). Managed local servers need no key.
-        dictationBackendMode == .managedLocal ? "" : apiKey.trimmed
-    }
-
-    var effectiveModelName: String {
-        effectiveModelName(for: realtimeProvider)
-    }
-
-    var displayModelName: String {
-        effectiveModelName
-    }
-
-    var endpointPlaceholder: String {
-        realtimeProvider.defaultEndpoint
-    }
-
-    var modelPlaceholder: String {
-        realtimeProvider.defaultModelName
-    }
-
-    var dictationShortcut: DictationShortcut? {
-        guard dictationShortcutEnabled else { return nil }
-
-        let candidate = DictationShortcut(
-            keyCode: dictationShortcutKeyCode,
-            carbonModifierFlags: dictationShortcutCarbonModifierFlags
-        ).normalized
-
-        if DictationShortcutValidation.persistenceErrorMessage(for: candidate) != nil {
-            return Self.defaultDictationShortcut
-        }
-
-        return candidate
-    }
-
-    func setDictationShortcut(_ shortcut: DictationShortcut?) {
-        guard let shortcut else {
-            dictationShortcutEnabled = false
-            return
-        }
-
-        let normalizedShortcut = shortcut.normalized
-        let resolvedShortcut: DictationShortcut
-        if DictationShortcutValidation.persistenceErrorMessage(for: normalizedShortcut) == nil {
-            resolvedShortcut = normalizedShortcut
-        } else {
-            resolvedShortcut = Self.defaultDictationShortcut
-        }
-
-        dictationShortcutKeyCode = resolvedShortcut.keyCode
-        dictationShortcutCarbonModifierFlags = resolvedShortcut.carbonModifierFlags
-        dictationShortcutEnabled = true
-    }
-
-    func resetDictationShortcutToDefault() {
-        setDictationShortcut(Self.defaultDictationShortcut)
-    }
-
-    // MARK: - Dual Shortcuts (per output mode)
-
-    var overlayBufferShortcut: DictationShortcut? {
-        guard overlayBufferShortcutEnabled else { return nil }
-        let candidate = DictationShortcut(
-            keyCode: overlayBufferShortcutKeyCode,
-            carbonModifierFlags: overlayBufferShortcutCarbonModifierFlags
-        ).normalized
-        if DictationShortcutValidation.persistenceErrorMessage(for: candidate) != nil {
-            return nil
-        }
-        return candidate
-    }
-
-    /// True when a keyboard trigger can start an Overlay Buffer session: the
-    /// single-modifier tap gesture, or a dedicated Overlay Buffer shortcut.
-    /// LLM polishing runs only on Overlay Buffer commits, so when this is
-    /// false Settings shows polishing as unavailable and managed polishd is
-    /// kept stopped. The menu-bar Start Dictation button deliberately does
-    /// not count (owner call, 2026-07-06): an overlay session started from
-    /// the popover still polishes via the session-time ensureReady backstop,
-    /// paying the polishd cold start.
-    var isOverlayBufferSessionReachable: Bool {
-        modifierOnlyHotKeyEnabled || overlayBufferShortcut != nil
-    }
-
-    var livePasteShortcut: DictationShortcut? {
-        guard livePasteShortcutEnabled else { return nil }
-        let candidate = DictationShortcut(
-            keyCode: livePasteShortcutKeyCode,
-            carbonModifierFlags: livePasteShortcutCarbonModifierFlags
-        ).normalized
-        if DictationShortcutValidation.persistenceErrorMessage(for: candidate) != nil {
-            return nil
-        }
-        return candidate
-    }
-
-    func setOverlayBufferShortcut(_ shortcut: DictationShortcut?) {
-        guard let shortcut else {
-            overlayBufferShortcutEnabled = false
-            return
-        }
-        let normalizedShortcut = shortcut.normalized
-        if DictationShortcutValidation.persistenceErrorMessage(for: normalizedShortcut) == nil {
-            overlayBufferShortcutKeyCode = normalizedShortcut.keyCode
-            overlayBufferShortcutCarbonModifierFlags = normalizedShortcut.carbonModifierFlags
-        } else {
-            overlayBufferShortcutKeyCode = Self.defaultDictationShortcut.keyCode
-            overlayBufferShortcutCarbonModifierFlags = Self.defaultDictationShortcut.carbonModifierFlags
-        }
-        overlayBufferShortcutEnabled = true
-    }
-
-    func setLivePasteShortcut(_ shortcut: DictationShortcut?) {
-        guard let shortcut else {
-            livePasteShortcutEnabled = false
-            return
-        }
-        let normalizedShortcut = shortcut.normalized
-        if DictationShortcutValidation.persistenceErrorMessage(for: normalizedShortcut) == nil {
-            livePasteShortcutKeyCode = normalizedShortcut.keyCode
-            livePasteShortcutCarbonModifierFlags = normalizedShortcut.carbonModifierFlags
-        } else {
-            return
-        }
-        livePasteShortcutEnabled = true
-    }
-
-    var effectiveSendNowTriggerPhrase: String {
-        let trigger = sendNowTriggerPhrase.trimmed
-        return trigger.isEmpty ? Self.defaultSendNowTriggerPhrase : trigger
-    }
-
-    var selectedSendNowTargetApps: [SendNowTargetApp] {
-        let selected = Set(sendNowTargetAppIDs)
-        return SendNowTargetApp.allCases.filter { selected.contains($0.rawValue) }
-    }
-
-    func isSendNowTargetAppSelected(_ app: SendNowTargetApp) -> Bool {
-        sendNowTargetAppIDs.contains(app.rawValue)
-    }
-
-    func setSendNowTargetApp(_ app: SendNowTargetApp, isSelected: Bool) {
-        var selected = Set(sendNowTargetAppIDs)
-        if isSelected {
-            selected.insert(app.rawValue)
-        } else {
-            selected.remove(app.rawValue)
-        }
-        sendNowTargetAppIDs = SendNowTargetApp.allCases
-            .map(\.rawValue)
-            .filter(selected.contains)
-    }
-
-    func sendNowTargetApp(for bundleIdentifier: String) -> SendNowTargetApp? {
-        selectedSendNowTargetApps.first { $0.bundleIdentifiers.contains(bundleIdentifier) }
-    }
-
-    private static func loadSendNowTargetAppIDs(defaults: UserDefaults) -> [String] {
-        guard let stored = defaults.array(forKey: Keys.sendNowTargetAppIDs) as? [String] else {
-            return defaultSendNowTargetApps.map(\.rawValue)
-        }
-        let known = Set(SendNowTargetApp.allCases.map(\.rawValue))
-        return stored.filter(known.contains)
-    }
-
-    func modelName(for provider: RealtimeProvider) -> String {
-        realtimeAPIModelName
-    }
-
-    func effectiveModelName(for provider: RealtimeProvider) -> String {
-        if dictationBackendMode == .managedLocal {
-            // The bundled Swift engine needs its dedicated HF-layout pin.
-            // Keep the external provider's placeholder/default independent:
-            // user-typed external values remain ignored in managed mode, but
-            // an existing external endpoint still sees its historical model.
-            return SpeechModelCatalog.defaultOption.repoID
-        }
-        let normalized = Self.normalizedModelName(from: modelName(for: provider))
-        return normalized.isEmpty ? provider.defaultModelName : normalized
-    }
-
-    func endpointURL(for provider: RealtimeProvider) -> String {
-        realtimeAPIEndpointURL
-    }
-
-    var resolvedWebSocketURL: URL? {
-        resolvedWebSocketURL(for: realtimeProvider)
-    }
-
-    func resolvedWebSocketURL(for provider: RealtimeProvider) -> URL? {
-        if dictationBackendMode == .managedLocal {
-            return URL(string: ManagedBackendEndpoints.realtimeURLString)
-        }
-        let trimmed = endpointURL(for: provider).trimmed
-        guard !trimmed.isEmpty else { return nil }
-
-        if trimmed.hasPrefix("ws://") || trimmed.hasPrefix("wss://") {
-            return URL(string: trimmed)
-        }
-
-        if trimmed.hasPrefix("http://") {
-            return URL(string: "ws://" + trimmed.dropFirst("http://".count))
-        }
-
-        if trimmed.hasPrefix("https://") {
-            return URL(string: "wss://" + trimmed.dropFirst("https://".count))
-        }
-
-        return URL(string: "ws://\(trimmed)")
-    }
-
-    private static func normalizedModelName(from raw: String) -> String {
-        let trimmed = raw.trimmed
-        guard !trimmed.isEmpty else { return "" }
-
-        let lines =
-            trimmed
-            .split(whereSeparator: \.isNewline)
-            .map { String($0).trimmed }
-            .filter { !$0.isEmpty }
-
-        guard let candidate = lines.last else {
-            return trimmed
-        }
-
-        if candidate.contains(" ") {
-            let tokens = candidate.split(whereSeparator: \.isWhitespace).map(String.init)
-            if let token = tokens.last {
-                return token
-            }
-        }
-
-        return candidate
-    }
-
-    var llmPolishingConfiguration: LLMPolishingConfiguration? {
-        guard llmPolishingEnabled else { return nil }
-        if polishingBackendMode == .managedLocal {
-            guard let url = URL(string: ManagedBackendEndpoints.polishingURLString)
-            else { return nil }
-            let model = resolvedManagedLLMPolishingModel
-            let option = PolishModelCatalog.option(forRepoID: model)
-            return LLMPolishingConfiguration(
-                endpointURL: url,
-                apiKey: "",
-                model: model,
-                samplingDefaults: option?.samplingDefaults,
-                chatTemplateArguments: option?.chatTemplateArguments
-            )
-        }
-        let trimmedEndpoint = llmPolishingEndpointURL.trimmed
-        guard !trimmedEndpoint.isEmpty, let url = URL(string: trimmedEndpoint) else { return nil }
-        guard
-            let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
-            let scheme = components.scheme?.lowercased(),
-            (scheme == "http" || scheme == "https"),
-            components.host != nil
-        else {
-            return nil
-        }
-        return LLMPolishingConfiguration(
-            endpointURL: url,
-            apiKey: llmPolishingAPIKey.trimmed,
-            model: llmPolishingModel.trimmed.isEmpty
-                ? Self.defaultLLMPolishingModel
-                : llmPolishingModel.trimmed
-        )
-    }
-
-    /// The managed picker's stored selection, hardened against an empty env
-    /// override. External mode's `llmPolishingModel` is a server-side model
-    /// NAME; this is an HF repo the helper must download — separate keys so a
-    /// leftover external value can never leak into a managed launch.
-    var resolvedManagedLLMPolishingModel: String {
-        let model = managedLLMPolishingModel.trimmed
-        return model.isEmpty ? Self.defaultLLMPolishingModel : model
     }
 }

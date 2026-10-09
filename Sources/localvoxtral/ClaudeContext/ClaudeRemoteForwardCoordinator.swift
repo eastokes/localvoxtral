@@ -47,6 +47,7 @@ public final class ClaudeRemoteForwardCoordinator {
     @ObservationIgnored private let remoteForwardPort: UInt16
     @ObservationIgnored private let listenerPort: UInt16
     @ObservationIgnored private let makeSupervisor: MakeSupervisor
+    @ObservationIgnored private let reconcileHerdrEnrollment: @MainActor (Set<String>) -> Void
     @ObservationIgnored private var supervisors: [String: any ClaudeRemoteForwarding] = [:]
 
     /// Whether the launch-time orphan reap has run yet. Forwards may not start
@@ -63,14 +64,19 @@ public final class ClaudeRemoteForwardCoordinator {
         listenerPort: UInt16 = ClaudeRemoteListenerLimits.default.port,
         isListenerBound: @escaping @MainActor () -> Bool,
         makeSupervisor: MakeSupervisor? = nil,
+        // Handed to every supervisor this coordinator builds itself. Nil keeps
+        // the fail-closed behaviour: a refused bind stays `portUnavailable`.
+        ownershipProbe: ClaudeRemoteForwardOwnershipProbe? = nil,
         pidLedger: ClaudeRemoteForwardPidLedger? = nil,
-        reapOrphans: (@Sendable () async -> Void)? = nil
+        reapOrphans: (@Sendable () async -> Void)? = nil,
+        reconcileHerdrEnrollment: @escaping @MainActor (Set<String>) -> Void = { _ in }
     ) {
         self.hosts = hosts
         self.remoteForwardPort = remoteForwardPort
         self.listenerPort = listenerPort
         self.isListenerBound = isListenerBound
         self.reapOrphans = reapOrphans
+        self.reconcileHerdrEnrollment = reconcileHerdrEnrollment
         // No reaper means nothing to wait for — the seam's absence must not
         // stall every forward forever.
         self.orphanReap = reapOrphans == nil ? .done : .pending
@@ -84,14 +90,16 @@ public final class ClaudeRemoteForwardCoordinator {
                     // record is what lets the next launch find and kill the
                     // orphan instead of reporting "Port held" at it.
                     if let pidLedger,
-                       let record = ClaudeRemoteForwardProcessIdentity.snapshot(
+                       var record = ClaudeRemoteForwardProcessIdentity.snapshot(
                            pid: process.processIdentifier
                        )
                     {
+                        record.owner = .current
                         pidLedger.remember(hostID: config.hostID, record: record)
                     }
                     return process
-                }
+                },
+                ownershipProbe: ownershipProbe
             )
         }
     }
@@ -103,9 +111,8 @@ public final class ClaudeRemoteForwardCoordinator {
     /// guessable — the label is a different field and can name a different
     /// machine (PR #197) — so it cannot be forwarded, only re-enrolled.
     private func eligibleHosts() -> [ClaudeRemoteHost] {
-        hosts.hosts().filter { host in
+        hosts.activeHostsIfReadable().filter { host in
             host.persistentForwardEnabled
-                && !host.isRevoked
                 && host.sshHostAlias.map(ClaudeRemoteEnrollmentService.isValidHostAlias) == true
         }
     }
@@ -114,6 +121,7 @@ public final class ClaudeRemoteForwardCoordinator {
     /// twice starts nothing twice, which is what lets every mutation path call
     /// it unconditionally.
     public func reconcile() {
+        reconcileHerdrEnrollment(activeHostIDs())
         guard isListenerBound() else {
             if !supervisors.isEmpty {
                 Log.claudeContext.info(
@@ -121,35 +129,17 @@ public final class ClaudeRemoteForwardCoordinator {
                 )
                 stopAll()
             }
+            // The reap still runs: herdr `-L` forwards need no listener but
+            // wait on it, so a copy that lost the port would otherwise spend
+            // every remote herdr join's readiness budget at that gate (#1368).
+            // Another copy's forwards are protected by the reaper's owner
+            // check (#892), not by the listener.
+            _ = orphanReapFinished()
             return
         }
 
-        // Orphans from a previous run die BEFORE the first forward dials. The
-        // gate sits after the listener check on purpose: only the instance
-        // holding the listener port gets here, so a second app instance can
-        // never reap the first one's healthy tunnels.
-        switch orphanReap {
-        case .running:
-            return
-        case .pending:
-            guard let reapOrphans else {
-                orphanReap = .done
-                break
-            }
-            orphanReap = .running
-            Log.claudeContext.info(
-                "Claude remote forwards waiting for the orphan reap before first start"
-            )
-            Task { @MainActor [weak self] in
-                await reapOrphans()
-                guard let self else { return }
-                self.orphanReap = .done
-                self.reconcile()
-            }
-            return
-        case .done:
-            break
-        }
+        // Orphans from a previous run die BEFORE the first forward dials.
+        guard orphanReapFinished() else { return }
 
         let eligible = eligibleHosts()
         let wanted = Set(eligible.map(\.id))
@@ -197,6 +187,33 @@ public final class ClaudeRemoteForwardCoordinator {
         }
     }
 
+    /// Starts the launch orphan reap if it has not run, and says whether it
+    /// has finished. A finished reap calls `reconcile()` again.
+    private func orphanReapFinished() -> Bool {
+        switch orphanReap {
+        case .done:
+            return true
+        case .running:
+            return false
+        case .pending:
+            guard let reapOrphans else {
+                orphanReap = .done
+                return true
+            }
+            orphanReap = .running
+            Log.claudeContext.info(
+                "Claude remote forwards waiting for the orphan reap before first start"
+            )
+            Task { @MainActor [weak self] in
+                await reapOrphans()
+                guard let self else { return }
+                self.orphanReap = .done
+                self.reconcile()
+            }
+            return false
+        }
+    }
+
     /// The user's move after freeing a held port. Only a failed forward can be
     /// retried — there is nothing to retry about a healthy one.
     public func retry(hostID: String) {
@@ -204,8 +221,37 @@ public final class ClaudeRemoteForwardCoordinator {
         setState(supervisors[hostID]?.state, hostID: hostID)
     }
 
+    /// Why `recover` was called. Logged, and nothing else.
+    public enum RecoveryTrigger: String, Sendable {
+        case wake
+        case networkChange = "network change"
+    }
+
+    /// The Mac woke or its network path changed: every failed or parked
+    /// forward starts over (#659). Nothing else ever restarted a forward that
+    /// had given up, so one wake with no network yet stopped it for good.
+    public func recover(after trigger: RecoveryTrigger) {
+        guard !supervisors.isEmpty else { return }
+        Log.claudeContext.info(
+            "Claude remote forwards recovering after \(trigger.rawValue, privacy: .public)"
+        )
+        for (hostID, supervisor) in supervisors {
+            supervisor.recover()
+            setState(supervisor.state, hostID: hostID)
+        }
+    }
+
     public func stopAll() {
+        // On the revoke-last-host path the Settings model calls stopAll before
+        // the listener closes. Reconcile the independent `-L` entries here too;
+        // on app quit the registry is still active, so this does not mislabel a
+        // quit as revocation (AppDelegate stops them explicitly with that reason).
+        reconcileHerdrEnrollment(activeHostIDs())
         for hostID in Array(supervisors.keys) { stop(hostID: hostID) }
+    }
+
+    private func activeHostIDs() -> Set<String> {
+        Set(hosts.activeHostsIfReadable().map(\.id))
     }
 
     /// Every teardown still draining, for a caller that must not return until

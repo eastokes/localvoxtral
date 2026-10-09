@@ -1,0 +1,88 @@
+import SwiftUI
+
+/// The local agents-panel row offer for federated herdr clients.
+///
+/// A 0.9 client renders its agents panel from this Mac's herdr config, not
+/// from an enrolled host's config. This row appears only when the live
+/// machine catalog has an enabled machine, stays inside the herdr pane's Saved
+/// machines group, and never renders generated TOML: consent names the file
+/// in one sentence, with Details pointing at the docs. Set up… shows only
+/// where it would write: a config that already has the row gets a status
+/// line; agents rows the user wrote, or a config that cannot be read, get a
+/// status line and Details for the manual placement.
+struct ClaudeHerdrLocalPanelSettingsRow: View {
+    @Bindable var model: ClaudeIntegrationSettingsModel
+    @State private var isShowingSetup = false
+
+    private static let documentationURL = DocsLink.page("docs/remote-claude-context/#federated-herdr-machines")
+
+    var body: some View {
+        if model.hasEnabledHerdrMachine {
+            SettingsFieldRow(
+                title: "Mic indicator in herdr panel",
+                status: model.localHerdrPanelSentence,
+                statusAccessibilityIdentifier: "integrations.claude.localHerdrPanel.status"
+            ) {
+                if model.offersLocalHerdrPanelSetup {
+                    Button("Set up…") {
+                        model.requestLocalHerdrPanelConfiguration()
+                        isShowingSetup = model.enrollmentConfirmation?.action == .configureLocalHerdrPanel
+                    }
+                    .controlSize(.small)
+                    .disabled(model.isEnrollmentBusy)
+                    .accessibilityIdentifier("integrations.claude.localHerdrPanel.setUp")
+                } else if model.localHerdrPanelStatus != .added {
+                    Link("Details", destination: Self.documentationURL)
+                        .font(.caption)
+                }
+            }
+            .sheet(isPresented: $isShowingSetup) {
+                ClaudeLocalHerdrPanelSetupSheet(model: model) { isShowingSetup = false }
+                    .opensWithNothingFocused()
+            }
+        }
+    }
+}
+
+/// Consent for the local herdr config edit.
+private struct ClaudeLocalHerdrPanelSetupSheet: View {
+    @Bindable var model: ClaudeIntegrationSettingsModel
+    var dismiss: () -> Void
+
+    private static let documentationURL = DocsLink.page("docs/remote-claude-context/#federated-herdr-machines")
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("herdr panel row")
+                .font(.headline)
+                .accessibilityIdentifier("integrations.claude.localHerdrPanelSheet.title")
+            if let confirmation = model.enrollmentConfirmation,
+               confirmation.action == .configureLocalHerdrPanel {
+                Text(confirmation.title)
+                    .font(.callout)
+                    .fixedSize(horizontal: false, vertical: true)
+                Link("Details", destination: Self.documentationURL)
+
+                HStack {
+                    Spacer()
+                    Button("Cancel") {
+                        model.cancelEnrollmentActionConfirmation()
+                        dismiss()
+                    }
+                    .accessibilityIdentifier("integrations.claude.localHerdrPanelSheet.cancel")
+                    Button(confirmation.confirmButtonTitle) {
+                        Task {
+                            await model.confirmEnrollmentAction()
+                            dismiss()
+                        }
+                    }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(model.isEnrollmentBusy)
+                    .accessibilityIdentifier("integrations.claude.localHerdrPanelSheet.apply")
+                }
+            }
+        }
+        .padding(16)
+        .frame(width: 460)
+    }
+}

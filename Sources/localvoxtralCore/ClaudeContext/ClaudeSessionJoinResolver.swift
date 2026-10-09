@@ -1,0 +1,732 @@
+import ClaudeContextWire
+#if canImport(CoreGraphics)
+#if canImport(CoreGraphics)
+import CoreGraphics
+#endif
+#endif
+import Foundation
+
+/// One dictation's join, and the one fact about a non-join the overlay badge
+/// needs from the same resolution.
+package struct ClaudeJoinResolution: Sendable, Equatable {
+    package var join: ClaudeSessionJoin?
+    /// The focused surface itself named a Claude Code session and nothing
+    /// joined it: Claude Desktop focus inside a session's web view whose id
+    /// the registry did not resolve to one live session. Never true with a
+    /// join, and never set by an arm that cannot tell a session view from
+    /// anything else on screen.
+    package var focusedSessionUnmatched: Bool
+    /// Claude Desktop focus is in a Claude project's page
+    /// (`ClaudeProjectPageURL`), which names no session: nothing joins, but
+    /// the dictation goes to coding agents. Never true with a join.
+    package var focusedClaudeProject: Bool
+
+    package init(join: ClaudeSessionJoin?, focusedSessionUnmatched: Bool = false, focusedClaudeProject: Bool = false) {
+        self.join = join
+        self.focusedSessionUnmatched = focusedSessionUnmatched
+        self.focusedClaudeProject = focusedClaudeProject
+    }
+}
+
+/// Resolves the focused pane to a live Claude session, and authorizes raw
+/// screen attachment only when that join is unambiguous.
+///
+/// This is the positive gate `TerminalScreenRawAttachmentPolicy` was written to
+/// wait for. Every arm below is the same shape, and the shape is what makes it
+/// a gate rather than a guess:
+///
+/// 1. A session was authenticated by its TRANSPORT — peer credentials for a
+///    local one (`ClaudeTransportOrigin`), an enrolled host's token for a
+///    remote one — so a candidate existing at all means someone we trust
+///    reported it.
+/// 2. That session's own hooks published a HANDLE to where it lives: a
+///    controlling TTY, a herdr pane id, a cmux surface id, a Remote Control
+///    bridge session id.
+/// 3. We read the SAME KIND of handle off the surface the user is actually
+///    looking at, from the PID we captured — never system-wide focus.
+/// 4. The two are compared for exact equality, and the registry still resolves
+///    the match to ONE live session.
+///
+/// Every link abstains rather than guesses, because the failure modes are not
+/// symmetric: a wrong `true` renders an unrelated terminal's scrollback into
+/// someone's prompt, while a wrong `false` costs only an excerpt whose terms the
+/// vocabulary matcher already extracted. So a surface that publishes no handle
+/// we can read (a plain shell, an editor, a terminal the user opened
+/// themselves) joins nothing, and so does `unknown`, `stale` (past TTL, or the
+/// agent process is gone) or `ambiguous` (more than one live session matches).
+///
+/// Note what is NOT here: any inference from the cwd, the window title, or
+/// "there is only one live session so it must be that one". No window title is
+/// read for a join at all — it is a fought-over channel that every party in the
+/// stack rewrites. A sole-session heuristic is wrong precisely when it matters
+/// — the user has one Claude session open and is dictating into an unrelated
+/// shell — and it would attach that session's repo to a prompt that has nothing
+/// to do with it.
+@MainActor
+package struct ClaudeSessionJoinResolver {
+    package let registry: ClaudeSessionRegistry
+    private let focusedTerminalTTY: (String) async -> String?
+    package let focusedBrowserTabURL: (String) async -> String?
+    package let focusedDesktopSessionURL: (pid_t) async -> String?
+    package let focusedWindowID: (pid_t) -> CGWindowID?
+    private let herdrClientProbe: @Sendable (String) -> Bool
+    package let herdrFederation: @Sendable () -> HerdrMachineFederation
+    package let herdrClientSurfaceCount: @Sendable () -> Int?
+    package let herdrPanes: HerdrPaneQuerying?
+    package let herdrPaneWriter: (any HerdrPaneWriting)?
+    package let cmuxSurfaces: CmuxSurfaceQuerying?
+    package let cmuxJoinEnabled: @MainActor () -> Bool
+    package let reportCmuxStatus: @MainActor (CmuxSocketStatus) -> Void
+    package let ttyForegroundPIDs: @Sendable (String) -> [Int32]?
+    private let sshDestinationProbe: @Sendable (String) -> SSHDestinationTTYProbeResult
+    package let enrolledHosts: @MainActor (String) -> [ClaudeRemoteHost]
+    package let canonicalizedEnrolledHosts: @MainActor (String) async -> [ClaudeRemoteHost]
+    package let proxyJumpShape: @MainActor (String) async -> SSHProxyJumpShape?
+    /// Every host in the store, revoked ones included. The panel arm's
+    /// speculation and the herdr pane route's enrollment check filter it.
+    package let speculativeHosts: @MainActor () -> [ClaudeRemoteHost]
+    package let remoteHerdrForwards: (any ClaudeRemoteHerdrForwarding)?
+    package let herdrPanelMetadata: (any HerdrPanelMetadataReporting)?
+    package let readFocusedGrid: HerdrPanelBindingProbe.GridRead
+    package let panelNow: HerdrPanelBindingProbe.Now
+    package let panelSleepFor: HerdrPanelBindingProbe.SleepFor
+    package let panelRandomBits: HerdrPanelBindingProbe.RandomBits
+    package let indicatorSleepFor: HerdrPanelMicIndicator.SleepFor
+
+    /// - Parameters:
+    ///   - focusedTerminalTTY: reads the focused pane's controlling TTY for a
+    ///     bundle id over AppleScript (Ghostty ≥ 1.4's focused terminal,
+    ///     iTerm2's current session, Terminal.app's selected tab). Unlike the
+    ///     AX seam this
+    ///     DEFAULTS TO ABSTAIN, not to the live reader: an Apple event is not
+    ///     an AX read — the first one triggers the Automation consent prompt,
+    ///     and a defaulted live reader would send real events (and hang the
+    ///     suite on that prompt) from any test that forgets to inject. The app
+    ///     wires `AppleScriptTerminalTTYReader` explicitly.
+    ///   - focusedBrowserTabURL: reads the focused window's active-tab URL for
+    ///     an allowlisted browser over AppleScript. DEFAULTS TO ABSTAIN for the
+    ///     same reason `focusedTerminalTTY` does — it sends a real Apple event
+    ///     and can raise the Automation consent sheet — and additionally
+    ///     because a browser tab URL is user CONTENT: no test may reach the
+    ///     live reader by forgetting an injection. The app wires
+    ///     `AppleScriptFocusedBrowserTabURLReader` explicitly.
+    ///   - focusedDesktopSessionURL: reads the address of the Claude Desktop
+    ///     web view holding keyboard focus, for that app's pid. DEFAULTS TO
+    ///     ABSTAIN: it is an Accessibility read of another process and flips
+    ///     Electron's accessibility tree on, so no test may reach the live
+    ///     reader by forgetting an injection. The app wires
+    ///     `AXClaudeDesktopSessionURLReader` explicitly.
+    ///   - focusedWindowID: the join's window identity, from its own
+    ///     PID-pinned AX read. It exists to pair a screen capture with the
+    ///     join that authorized it; nil means unknown, which the authorizer
+    ///     refuses rather than treats as a match (review F2). It defaults to
+    ///     unknown; the app wires `TerminalScreenAXReader` explicitly.
+    ///   - herdrClientProbe: reads the local process table to bind the focused
+    ///     Ghostty surface to a herdr client. It DEFAULTS TO ABSTAIN: a test
+    ///     that forgets to inject must never consult the live process table.
+    ///     The app wires the live probe explicitly.
+    ///   - herdrFederation: reads herdr's saved-machine state, which decides
+    ///     whether the local socket's focused pane still describes what the
+    ///     surface displays (issue #286). It defaults to `.notFederated`, the
+    ///     state of every herdr before 0.9 and of every 0.9 user who saved no
+    ///     machine, so a test that does not care about federation keeps the
+    ///     pre-0.9 arm. The two abstaining values are what a test injects.
+    ///   - herdrClientSurfaceCount: how many surfaces this user has a herdr
+    ///     client on, consulted only once machines are saved. DEFAULTS TO
+    ///     ABSTAIN (nil, unknown) so a federated case cannot silently pass by
+    ///     reaching the live process table.
+    ///   - herdrPanes: queries herdr's local JSON socket after that surface
+    ///     binding succeeds. It likewise DEFAULTS TO ABSTAIN so a test that
+    ///     forgets to inject cannot connect to a real user socket. The app is
+    ///     the only place that installs the live client.
+    ///   - herdrPaneWriter: writes dictation into the joined herdr pane
+    ///     (#726). DEFAULTS TO ABSTAIN (nil) for the same reason: no test may
+    ///     type into a real user's pane.
+    ///   - cmuxSurfaces: queries cmux's control socket for the focused surface
+    ///     and its text. DEFAULTS TO ABSTAIN (nil) for the same reason as
+    ///     `herdrPanes`: no test may dial a real user's socket.
+    ///   - cmuxJoinEnabled: the user's cmux opt-in, read live so turning the
+    ///     toggle off stops the next dictation from dialing. DEFAULTS TO
+    ///     ABSTAIN — a second, independent reason a forgetful test cannot reach
+    ///     that socket.
+    ///   - reportCmuxStatus: one short sentence for the Settings row when the
+    ///     socket refuses us (details go to the log, never the popover).
+    ///   - ttyForegroundPIDs: the pids in a tty's foreground process group,
+    ///     from the local process table. The cmux route asks it before every
+    ///     write: a suspended agent is alive and registered, but its shell
+    ///     owns the terminal. DEFAULTS TO ABSTAIN (nil), which refuses every
+    ///     local cmux write; the app wires the live table.
+    ///   - sshDestinationProbe: reads the local process table for an ssh client
+    ///     on the focused surface's TTY and reports where it is going. Defaults
+    ///     to `.undeterminable`, which disables the remote herdr arm entirely
+    ///     — an un-injected resolver behaves exactly as it did before that arm
+    ///     existed.
+    ///   - enrolledHosts: the enrolled remote hosts whose ssh alias IS that
+    ///     destination. Defaults to none, for the same reason: no enrollment
+    ///     lookup, no remote arm. Passed as a closure rather than the registry
+    ///     because the host list is built later in launch than this resolver.
+    ///   - canonicalizedEnrolledHosts: the `ssh -G` fallback, consulted only
+    ///     when exact alias matching found nothing. Defaults to none so a test
+    ///     that forgets to inject never spawns a process.
+    ///   - remoteHerdrForwards: opens the app-managed `ssh -L`. Nil means the
+    ///     arm can never spawn anything, which is what a test that forgets to
+    ///     inject must get.
+    package init(
+        registry: ClaudeSessionRegistry,
+        focusedTerminalTTY: @escaping (String) async -> String? = { _ in nil },
+        focusedBrowserTabURL: @escaping (String) async -> String? = { _ in nil },
+        focusedDesktopSessionURL: @escaping (pid_t) async -> String? = { _ in nil },
+        focusedWindowID: @escaping (pid_t) -> CGWindowID? = { _ in nil },
+        herdrClientProbe: @escaping @Sendable (String) -> Bool = { _ in false },
+        herdrFederation: @escaping @Sendable () -> HerdrMachineFederation = { .notFederated },
+        herdrClientSurfaceCount: @escaping @Sendable () -> Int? = { nil },
+        herdrPanes: HerdrPaneQuerying? = nil,
+        herdrPaneWriter: (any HerdrPaneWriting)? = nil,
+        cmuxSurfaces: CmuxSurfaceQuerying? = nil,
+        cmuxJoinEnabled: @escaping @MainActor () -> Bool = { false },
+        reportCmuxStatus: @escaping @MainActor (CmuxSocketStatus) -> Void = { _ in },
+        ttyForegroundPIDs: @escaping @Sendable (String) -> [Int32]? = { _ in nil },
+        sshDestinationProbe: @escaping @Sendable (String) -> SSHDestinationTTYProbeResult = { _ in
+            .undeterminable(.probeUnavailable)
+        },
+        enrolledHosts: @escaping @MainActor (String) -> [ClaudeRemoteHost] = { _ in [] },
+        canonicalizedEnrolledHosts: @escaping @MainActor (String) async -> [ClaudeRemoteHost] = {
+            _ in []
+        },
+        proxyJumpShape: @escaping @MainActor (String) async -> SSHProxyJumpShape? = { _ in nil },
+        speculativeHosts: @escaping @MainActor () -> [ClaudeRemoteHost] = { [] },
+        remoteHerdrForwards: (any ClaudeRemoteHerdrForwarding)? = nil,
+        herdrPanelMetadata: (any HerdrPanelMetadataReporting)? = nil,
+        readFocusedGrid: @escaping HerdrPanelBindingProbe.GridRead = { _ in nil },
+        panelNow: @escaping HerdrPanelBindingProbe.Now = Date.init,
+        panelSleepFor: @escaping HerdrPanelBindingProbe.SleepFor = { seconds in
+            try? await Task.sleep(for: .seconds(seconds))
+        },
+        panelRandomBits: @escaping HerdrPanelBindingProbe.RandomBits = {
+            var generator = SystemRandomNumberGenerator()
+            return generator.next()
+        },
+        indicatorSleepFor: @escaping HerdrPanelMicIndicator.SleepFor = { seconds in
+            try? await Task.sleep(for: .seconds(seconds))
+        }
+    ) {
+        self.registry = registry
+        self.focusedTerminalTTY = focusedTerminalTTY
+        self.focusedBrowserTabURL = focusedBrowserTabURL
+        self.focusedDesktopSessionURL = focusedDesktopSessionURL
+        self.focusedWindowID = focusedWindowID
+        self.herdrClientProbe = herdrClientProbe
+        self.herdrFederation = herdrFederation
+        self.herdrClientSurfaceCount = herdrClientSurfaceCount
+        self.herdrPanes = herdrPanes
+        self.herdrPaneWriter = herdrPaneWriter
+        self.cmuxSurfaces = cmuxSurfaces
+        self.cmuxJoinEnabled = cmuxJoinEnabled
+        self.reportCmuxStatus = reportCmuxStatus
+        self.ttyForegroundPIDs = ttyForegroundPIDs
+        self.sshDestinationProbe = sshDestinationProbe
+        self.enrolledHosts = enrolledHosts
+        self.canonicalizedEnrolledHosts = canonicalizedEnrolledHosts
+        self.proxyJumpShape = proxyJumpShape
+        self.speculativeHosts = speculativeHosts
+        self.remoteHerdrForwards = remoteHerdrForwards
+        self.herdrPanelMetadata = herdrPanelMetadata
+        self.readFocusedGrid = readFocusedGrid
+        self.panelNow = panelNow
+        self.panelSleepFor = panelSleepFor
+        self.panelRandomBits = panelRandomBits
+        self.indicatorSleepFor = indicatorSleepFor
+    }
+
+    /// The join for `target`, or nil on any abstention.
+    ///
+    /// TTY first, then — on that same surface TTY — herdr when a herdr client
+    /// holds it, and otherwise the remote-herdr arm. The TTY arm compares the
+    /// focused pane's device against what the hook publisher reported from
+    /// inside the session; the process table cannot be clobbered by whoever
+    /// wrote the window title last, which is exactly why it, and not a title,
+    /// is the primary evidence. A TTY non-answer does not fall through to some
+    /// weaker reading of the same surface — there is no such reading — so the
+    /// arms below it are the ones that ask a DIFFERENT question (an inner
+    /// herdr pane, a cmux surface, a browser tab), and when none of them
+    /// answers, the dictation gets no join.
+    ///
+    /// LOCAL sessions only, for every terminal arm: a remote session's TTY,
+    /// pane id, or surface id names something on another machine, and
+    /// `resolve(tty:)` refuses remote candidates outright so an SSH host can
+    /// never claim a local pane by echoing its device. A remote session joins
+    /// only through an arm that proves the remote binding itself — the
+    /// remote-herdr pane arm, `cmux ssh`'s round-tripped surface id, or the
+    /// bridge-allocated Remote Control session id.
+    ///
+    /// Whether the registry currently holds ANY live session.
+    ///
+    /// Not a join and not a step toward one: the overlay's join badge asks it
+    /// to tell "nothing attached" apart from "there was nothing to attach", so
+    /// a Mac that simply is not running Claude Code shows no badge instead of a
+    /// permanent complaint. It reads no title, no TTY, no socket and no
+    /// process table — it cannot influence, or be influenced by, what `resolve`
+    /// decides.
+    package func hasLiveSessions() -> Bool {
+        registry.hasLiveSessions()
+    }
+
+    /// This remains the only place a join is resolved, once per dictation, at
+    /// start — whichever mechanism answers.
+    package func resolve(target: TerminalScreenTarget) async -> ClaudeSessionJoin? {
+        await resolution(target: target).join
+    }
+
+    /// `resolve(target:)`, plus whether the surface named a Claude Code session
+    /// that did not join. The overlay badge reads that from here, from the one
+    /// resolution, rather than asking the surface a second time.
+    package func resolution(target: TerminalScreenTarget) async -> ClaudeJoinResolution {
+        // Claude Desktop is the third kind of target: one address, read over
+        // Accessibility, no screen. Its allowlist is disjoint from the other
+        // two (pinned by a test).
+        if ClaudeDesktopAllowlist.isSupported(target.bundleID) {
+            return await resolveViaDesktopSession(target: target)
+        }
+        return ClaudeJoinResolution(join: await resolveSurface(target: target))
+    }
+
+    /// The prompt relay of the opencode pane focused now (#719), or nil.
+    ///
+    /// The writing counterpart of `resolution(target:)`, asked only when that
+    /// resolution did not run (its gates are about reading context, and
+    /// writing needs none of them) or did not join. It asks the local
+    /// questions only: the focused pane's TTY, then, when that TTY is a local
+    /// herdr client's, that herdr's focused pane (#733). Never the remote or
+    /// federated herdr, ssh or cmux arms: those open sockets and tunnels on
+    /// the strength of a context consent this path does not have. A pane
+    /// that resolves to a session through anything but a fresh opencode
+    /// focus declaration carrying a relay gets nil, and the dictation types
+    /// as before.
+    package func opencodePromptRelay(target: TerminalScreenTarget) async -> OpencodePromptRelay? {
+        guard TerminalScreenAllowlist.isSupported(target.bundleID),
+              let tty = await focusedTerminalTTY(target.bundleID)
+        else { return nil }
+        let snapshot: ClaudeSessionSnapshot
+        if case .resolved(let resolved) = registry.resolve(tty: tty) {
+            snapshot = resolved
+        } else if let found = await focusedLocalHerdrPane(surfaceTTY: tty, purpose: "opencode prompt relay") {
+            snapshot = found.snapshot
+        } else {
+            return nil
+        }
+        guard snapshot.agent == .opencode else { return nil }
+        return registry.opencodePromptRelay(sessionID: snapshot.sessionID)
+    }
+
+    /// The id of the live session `target`'s focused pane shows, or nil (#717:
+    /// a finished turn cues only when the user was not looking at it). The
+    /// relay's local questions (the focused TTY, then a local herdr's focused
+    /// pane) plus Claude Desktop's focused session view. Never the remote,
+    /// federated, ssh or cmux arms: this runs on every turn's end, with no
+    /// dictation to justify a forward or a socket. A nil makes the cue fire,
+    /// so an answer this cannot give costs a cue, never a missed one.
+    /// Whether keys typed into `target` now would reach `sessionID`'s prompt,
+    /// for a mod's keyboard fallback. A remote session has no tty on this Mac
+    /// to look up (#1412): the join `target` resolves to now must name it,
+    /// and what the join read must still be on screen after its last await.
+    package func shows(_ sessionID: String, target: TerminalScreenTarget) async -> Bool {
+        guard ClaudeRemoteSessionScope.hostID(fromScopedSessionID: sessionID) != nil else {
+            return await sessionShown(target: target) == sessionID
+        }
+        guard let join = await resolve(target: target), join.snapshot.sessionID == sessionID,
+              await stillShows(join, terminal: target)
+        else { return false }
+        return true
+    }
+
+    /// Whether `join` still describes the focused surface. The remote arms
+    /// await forwards, sockets and process queries after reading the focus,
+    /// and the fallback types on their answer: a tab, machine or pane switch
+    /// in between must count (Codex review of #1780, 2026-10-04). As for a
+    /// local herdr pane (#1498), the pane is read last: a pane switch keeps
+    /// the tty, so no slower read may follow it.
+    private func stillShows(_ join: ClaudeSessionJoin, terminal: TerminalScreenTarget) async -> Bool {
+        let shown: Bool
+        switch join.mechanism {
+        case .remoteHerdrPane, .federatedHerdrPane:
+            guard let surface = join.herdrSurface, let binding = join.herdrPane, let herdrPanes else { return false }
+            guard await displaysJoinedSurface(surface, terminal: terminal) else { return false }
+            shown = await herdrPanes.focusedPane(socketPath: binding.socketPath)?.paneID == binding.paneID
+        case .cmuxSurface:
+            guard let binding = join.cmuxSurface, let cmuxSurfaces,
+                  case .value(let focused) = await cmuxSurfaces.focusedSurface(expectedPeerPID: terminal.pid)
+            else { return false }
+            shown = focused.surfaceID == binding.surfaceID
+        case .remoteLocalTTY:
+            // The binding is the tty the session reported: the focused one,
+            // read last.
+            guard let bound = join.snapshot.remoteSessionEnvironment?.localTTY else { return false }
+            shown = await focusedTerminalTTY(terminal.bundleID) == bound
+        case .remoteSSHConnection:
+            // The binding is the connection the session reported: the
+            // focused tty's ssh must still hold it, and the tty is read
+            // again last.
+            guard let tty = await focusedTerminalTTY(terminal.bundleID),
+                  let value = join.snapshot.remoteSessionEnvironment?.sshConnection,
+                  let report = ClaudeRemoteSSHConnectionReport.parse(value),
+                  case .connection(let connection) = sshDestinationProbe(tty),
+                  let sockets = connection.sockets,
+                  sockets.filter({ Self.socket($0, matches: report) }).count == 1
+            else { return false }
+            shown = await focusedTerminalTTY(terminal.bundleID) == tty
+        default:
+            shown = false
+        }
+        if !shown {
+            Log.claudeContext.info("Remote session check: the focus moved during the join; keys stay unsent")
+        }
+        return shown
+    }
+
+    package func sessionShown(target: TerminalScreenTarget) async -> String? {
+        if ClaudeDesktopAllowlist.isSupported(target.bundleID) {
+            guard let address = await focusedDesktopSessionURL(target.pid),
+                  let desktopSessionID = ClaudeDesktopSessionURL.sessionID(inWebAreaURL: address),
+                  case .resolved(let snapshot) = registry.resolve(desktopSessionID: desktopSessionID)
+            else { return nil }
+            return snapshot.sessionID
+        }
+        guard TerminalScreenAllowlist.isSupported(target.bundleID),
+              let tty = await focusedTerminalTTY(target.bundleID)
+        else { return nil }
+        if case .resolved(let snapshot) = registry.resolve(tty: tty) {
+            return snapshot.sessionID
+        }
+        guard let found = await focusedLocalHerdrPane(surfaceTTY: tty, purpose: "needs-you pane check") else {
+            return nil
+        }
+        // The pane's foreground query awaited herdr: the user may have moved
+        // to another pane or tab since, and the mod's keyboard fallback
+        // types on this answer (#1498). Both are read again, the pane last:
+        // a pane switch keeps the tty, so no slower read may follow it.
+        guard await focusedTerminalTTY(target.bundleID) == tty,
+              await herdrPanes?.focusedPane(socketPath: found.socketPath)?.paneID == found.pane.paneID
+        else {
+            Log.claudeContext.info("needs-you pane check: the focus moved during the herdr lookup")
+            return nil
+        }
+        return found.snapshot.sessionID
+    }
+
+    /// The herdr pane route for the focused pane of a LOCAL herdr, found
+    /// without a context join (#759): for a dictation with polishing off,
+    /// which resolves no join. The same local question as the relay lookup,
+    /// and nothing is read from the pane. Asked only while some live local
+    /// session sits in a herdr pane, so a Mac without herdr sends no Apple
+    /// event for it.
+    package func localHerdrPromptRoute(
+        target: TerminalScreenTarget,
+        frontmostPID: @escaping @MainActor () -> pid_t?
+    ) async -> HerdrPanePromptRoute? {
+        guard TerminalScreenAllowlist.isSupported(target.bundleID),
+              herdrPaneWriter != nil,
+              !registry.liveLocalHerdrSocketPaths().isEmpty,
+              let tty = await focusedTerminalTTY(target.bundleID),
+              let found = await focusedLocalHerdrPane(surfaceTTY: tty, purpose: "herdr pane route")
+        else { return nil }
+        return herdrPromptRoute(
+            binding: ClaudeHerdrPaneBinding(paneID: found.pane.paneID, socketPath: found.socketPath),
+            snapshot: found.snapshot,
+            mechanism: .herdrPane,
+            terminal: target,
+            surface: HerdrJoinedSurface(tty: tty, machine: .herdrClient(found.selection)),
+            frontmostPID: frontmostPID
+        )
+    }
+
+    /// The session in the focused pane of a LOCAL herdr, for the write
+    /// routes that run without a context join (#733, #759): inside herdr
+    /// the focused TTY is herdr's client, not the pane. Asks only what the
+    /// local herdr arm asks (`focusedLocalHerdrPaneSession`), and only when
+    /// the surface binds to a herdr client showing this machine. Never the
+    /// federated or remote arms: they read another machine's herdr, over a
+    /// forward opened on a context consent writing does not have.
+    private func focusedLocalHerdrPane(
+        surfaceTTY tty: String, purpose: String
+    ) async -> (
+        pane: HerdrFocusedPane, snapshot: ClaudeSessionSnapshot, socketPath: String,
+        selection: HerdrMachineFederation
+    )? {
+        guard herdrClientProbe(tty) else { return nil }
+        let selection = herdrFederation()
+        switch selection {
+        case .notFederated:
+            break
+        case .showingLocal:
+            // One selection per user: with a second client on screen it
+            // cannot say which machine this surface shows.
+            guard herdrClientSurfaceCount() == 1 else { return nil }
+        case .showingMachine, .unreadable:
+            return nil
+        }
+        guard let found = await focusedLocalHerdrPaneSession(abstain: { outcome in
+            Log.claudeContext.info("\(purpose, privacy: .public): herdr pane not resolved (\(outcome, privacy: .public))")
+        }) else { return nil }
+        return (found.pane, found.snapshot, found.socketPath, selection)
+    }
+
+    /// Whether `terminal` still shows what the herdr join saw (#1105): the
+    /// same focused tty, and on it the same machine. A herdr client switched
+    /// to another saved machine keeps its tty, and the server it left keeps
+    /// a focused pane it no longer shows, so that pane's `pane.current`
+    /// alone cannot say where keys typed now would land. The machine is
+    /// read the way the arm read it: herdr's selection, alone on screen once
+    /// machines are saved, or the tty's ssh session as the process table
+    /// shows it.
+    func displaysJoinedSurface(
+        _ surface: HerdrJoinedSurface, terminal: TerminalScreenTarget
+    ) async -> Bool {
+        guard let tty = await focusedTerminalTTY(terminal.bundleID), tty == surface.tty else {
+            Log.backends.notice("herdr pane route: the terminal's focused tty changed since the join")
+            return false
+        }
+        let shown: Bool
+        switch surface.machine {
+        case .herdrClient(let selection):
+            shown = herdrClientProbe(tty)
+                && herdrFederation() == selection
+                && (selection == .notFederated || herdrClientSurfaceCount() == 1)
+        case .ssh(let connection):
+            shown = sshDestinationProbe(tty) == connection
+        }
+        if !shown {
+            Log.backends.notice("herdr pane route: the surface no longer shows the joined machine")
+        }
+        return shown
+    }
+
+    /// The focused pane's tty, read the way the tty arm reads it, so a
+    /// screen capture taken next to it names its pane (#1226). Nil for an
+    /// app off the terminal allowlist or an unreadable surface.
+    package func focusedPaneTTY(of target: TerminalScreenTarget) async -> String? {
+        guard TerminalScreenAllowlist.isSupported(target.bundleID) else { return nil }
+        return await focusedTerminalTTY(target.bundleID)
+    }
+
+    private func resolveSurface(target: TerminalScreenTarget) async -> ClaudeSessionJoin? {
+        // A browser is a different kind of target with a different capability:
+        // one short URL string, no screen, no pane. The two allowlists are
+        // disjoint (pinned by a test), so this branch and the terminal path
+        // below can never both apply to one app.
+        if BrowserTabAllowlist.isSupported(target.bundleID) {
+            return await resolveViaBrowserTab(target: target)
+        }
+        // The allowlist is re-checked here even though the capture gate already
+        // enforced it. This object is reachable independently of that gate, and
+        // "only a terminal with a verified focused-pane surface" (Ghostty's
+        // single-AXTextArea grid, iTerm2's current session, Terminal.app's
+        // selected tab) is a precondition of reading this app at all — not
+        // something to inherit on trust from a caller.
+        guard TerminalScreenAllowlist.isSupported(target.bundleID) else { return nil }
+
+        if let tty = await focusedTerminalTTY(target.bundleID) {
+            switch registry.resolve(tty: tty) {
+            case .resolved(let snapshot):
+                Log.claudeContext.info(
+                    "Terminal pane joined to a live Claude session via focused-pane tty"
+                )
+                // Without a window identity the authorizer cannot tell two
+                // windows of one Ghostty process apart and must refuse raw
+                // attachment (review F2). Read here, once, at join time.
+                return ClaudeSessionJoin(
+                    target: target,
+                    snapshot: snapshot,
+                    windowID: focusedWindowID(target.pid),
+                    mechanism: .ttyDevice,
+                    paneTTY: tty
+                )
+            case .unknown:
+                abstainedTTYJoin(outcome: "no live session on this device")
+            case .stale:
+                abstainedTTYJoin(outcome: "stale")
+            case .ambiguous:
+                abstainedTTYJoin(outcome: "ambiguous")
+            }
+
+            // A focused surface positively bound to herdr describes an inner
+            // pane, so only herdr can say which one: the arms below ask about
+            // the outer surface and would answer about the wrong thing.
+            if herdrClientProbe(tty) {
+                return await resolveViaHerdr(target: target, tty: tty)
+            }
+
+            // The surface is not a local herdr client. It may still be an ssh
+            // session into an enrolled host. ONE process-table scan answers for
+            // both remote arms below — it is the same question ("what ssh is in
+            // this tty's foreground, and where does it go"), and scanning twice
+            // could answer it differently for two arms of one dictation.
+            let sshResult = sshDestinationProbe(tty)
+
+            switch await resolveViaRemoteHerdr(target: target, sshResult: sshResult) {
+            case .joined(var join):
+                join.herdrSurface = HerdrJoinedSurface(tty: tty, machine: .ssh(sshResult))
+                return join
+            case .declined:
+                break
+            }
+
+            // The local-tty echo first of the two plain-ssh arms: it is the
+            // one that works through ProxyJump and ControlMaster, and it costs
+            // nothing when the user has not set it up (no header, no match, a
+            // named abstention).
+            if let join = await resolveViaRemoteLocalTTY(
+                target: target, tty: tty, sshResult: sshResult
+            ) {
+                return join
+            }
+
+            // Then the connection binding, for the zero-setup case. Last,
+            // because it is the weakest surface claim: the herdr arms prove
+            // what the terminal DISPLAYS (a nonce rendered in the grid, or an
+            // argv naming herdr as the remote command), while this one proves
+            // only which connection the terminal holds. A herdr-hosted session
+            // never gets here anyway — it carries a herdr label and both plain
+            // arms refuse those outright.
+            if let join = await resolveViaPlainSSHConnection(
+                target: target, sshResult: sshResult
+            ) {
+                return join
+            }
+        }
+
+        // cmux has no AppleScript TTY reader, so the block above never answers
+        // for it and this is where its surface arm runs.
+        if TerminalScreenAllowlist.isSocketCaptureSupported(target.bundleID),
+           let join = await resolveViaCmux(target: target) {
+            return join
+        }
+
+        // Nothing identified the surface. There is no weaker reading to fall
+        // back to, and that is the design: the alternative was a marker in the
+        // window title, which every party in the stack (Claude Code, herdr,
+        // cmux, the user) rewrites at will, so a lingering one could only
+        // describe a session other than the one on screen.
+        return nil
+    }
+
+    /// Outcome only, never the device path. A silent abstention here made a
+    /// broken hook-side tty capture indistinguishable from a failed pane read
+    /// in the field (2026-07-20): later arms may still answer, but the
+    /// non-answer must say which side of the join went missing.
+    private func abstainedTTYJoin(outcome: String) {
+        Log.claudeContext.info(
+            "Focused-pane tty matched no session (\(outcome, privacy: .public))"
+        )
+        Self.noteAbstention("tty: \(outcome)")
+    }
+
+    /// Where an abstention cause leaves this resolver as a value rather than as
+    /// a log line (`HerdrPanelBindingProbe` has the one other such point).
+    ///
+    /// Both consumers are diagnostics — the diagnostic record and
+    /// `--probe-surface` — and both need the SAME string, so they read it from
+    /// here rather than each deriving one. `cause` is already the content-free
+    /// category the log line above carries; nothing else may be passed in.
+    package static func noteAbstention(_ cause: String) {
+        ClaudeJoinAbstentionTap.note(cause)
+        ClaudeJoinAbstentionTap.noteForDiagnostics(cause)
+    }
+
+    /// Re-checks at commit that the join resolved at start still names one live
+    /// session, WITHOUT asking any surface a second question.
+    ///
+    /// The SESSION is fixed by the start resolution — that is the point of
+    /// resolving once. What can still change between start and stop is that
+    /// session: it can end, its process can die, or the registry can evict it.
+    /// Those make the join stale, and a stale join must not attach. So this
+    /// asks the registry about the SAME session id (`snapshot(sessionID:)`,
+    /// the same TTL-plus-pid-liveness answer every arm resolves through)
+    /// rather than re-reading a surface, which would let the answer drift to a
+    /// different pane.
+    /// A `.browserTab` join additionally re-checks its BINDING: the session
+    /// must still report the bridge session id the tab named at start.
+    ///
+    /// This is what makes a Remote Control disconnect age the join out without
+    /// a timer of ours. `CLAUDE_CODE_BRIDGE_SESSION_ID` is REMOVED from the
+    /// hook environment when the browser connection ends, and the reducer
+    /// replaces a session's reported metadata on the next non-focus record —
+    /// `process` for a local session, `remoteEnvironment` for a remote one — so
+    /// that record carries no bridge id and this check fails on the session's
+    /// own activity, with no clock of ours involved.
+    ///
+    /// Two exactness caveats, both deliberate and both pinned by tests:
+    /// * A record with NO process block (local) or NO allowlisted env header at
+    ///   all (remote) is not a retraction — the reducer keeps the last report
+    ///   (#216: "an empty report is not a retraction"). Such a session keeps its
+    ///   binding until TTL. The bundled shim always reports `$PPID`, so an
+    ///   honest disconnect never takes that path, and a host that strips its
+    ///   headers could just as well keep sending the id.
+    /// * A session that stops reporting entirely is covered by the registry's
+    ///   existing freshness (TTL plus, locally, process liveness), exactly like
+    ///   every other arm — on the registry's injected clock.
+    package func isStillLive(_ join: ClaudeSessionJoin) -> Bool {
+        guard registry.snapshot(sessionID: join.snapshot.sessionID) != nil else { return false }
+        if join.mechanism == .desktopSession {
+            return desktopSessionStillResolves(join)
+        }
+        guard join.mechanism == .browserTab else { return true }
+        guard let binding = join.browserTab else {
+            // Unreachable through `resolveViaBrowserTab`, which always binds.
+            // Fail closed anyway: a browser join with nothing to re-check is
+            // not a join we can still vouch for.
+            Log.claudeContext.info(
+                "Browser tab join carries no bridge binding; treating it as ended"
+            )
+            return false
+        }
+        // Re-ASK the registry rather than re-check the session we already
+        // picked (review finding, codex on PR #218). Asking only "does my
+        // session still report this id" answers a question that was already
+        // settled at start; what can change afterwards is who ELSE reports it.
+        // A second reporter arriving mid-dictation is exactly the case the
+        // start-time arm abstains on — and a hostile enrolled remote host can
+        // publish any label it likes, so "I was the sole reporter when we
+        // resolved" must not be a permanent claim. Re-resolving makes the
+        // abstention rules identical at both ends: unique fresh reporter, or no
+        // join. It subsumes the identity check too — `.resolved` can only name
+        // a session that still reports the bound id.
+        guard case .resolved(let current) =
+            registry.resolve(bridgeSessionID: binding.bridgeSessionID),
+            current.sessionID == join.snapshot.sessionID
+        else {
+            Log.claudeContext.info(
+                "Remote Control bridge session no longer resolves to this session alone; Claude context withheld"
+            )
+            return false
+        }
+        return true
+    }
+
+    /// The `.desktopSession` half of `isStillLive`: the bound id must still
+    /// resolve to THIS session alone, re-asked for the browser arm's reason —
+    /// a second reporter arriving mid-dictation is the ambiguity the start-time
+    /// arm abstains on, and an enrolled host can publish any label it likes.
+    /// Unlike the bridge id the desktop id never goes away while the session
+    /// runs, so this adds no disconnect signal; the registry's freshness still
+    /// covers a session that ended.
+    private func desktopSessionStillResolves(_ join: ClaudeSessionJoin) -> Bool {
+        guard let binding = join.desktopSession else {
+            // Unreachable through `resolveViaDesktopSession`, which always
+            // binds. Fail closed anyway.
+            Log.claudeContext.info(
+                "Claude Desktop join carries no session binding; treating it as ended"
+            )
+            return false
+        }
+        guard case .resolved(let current) =
+            registry.resolve(desktopSessionID: binding.desktopSessionID),
+            current.sessionID == join.snapshot.sessionID
+        else {
+            Log.claudeContext.info(
+                "Claude Desktop session no longer resolves to this session alone; Claude context withheld"
+            )
+            return false
+        }
+        return true
+    }
+}

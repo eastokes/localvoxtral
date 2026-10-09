@@ -1,0 +1,1552 @@
+import ClaudeContextWire
+import Foundation
+import Synchronization
+
+#if canImport(Darwin)
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+#endif
+
+/// Result of a session lookup, shared by every join arm.
+///
+/// Arm-neutral on purpose: the tty, herdr pane, cmux surface, browser bridge
+/// and remote-herdr arms all ask a different question and all get this answer
+/// back, so nothing here names the evidence that was used.
+///
+/// Every non-`resolved` case is an ABSTENTION, and callers must treat it as
+/// "we do not know" — never as "pick the most likely one". A wrong session's
+/// context silently poisons dictation grounding; no context merely fails to
+/// help it.
+public enum ClaudeSessionResolution: Sendable, Equatable {
+    case resolved(ClaudeSessionSnapshot)
+    /// No session matches the query.
+    case unknown
+    /// A session matches, but it is past TTL or its process is gone.
+    case stale
+    /// More than one live session matches the query.
+    case ambiguous
+}
+
+public struct ClaudeRegistryLimits: Sendable, Equatable {
+    /// A local session without a Claude pid cannot be probed for liveness. Five
+    /// minutes keeps brief publisher-metadata failures useful while bounding a
+    /// dead session's joinable exposure far below the normal four-hour TTL.
+    public static let defaultPIDLessLocalSessionTTL: TimeInterval = 5 * 60
+    /// When origins compete for the global cap, no one origin may retain more
+    /// than this many sessions without a Claude Desktop id. Eight covers a
+    /// generous set of terminal tabs while leaving most of the global registry
+    /// available to other origins.
+    public static let defaultMaxSessionsPerOrigin = 8
+    /// The same quota for sessions that report a Claude Desktop id, counted
+    /// apart so a host's Desktop sessions do not compete with its terminal
+    /// ones. An ssh host was measured running 18 at once.
+    public static let defaultMaxDesktopSessionsPerOrigin = 24
+    /// How long a session that reports a Claude Desktop session id stays
+    /// fresh without a hook. Only hooks refresh activity, and the next hook of
+    /// a Desktop session left idle overnight is the UserPromptSubmit of the
+    /// very prompt being dictated, so the four-hour TTL made the first
+    /// dictation back always miss. The id names the web view the user is
+    /// looking at and joins only on exact equality, so keeping the record
+    /// longer cannot widen a join onto another session. Seven days covers a
+    /// weekend away.
+    public static let defaultDesktopSessionTTL: TimeInterval = 7 * 24 * 60 * 60
+    /// How long a focus declaration stays credible. The opencode TUI half
+    /// re-declares on every displayed-session change AND retracts explicitly
+    /// (`FocusCleared`) when the pane leaves its session view, so this bound
+    /// only defends against lost writes and a silently dead TUI: at a
+    /// 20-second heartbeat, 45 seconds tolerates one lost beat plus jitter
+    /// while keeping a pane that stopped declaring from steering the TTY join
+    /// for long. Stale focus is treated as ABSENT information, never as
+    /// "probably still the same one".
+    public static let defaultFocusDeclarationTTL: TimeInterval = 45
+    /// Focus declarations are keyed by TTY device, one live entry per pane.
+    /// The session cap before #672 raised it for Claude Desktop sessions,
+    /// which have no pane and declare no focus.
+    public static let defaultMaxFocusDeclarations = 32
+
+    /// Hard cap on retained sessions — a user with hundreds of stale sessions
+    /// must not grow the app. Beyond it, the origin holding the most sessions
+    /// loses its least recently active one.
+    public var maxSessions: Int
+    /// Sub-quota applied per transport origin to sessions without a Claude
+    /// Desktop id when more than one origin is present. A lone origin may use
+    /// the global cap; once another arrives, churn is evicted from the
+    /// bursting origin first.
+    public var maxSessionsPerOrigin: Int
+    /// `maxSessionsPerOrigin` for sessions that report a Claude Desktop id.
+    public var maxDesktopSessionsPerOrigin: Int
+    /// A session with no hook activity for this long is stale. Claude Code can
+    /// die without firing SessionEnd (SIGKILL, a closed terminal), so TTL plus
+    /// PID liveness — not SessionEnd alone — is what keeps the registry honest.
+    public var sessionTTL: TimeInterval
+    /// `sessionTTL` for a session that reports a Claude Desktop session id.
+    /// Pid liveness still applies to a local one.
+    public var desktopSessionTTL: TimeInterval
+    public var pidlessLocalSessionTTL: TimeInterval
+    public var focusDeclarationTTL: TimeInterval
+    public var maxFocusDeclarations: Int
+
+    public init(
+        maxSessions: Int = 48,
+        maxSessionsPerOrigin: Int = Self.defaultMaxSessionsPerOrigin,
+        maxDesktopSessionsPerOrigin: Int = Self.defaultMaxDesktopSessionsPerOrigin,
+        sessionTTL: TimeInterval = 4 * 60 * 60,
+        desktopSessionTTL: TimeInterval = Self.defaultDesktopSessionTTL,
+        pidlessLocalSessionTTL: TimeInterval = Self.defaultPIDLessLocalSessionTTL,
+        focusDeclarationTTL: TimeInterval = Self.defaultFocusDeclarationTTL,
+        maxFocusDeclarations: Int = Self.defaultMaxFocusDeclarations
+    ) {
+        self.maxSessions = maxSessions
+        self.maxSessionsPerOrigin = maxSessionsPerOrigin
+        self.maxDesktopSessionsPerOrigin = maxDesktopSessionsPerOrigin
+        self.sessionTTL = sessionTTL
+        self.desktopSessionTTL = desktopSessionTTL
+        self.pidlessLocalSessionTTL = pidlessLocalSessionTTL
+        self.focusDeclarationTTL = focusDeclarationTTL
+        self.maxFocusDeclarations = maxFocusDeclarations
+    }
+
+    public static let `default` = ClaudeRegistryLimits()
+}
+
+/// Sessions the broker knows about, keyed by session id.
+///
+/// `Mutex` + `Sendable` per repo convention (no custom actors): the broker's
+/// accept thread writes, the main actor reads, and neither should await.
+public final class ClaudeSessionRegistry: Sendable {
+    /// One pane's declared focus: "the TTY this is keyed by currently displays
+    /// this session", as published by an agent that can actually see its own
+    /// pane (the opencode TUI half). Held per TTY, not per session — focus is
+    /// a property of the pane.
+    private struct FocusDeclaration {
+        var sessionID: String
+        /// The declaring process's pid. Cross-checked against the focused
+        /// session's registered pid at resolution: a declaration that outlived
+        /// its process must not steer a recycled TTY.
+        var declaredPID: Int32
+        var declaredAt: Date
+        /// The declaring TUI's prompt relay, when it runs one (#719). In
+        /// memory only, like every focus declaration: the token never reaches
+        /// the persisted registry file.
+        var promptRelay: OpencodePromptRelayAddress?
+    }
+
+    private struct State {
+        var sessions: [String: ClaudeSessionSnapshot] = [:]
+        var focusByTTY: [String: FocusDeclaration] = [:]
+        /// Counts accepted records, so the turn observer, which runs off the
+        /// lock on whichever broker thread ingested, can tell their order.
+        var acceptedCount: UInt64 = 0
+        /// Remote rows restored while the host registry could not be read.
+        /// Not join candidates, since no enrollment vouches for them, but
+        /// written back with every save so a registry that failed to load
+        /// does not prune them from the file (#1041).
+        var unverifiedRemoteRows: [StoredClaudeSessions.Session] = []
+    }
+
+    private let state = Mutex(State())
+    private let limits: ClaudeRegistryLimits
+    private let now: @Sendable () -> Date
+    private let isProcessAlive: @Sendable (Int32) -> Bool
+    private let processStartMicros: @Sendable (Int32) -> Int64?
+    private let bootIdentity: @Sendable () -> String?
+    private let localPeerUID: @Sendable () -> UInt32
+    private let persistenceWriter: ClaudeSessionStoreWriter?
+    private let submittedPromptObserver =
+        Mutex<(@Sendable (_ sessionID: String, _ prompt: String) -> Void)?>(nil)
+    private let turnObserver =
+        Mutex<(@Sendable (_ event: ClaudeHookEvent, _ session: ClaudeSessionSnapshot, _ sequence: UInt64) -> Void)?>(nil)
+    /// Agents whose hooks this Mac has accepted a record from since launch
+    /// (or since `forgetHeard`). In memory only: it answers the Integrations
+    /// pane's "has this agent's hook ever run", which for Codex is the only
+    /// proof its trust gate let the hook through.
+    private let heardLocalAgents = Mutex<Set<ClaudeHookAgent>>([])
+
+    /// - Parameters:
+    ///   - now: injected clock. Nothing here reads the wall clock directly, so
+    ///     TTL/staleness is testable without sleeping (AGENTS: no wall-clock in
+    ///     tests).
+    ///   - isProcessAlive: liveness probe for a session's hook pid.
+    ///   - allowedRemoteChannels: the enrolled, unrevoked hosts' channels.
+    ///     Nil when the host registry could not be read: the restore then
+    ///     keeps remote rows in the file without trusting them.
+    public init(
+        limits: ClaudeRegistryLimits = .default,
+        store: (any ClaudeSessionStore)? = nil,
+        allowedRemoteChannels: Set<String>? = [],
+        now: @escaping @Sendable () -> Date = { Date() },
+        isProcessAlive: @escaping @Sendable (Int32) -> Bool = ClaudeSessionRegistry.defaultLivenessProbe,
+        processStartMicros: @escaping @Sendable (Int32) -> Int64? = ClaudeSessionRegistry.defaultProcessStartMicros,
+        bootIdentity: @escaping @Sendable () -> String? = ClaudeSessionRegistry.defaultBootIdentity,
+        localPeerUID: @escaping @Sendable () -> UInt32 = ClaudeSessionRegistry.defaultLocalPeerUID
+    ) {
+        self.limits = limits
+        self.now = now
+        self.isProcessAlive = isProcessAlive
+        self.processStartMicros = processStartMicros
+        self.bootIdentity = bootIdentity
+        self.localPeerUID = localPeerUID
+        persistenceWriter = store.map(ClaudeSessionStoreWriter.init)
+
+        guard let store else { return }
+        restore(
+            from: store,
+            allowedRemoteChannels: allowedRemoteChannels,
+            currentBootIdentity: bootIdentity(),
+            currentPeerUID: localPeerUID(),
+            timestamp: now()
+        )
+    }
+
+    /// Fold an authenticated record into the registry.
+    ///
+    /// - Parameters:
+    ///   - origin: decided by the TRANSPORT — the local broker from peer
+    ///     credentials, the remote listener from which token authenticated the
+    ///     connection. This is the only way trust enters; `record` has no origin
+    ///     field to consult.
+    ///   - snippets: sanitized excerpts the transport extracted. Always empty
+    ///     from the local NDJSON wire, which has no field for them.
+    ///   - environment: allowlisted env labels the REMOTE listener read off the
+    ///     request headers, likewise absent from the local wire. Untrusted
+    ///     labels about another machine: the reducer stores them only for a
+    ///     `.remote` origin and NEVER in `process`, which is what the
+    ///     local-only arms below read.
+    ///   - remoteShimVersion: the shim version the remote listener read off
+    ///     the request; ignored for a local origin.
+    /// - Returns: the resulting snapshot, or nil if the record was dropped.
+    @discardableResult
+    public func ingest(
+        _ record: ClaudeHookRecord,
+        origin: ClaudeTransportOrigin,
+        snippets: [ClaudeContentSnippet] = [],
+        environment: ClaudeRemoteSessionEnvironment? = nil,
+        remoteShimVersion: ClaudeRemotePluginVersionReport? = nil
+    ) -> ClaudeSessionSnapshot? {
+        let timestamp = now()
+        // A status probe is read-only by contract and is answered by the
+        // broker BEFORE ingest (`ClaudeContextBroker.handle`). Refusing it
+        // here too is the backstop: an ingested probe would CREATE a session
+        // for an id nobody ever hooked, or refresh the activity of one whose
+        // process is gone — the probe would keep alive the very state it
+        // exists to report on.
+        if record.event == .statusQuery { return nil }
+        // A LOCAL Claude record whose raw id spells another namespace's prefix
+        // is spelling a key that can never be its own: Claude Code ids are
+        // bare UUIDs, opencode ids get the prefix added HERE, and remote ids
+        // are minted by the remote listener (which passes them in pre-scoped,
+        // over a remote origin — that path is exempt below). Dropping these
+        // outright closes the aliasing hole where a crafted `claude` record
+        // literally named "opencode:X" would collide with opencode's raw "X".
+        if origin.isLocalAuthenticated, record.agent == .claude,
+           ClaudeAgentSessionScope.agentPrefixes.contains(where: record.sessionID.hasPrefix)
+               || record.sessionID.hasPrefix(ClaudeRemoteSessionScope.prefix) {
+            return nil
+        }
+        // Receiver-side namespacing, recomputed on EVERY ingest from the agent
+        // tag — mirroring how the remote listener scopes ids under the host
+        // that authenticated them. The registry keys, the focus table, and
+        // every snapshot all speak scoped ids from here on.
+        var record = record
+        record.sessionID = ClaudeAgentSessionScope.scopedSessionID(
+            agent: record.agent, sessionID: record.sessionID
+        )
+        var capEvictions = CapEvictions()
+        var sequence: UInt64 = 0
+        var repeatedSubmit = false
+        let ingested = state.withLock { state -> ClaudeSessionSnapshot? in
+            let before = state.sessions
+            defer {
+                if state.sessions != before { schedulePersistenceLocked(state) }
+            }
+            pruneLocked(&state, now: timestamp)
+
+            // Focus records are pane state, not session state, and they are an
+            // opencode-only mechanism (Claude Code has no way to know what a
+            // pane displays — a `.claude` focus record is an inconsistency to
+            // refuse, not to honor). Everything is validated BEFORE any focus
+            // state is touched: an invalid declaration must not be able to
+            // suppress an existing per-session TTY claim for the focus TTL —
+            // that ordering bug is exactly what review C2b caught.
+            switch record.event {
+            case .focusChanged:
+                guard isValidFocusDeclarationLocked(state, record: record, origin: origin) else {
+                    // The TUI now shows a session this registry cannot join
+                    // (one the server half never announced): whatever this
+                    // tty declared before is no longer on screen. Retracted
+                    // under the same gate as a clear, which only widens
+                    // abstention and never touches a Claude TTY claim.
+                    if record.agent == .opencode, origin.isLocalAuthenticated,
+                       let tty = record.process?.tty, !tty.isEmpty {
+                        state.focusByTTY.removeValue(forKey: tty)
+                    }
+                    return nil
+                }
+                recordFocusLocked(&state, record: record, now: timestamp)
+                // Falls through: the target exists (validated), so the reduce
+                // below bumps its activity.
+            case .focusCleared:
+                guard record.agent == .opencode, origin.isLocalAuthenticated,
+                      let tty = record.process?.tty, !tty.isEmpty
+                else { return nil }
+                // Unconditional removal by TTY, no pid cross-check: a clear
+                // can only ever WIDEN abstention, and requiring the declaring
+                // pid to match would let a restarted TUI's retraction bounce
+                // off its predecessor's lingering entry.
+                state.focusByTTY.removeValue(forKey: tty)
+                guard state.sessions[record.sessionID] != nil else { return nil }
+            default:
+                break
+            }
+
+            var snapshot: ClaudeSessionSnapshot
+            if let existing = state.sessions[record.sessionID] {
+                snapshot = existing
+                // A session's origin is fixed at first sight, and a mismatch is
+                // dropped in EITHER direction — not just remote-claiming-local.
+                //
+                // Remote→local was always the dangerous one (it would let a
+                // forwarded peer mutate a session whose paths authorize
+                // filesystem reads). Local→remote and remote(A)→remote(B) are
+                // dropped too because there is no legitimate way to reach them:
+                // remote ids are namespaced under the host whose token
+                // authenticated them (`ClaudeRemoteSessionScope`), so a second
+                // transport naming the same id is, by construction, someone
+                // spelling an id that is not theirs.
+                if snapshot.origin != origin { return nil }
+                // The agent is likewise fixed at first sight. Agent scoping
+                // makes an honest collision impossible (the scoped keys
+                // differ), so a mismatch here is a record spelling another
+                // agent's scoped id — drop it rather than let one agent's
+                // records mutate another's session.
+                if snapshot.agent != record.agent { return nil }
+            } else {
+                if record.event == .sessionEnd { return nil } // nothing to start
+                snapshot = ClaudeSessionSnapshot(
+                    sessionID: record.sessionID,
+                    origin: origin,
+                    agent: record.agent,
+                    firstSeen: timestamp
+                )
+            }
+
+            repeatedSubmit = ClaudeSessionReducer.isRepeatedSubmit(record, of: snapshot)
+            ClaudeSessionReducer.reduce(
+                &snapshot,
+                record: record,
+                origin: snapshot.origin,
+                snippets: snippets,
+                environment: environment,
+                now: timestamp
+            )
+            // The last report wins: `/reload-plugins` moves a session to the
+            // new shim, and its next hook says so.
+            if case .remote = snapshot.origin, let remoteShimVersion {
+                snapshot.remoteShimVersion = remoteShimVersion
+            }
+
+            state.acceptedCount += 1
+            sequence = state.acceptedCount
+            if record.event == .sessionEnd {
+                // Explicit end: evict immediately, but hand the final snapshot
+                // back so a caller can react to the teardown.
+                removeLocked(&state, sessionID: record.sessionID)
+                return snapshot
+            }
+
+            state.sessions[record.sessionID] = snapshot
+            capEvictions = enforceCapLocked(&state, keeping: record.sessionID)
+            return snapshot
+        }
+        if capEvictions.count > 0 {
+            Log.claudeContext.notice(
+                "Claude session registry evicted \(capEvictions.count, privacy: .public) session(s) over the session cap (\(capEvictions.desktopCount, privacy: .public) reporting a Claude Desktop session id; per-origin \(capEvictions.originQuotaCount, privacy: .public), Desktop per-origin \(capEvictions.desktopQuotaCount, privacy: .public), global \(capEvictions.globalCount, privacy: .public))"
+            )
+        }
+        if ingested != nil, origin.isLocalAuthenticated {
+            _ = heardLocalAgents.withLock { $0.insert(record.agent) }
+        }
+        // The record's own prompt, never the snapshot's: a submit without
+        // one leaves the PREVIOUS prompt in the snapshot, and announcing that
+        // would compare a new dictation with an old prompt. A Vibe prompt
+        // read again by a later hook is not announced again (#1285).
+        if record.event == .userPromptSubmit,
+           !repeatedSubmit,
+           let ingested,
+           let prompt = record.prompt,
+           !prompt.isEmpty,
+           let observer = submittedPromptObserver.withLock({ $0 }) {
+            observer(ingested.sessionID, prompt)
+        }
+        if let ingested, let observer = turnObserver.withLock({ $0 }) {
+            observer(record.event, ingested, sequence)
+        }
+        return ingested
+    }
+
+    /// Whether a record from `agent`'s local hooks was accepted since launch
+    /// or since the last `forgetHeard(localAgent:)`.
+    public func hasHeard(localAgent agent: ClaudeHookAgent) -> Bool {
+        heardLocalAgents.withLock { $0.contains(agent) }
+    }
+
+    /// Called when the agent's hooks are installed again: a record from the
+    /// previous install proves nothing about the new one.
+    public func forgetHeard(localAgent agent: ClaudeHookAgent) {
+        _ = heardLocalAgents.withLock { $0.remove(agent) }
+    }
+
+    /// Hands every prompt a session submits, once the registry holds it, to
+    /// correction learning (`CorrectionLearning`), which compares it with the
+    /// dictation the app inserted into that session. Called on the ingesting
+    /// thread, outside the registry lock, with the scoped session id the join
+    /// also carries. The observer must neither persist nor log it.
+    public func setSubmittedPromptObserver(
+        _ observer: (@Sendable (_ sessionID: String, _ prompt: String) -> Void)?
+    ) {
+        submittedPromptObserver.withLock { $0 = observer }
+    }
+
+    /// Hands every accepted record's event and the session it left, to the
+    /// needs-you queue (#717): a wait, a turn's end, a new prompt, the end of
+    /// the session. Called on the ingesting thread, outside the registry
+    /// lock, with the scoped session id. Two broker threads can call it out
+    /// of order; `sequence`, taken under the lock, is the order the registry
+    /// accepted the records in.
+    public func setTurnObserver(
+        _ observer: (@Sendable (_ event: ClaudeHookEvent, _ session: ClaudeSessionSnapshot, _ sequence: UInt64) -> Void)?
+    ) {
+        turnObserver.withLock { $0 = observer }
+    }
+
+    /// Look up a local workspace path.
+    ///
+    /// Abstains as `.ambiguous` when two live sessions share a workspace —
+    /// which is exactly what happens with two terminal tabs in one repo, so it
+    /// is the common case, not an edge case. Resolving it needs the focus join
+    /// that is deliberately not built yet.
+    public func resolve(workspace: LocalWorkspacePath) -> ClaudeSessionResolution {
+        let timestamp = now()
+        return state.withLock { state in
+            let matches = state.sessions.values.filter { snapshot in
+                isFresh(snapshot, now: timestamp)
+                    && snapshot.localWorkspacePath?.path == workspace.path
+            }
+            switch matches.count {
+            case 0:
+                let hadStale = state.sessions.values.contains {
+                    $0.localWorkspacePath?.path == workspace.path
+                }
+                return hadStale ? .stale : .unknown
+            case 1:
+                return .resolved(matches[0])
+            default:
+                return .ambiguous
+            }
+        }
+    }
+
+    /// Look up by the focused pane's controlling TTY — the focus join.
+    ///
+    /// Only LOCAL sessions are candidates: a remote session's TTY names a
+    /// device on another machine, where it can collide with an unrelated local
+    /// pane — matching it here would let an SSH host claim a local pane by
+    /// publishing that pane's TTY.
+    ///
+    /// Two kinds of evidence can bind a TTY to a session, and they must agree:
+    ///
+    /// * **Per-session claims** (Claude Code): each hook record carries the
+    ///   session's controlling TTY, so a device usually maps to one session.
+    ///   Two live claims on one TTY (a suspended Claude beneath a new one in
+    ///   the same pane) abstain `.ambiguous` — no later arm reads a TTY, so
+    ///   that abstention is the dictation's answer.
+    /// * **Focus declarations** (opencode): one opencode process hosts many
+    ///   sessions on one TTY and its TUI shows one at a time, so its sessions
+    ///   carry no TTY at all — the TUI half instead declares which session the
+    ///   pane DISPLAYS (`FocusChanged`, freshness-bounded). A fresh declaration
+    ///   resolves the TTY to that session iff the session is live and its
+    ///   registered pid matches the declarer's; a declaration whose session is
+    ///   gone or unverifiable abstains rather than falling back to guesswork,
+    ///   and a stale declaration is ABSENT information, not a hint.
+    ///
+    /// When both kinds of evidence exist for one TTY and disagree — a live
+    /// per-session claim next to a fresh focus declaration naming a different
+    /// session — that is two agents each positively claiming the same pane,
+    /// and the only safe answer is `.ambiguous`.
+    public func resolve(tty: String) -> ClaudeSessionResolution {
+        let timestamp = now()
+        return state.withLock { state in
+            let matches = state.sessions.values.filter { snapshot in
+                snapshot.origin.isLocalAuthenticated
+                    && snapshot.process?.tty == tty
+                    && isFresh(snapshot, now: timestamp)
+            }
+
+            if let focus = state.focusByTTY[tty],
+               timestamp.timeIntervalSince(focus.declaredAt) <= limits.focusDeclarationTTL {
+                guard let focused = state.sessions[focus.sessionID],
+                      focused.origin.isLocalAuthenticated,
+                      isFresh(focused, now: timestamp),
+                      focused.process?.claudePID == focus.declaredPID
+                else {
+                    // A fresh declaration for a session that is dead, unknown,
+                    // or from a different process than the declarer. The pane
+                    // positively told us what it displays and we cannot verify
+                    // it — trusting any OTHER candidate now would contradict
+                    // the freshest evidence we have, so abstain outright.
+                    return .stale
+                }
+                if matches.isEmpty || matches.contains(where: { $0.sessionID == focus.sessionID }) {
+                    return .resolved(focused)
+                }
+                return .ambiguous
+            }
+
+            switch matches.count {
+            case 0:
+                let hadStale = state.sessions.values.contains {
+                    $0.origin.isLocalAuthenticated && $0.process?.tty == tty
+                }
+                return hadStale ? .stale : .unknown
+            case 1:
+                return .resolved(matches[0])
+            default:
+                return .ambiguous
+            }
+        }
+    }
+
+    /// Whether any fresh focus declaration carries a prompt relay. Reads no
+    /// surface: it lets a dictation skip asking the terminal for its focused
+    /// TTY (an Apple event, with its consent prompt) when no opencode pane
+    /// could answer.
+    public func hasFreshOpencodePromptRelay() -> Bool {
+        let timestamp = now()
+        return state.withLock { state in
+            state.focusByTTY.values.contains {
+                $0.promptRelay != nil
+                    && timestamp.timeIntervalSince($0.declaredAt) <= limits.focusDeclarationTTL
+            }
+        }
+    }
+
+    /// The prompt relay of the opencode pane that displays `sessionID` now,
+    /// or nil (#719). Answers only from a fresh focus declaration naming that
+    /// session, declared by the pid the session is registered under, for a
+    /// live LOCAL session; the relay rides on exactly that declaration. Two
+    /// such declarations with different relays abstain. `sessionID` is the
+    /// scoped id a join carries.
+    public func opencodePromptRelay(sessionID: String) -> OpencodePromptRelay? {
+        let timestamp = now()
+        return state.withLock { state in
+            guard let session = state.sessions[sessionID],
+                  session.agent == .opencode,
+                  session.origin.isLocalAuthenticated,
+                  isFresh(session, now: timestamp),
+                  let pid = session.process?.claudePID,
+                  sessionID.hasPrefix(ClaudeAgentSessionScope.opencodePrefix)
+            else { return nil }
+            let relays = Set(state.focusByTTY.values.compactMap { focus -> OpencodePromptRelayAddress? in
+                guard focus.sessionID == sessionID,
+                      focus.declaredPID == pid,
+                      timestamp.timeIntervalSince(focus.declaredAt) <= limits.focusDeclarationTTL
+                else { return nil }
+                return focus.promptRelay
+            })
+            guard relays.count == 1, let address = relays.first else { return nil }
+            return OpencodePromptRelay(
+                address: address,
+                opencodeSessionID: String(sessionID.dropFirst(ClaudeAgentSessionScope.opencodePrefix.count))
+            )
+        }
+    }
+
+    /// Look up by herdr pane id — the herdr focus join. LOCAL sessions only: a
+    /// remote host's pane ids live in another machine's herdr and could collide
+    /// with (or deliberately mirror) a local pane's id; matching them here would
+    /// let an SSH host claim a local pane by echoing its pane id.
+    ///
+    /// Every opencode session in one TUI shares the pane id AND the pid, so
+    /// with two sessions this used to hit `.ambiguous` before focus could
+    /// participate — the herdr arm silently stopped joining opencode panes
+    /// (review C3). Fresh focus declarations now arbitrate multi-candidate
+    /// panes the same way they arbitrate a TTY: a verified declaration
+    /// (fresh, pid-matched) naming EXACTLY ONE of the pane's candidates
+    /// resolves to it; anything else stays `.ambiguous`.
+    public func resolve(herdrPaneID: String) -> ClaudeSessionResolution {
+        let timestamp = now()
+        return state.withLock { state in
+            let matches = state.sessions.values.filter { snapshot in
+                snapshot.origin.isLocalAuthenticated
+                    && snapshot.process?.herdrPaneID == herdrPaneID
+                    && isFresh(snapshot, now: timestamp)
+            }
+            switch matches.count {
+            case 0:
+                let hadStale = state.sessions.values.contains {
+                    $0.origin.isLocalAuthenticated && $0.process?.herdrPaneID == herdrPaneID
+                }
+                return hadStale ? .stale : .unknown
+            case 1:
+                return .resolved(matches[0])
+            default:
+                // Focus declarations are keyed by the pane's inner TTY, which
+                // the outer herdr surface cannot know — so scan all fresh,
+                // pid-verified declarations for ones naming a candidate of
+                // THIS pane. Exactly one distinct session may win; zero or
+                // several (two TUIs somehow claiming siblings) abstain.
+                let focused = Set(state.focusByTTY.values.compactMap { focus -> String? in
+                    guard timestamp.timeIntervalSince(focus.declaredAt) <= limits.focusDeclarationTTL,
+                          let candidate = matches.first(where: { $0.sessionID == focus.sessionID }),
+                          candidate.process?.claudePID == focus.declaredPID
+                    else { return nil }
+                    return focus.sessionID
+                })
+                guard focused.count == 1, let winner = focused.first,
+                      let snapshot = matches.first(where: { $0.sessionID == winner })
+                else { return .ambiguous }
+                return .resolved(snapshot)
+            }
+        }
+    }
+
+    /// Look up by Claude Code "Remote Control" bridge session id — the browser
+    /// tab join.
+    ///
+    /// This arm and the Claude Desktop one are the two that span LOCAL and
+    /// REMOTE sessions, and that is a property of the key rather than a
+    /// relaxed rule. Every other local arm
+    /// keys on a per-machine name (a TTY device, a herdr pane id, a pid) that
+    /// another machine can hold identically, so matching a remote session on one
+    /// would let an SSH host claim a local pane by echoing it. A bridge session
+    /// id is allocated by Anthropic's bridge, is globally unique, and is what
+    /// the browser's address bar shows — a remote host reporting one is
+    /// reporting its own, and the tab the user is looking at IS that session's
+    /// UI whichever machine runs it. `ClaudeSessionSnapshot.bridgeSessionID`
+    /// still routes the read by origin (local reads `process`, remote reads
+    /// `remoteEnvironment`), so neither side reaches the other's storage.
+    ///
+    /// Exact equality, and zero or several matches abstain: two sessions
+    /// reporting one bridge id means we cannot tell which the tab belongs to.
+    public func resolve(bridgeSessionID: String) -> ClaudeSessionResolution {
+        resolveUnique(reporting: bridgeSessionID, via: \.bridgeSessionID, label: "bridge")
+    }
+
+    /// Look up by Claude Desktop Code-tab session id — the desktop window join.
+    ///
+    /// Spans LOCAL and REMOTE sessions for the reason `resolve(bridgeSessionID:)`
+    /// does: the desktop app allocates the `local_<uuid>` id and shows it as
+    /// the address of the web view that displays the session, whichever
+    /// machine runs it. Exact equality; zero or several matches abstain.
+    public func resolve(desktopSessionID: String) -> ClaudeSessionResolution {
+        resolveUnique(reporting: desktopSessionID, via: \.desktopSessionID, label: "Claude Desktop")
+    }
+
+    /// The one fresh session whose `key` equals `value`, across both origins.
+    /// Shared by the two globally-unique-id arms so they cannot drift apart on
+    /// the stale/ambiguous rules.
+    ///
+    /// An ambiguous answer logs how many sessions report the id, split by
+    /// origin: two local reporters and a local plus a remote one have
+    /// different causes (a `claude -p` child, a restart without SessionEnd).
+    private func resolveUnique(
+        reporting value: String,
+        via key: KeyPath<ClaudeSessionSnapshot, String?>,
+        label: String
+    ) -> ClaudeSessionResolution {
+        let timestamp = now()
+        let (resolution, localReporters, remoteReporters) = state.withLock { state in
+            let matches = state.sessions.values.filter { snapshot in
+                snapshot[keyPath: key] == value && isFresh(snapshot, now: timestamp)
+            }
+            switch matches.count {
+            case 0:
+                let hadStale = state.sessions.values.contains {
+                    $0[keyPath: key] == value
+                }
+                return (hadStale ? ClaudeSessionResolution.stale : .unknown, 0, 0)
+            case 1:
+                return (.resolved(matches[0]), 0, 0)
+            default:
+                let local = matches.filter(\.origin.isLocalAuthenticated).count
+                return (.ambiguous, local, matches.count - local)
+            }
+        }
+        if resolution == .ambiguous {
+            Log.claudeContext.info(
+                "\(label, privacy: .public) session id is reported by \(localReporters + remoteReporters, privacy: .public) live sessions (\(localReporters, privacy: .public) local, \(remoteReporters, privacy: .public) remote); abstaining"
+            )
+        }
+        return resolution
+    }
+
+    /// Look up by cmux surface id — the LOCAL half of the cmux focus join.
+    ///
+    /// Exactly the shape of `resolve(herdrPaneID:)`, and local-only for exactly
+    /// the same reason: `process` is written only from a peer-UID-authenticated
+    /// AF_UNIX record, so a surface id here was observed by a process running as
+    /// this user on this machine. A remote session's cmux surface id lives in
+    /// `remoteEnvironment` and is reachable only through
+    /// `resolveRemote(cmuxSurfaceID:)` — two methods rather than one, so neither
+    /// origin filter can be lost in a future edit without deleting a whole
+    /// function.
+    ///
+    /// Multi-candidate panes get the same focus-declaration arbitration as
+    /// herdr: one opencode TUI hosts many sessions on one surface, and without
+    /// it the arm would silently stop joining those panes (review C3).
+    public func resolve(cmuxSurfaceID: String) -> ClaudeSessionResolution {
+        let timestamp = now()
+        return state.withLock { state in
+            let matches = state.sessions.values.filter { snapshot in
+                snapshot.origin.isLocalAuthenticated
+                    && snapshot.process?.cmuxSurfaceID == cmuxSurfaceID
+                    && isFresh(snapshot, now: timestamp)
+            }
+            switch matches.count {
+            case 0:
+                let hadStale = state.sessions.values.contains {
+                    $0.origin.isLocalAuthenticated && $0.process?.cmuxSurfaceID == cmuxSurfaceID
+                }
+                return hadStale ? .stale : .unknown
+            case 1:
+                return .resolved(matches[0])
+            default:
+                let focused = Set(state.focusByTTY.values.compactMap { focus -> String? in
+                    guard timestamp.timeIntervalSince(focus.declaredAt) <= limits.focusDeclarationTTL,
+                          let candidate = matches.first(where: { $0.sessionID == focus.sessionID }),
+                          candidate.process?.claudePID == focus.declaredPID
+                    else { return nil }
+                    return focus.sessionID
+                })
+                guard focused.count == 1, let winner = focused.first,
+                      let snapshot = matches.first(where: { $0.sessionID == winner })
+                else { return .ambiguous }
+                return .resolved(snapshot)
+            }
+        }
+    }
+
+    /// Look up by cmux surface id among REMOTE sessions — the `cmux ssh` half.
+    ///
+    /// A remote session is selected here by a label the REMOTE host reported,
+    /// which is sound for a specific reason: the surface id was MINTED by the
+    /// cmux app on this Mac and pushed
+    /// into the remote shell's environment by cmux's own ssh relay. The remote
+    /// hook then reports it back over the authenticated listener. So the value
+    /// is ours, travelling out and back, and the equality test is between two
+    /// labels — nothing here reads a remote filesystem, and
+    /// `ClaudeSessionSnapshot.localWorkspacePath` still refuses to hand a remote
+    /// cwd to anything that could.
+    ///
+    /// A remembered label is NOT by itself evidence that the session still holds
+    /// the surface: a compromised ENROLLED host can replay an id from an earlier
+    /// `cmux ssh` session after that surface returned to a local shell. The
+    /// resolver therefore additionally requires cmux to report the focused
+    /// surface's workspace as a live remote workspace before accepting anything
+    /// this method returns (`remoteClaimIsCurrentlyHosted`). What remains is
+    /// bounded by host enrollment, which the user controls and can revoke.
+    ///
+    /// Mirrors the local method's shape, minus focus arbitration: focus
+    /// declarations are a LOCAL opencode mechanism keyed by a local TTY, and a
+    /// remote candidate must never be resolvable by one.
+    public func resolveRemote(cmuxSurfaceID: String) -> ClaudeSessionResolution {
+        let timestamp = now()
+        return state.withLock { state in
+            let matches = state.sessions.values.filter { snapshot in
+                snapshot.remoteSessionEnvironment?.cmuxSurfaceID == cmuxSurfaceID
+                    && isFresh(snapshot, now: timestamp)
+            }
+            switch matches.count {
+            case 0:
+                let hadStale = state.sessions.values.contains {
+                    $0.remoteSessionEnvironment?.cmuxSurfaceID == cmuxSurfaceID
+                }
+                return hadStale ? .stale : .unknown
+            case 1:
+                return .resolved(matches[0])
+            default:
+                return .ambiguous
+            }
+        }
+    }
+
+    /// Distinct herdr socket paths across live LOCAL sessions. The resolver
+    /// refuses to guess between multiple herdr sessions, so it needs the count,
+    /// not just one path.
+    public func liveLocalHerdrSocketPaths() -> Set<String> {
+        let timestamp = now()
+        return state.withLock { state in
+            Set(state.sessions.values.compactMap { snapshot in
+                guard snapshot.origin.isLocalAuthenticated,
+                      isFresh(snapshot, now: timestamp)
+                else { return nil }
+                return snapshot.process?.herdrSocketPath
+            })
+        }
+    }
+
+    /// Live sessions from ONE enrolled remote host that reported both halves of
+    /// a herdr pane identity, most recently active first.
+    ///
+    /// The mirror image of `liveLocalHerdrSocketPaths()`, and deliberately its
+    /// opposite in every filter: `.remote` origin only, scoped to one host's
+    /// channel, reading `remoteSessionEnvironment` rather than `process`. Those
+    /// two fields never mix (PR #216), so this cannot see a local session's
+    /// pane and the local arms cannot see one of these.
+    ///
+    /// Nothing here is trusted. Both values are opaque labels naming things on
+    /// the host that reported them: this returns candidates, and the join arm
+    /// still has to prove — over the forwarded socket, against that host's own
+    /// herdr — that the focused pane is this session's.
+    ///
+    /// SEVERAL candidates is the expected shape, not an ambiguity: two Claude
+    /// sessions in two herdr panes is the ordinary multiplexer workflow. The
+    /// caller narrows by the herdr's own FOCUSED pane id and requires exactly
+    /// one match there; what it refuses is two candidates claiming the same
+    /// pane id, and two distinct herdr sockets on the host.
+    public func liveRemoteHerdrSessions(hostID: String) -> [ClaudeSessionSnapshot] {
+        let channel = ClaudeRemoteSessionScope.channel(hostID: hostID)
+        let timestamp = now()
+        return state.withLock { state in
+            state.sessions.values
+                .filter { snapshot in
+                    guard case .remote(let sessionChannel) = snapshot.origin,
+                          sessionChannel == channel,
+                          isFresh(snapshot, now: timestamp)
+                    else { return false }
+                    let environment = snapshot.remoteSessionEnvironment
+                    return environment?.herdrPaneID != nil && environment?.herdrSocketPath != nil
+                }
+                .sorted { $0.lastActivity > $1.lastActivity }
+        }
+    }
+
+    /// Every live session from ONE enrolled remote host, most recently active
+    /// first — the plain-ssh arm's candidate set.
+    ///
+    /// Deliberately WIDER than `liveRemoteHerdrSessions(hostID:)`: the sessions
+    /// this arm is for report no multiplexer label at all, so there is no
+    /// second field to filter on here. The narrowing all happens in the arm,
+    /// against facts this registry cannot see — the ports of a socket in this
+    /// Mac's own kernel.
+    ///
+    /// Same origin discipline as its herdr sibling and for the same reason:
+    /// `.remote` only, scoped to one host's channel, and every value the caller
+    /// then reads comes from `remoteSessionEnvironment`, never `process`.
+    public func liveRemoteSessions(hostID: String) -> [ClaudeSessionSnapshot] {
+        let channel = ClaudeRemoteSessionScope.channel(hostID: hostID)
+        let timestamp = now()
+        return state.withLock { state in
+            state.sessions.values
+                .filter { snapshot in
+                    guard case .remote(let sessionChannel) = snapshot.origin,
+                          sessionChannel == channel,
+                          isFresh(snapshot, now: timestamp)
+                    else { return false }
+                    return true
+                }
+                .sorted { $0.lastActivity > $1.lastActivity }
+        }
+    }
+
+    public func snapshot(sessionID: String) -> ClaudeSessionSnapshot? {
+        let timestamp = now()
+        return state.withLock { state in
+            guard let snapshot = state.sessions[sessionID], isFresh(snapshot, now: timestamp) else {
+                return nil
+            }
+            return snapshot
+        }
+    }
+
+    /// All live sessions, most recently active first.
+    public func liveSessions() -> [ClaudeSessionSnapshot] {
+        let timestamp = now()
+        return state.withLock { state in
+            state.sessions.values
+                .filter { isFresh($0, now: timestamp) }
+                .sorted { $0.lastActivity > $1.lastActivity }
+        }
+    }
+
+    /// Whether ANY session is live, without materializing them.
+    ///
+    /// The overlay's join badge asks this once per unjoined dictation purely to
+    /// decide between "nothing attached" and silence, and it needs no snapshot
+    /// — `liveSessions()` would copy every session's recent files and snippets
+    /// to answer a question about emptiness.
+    public func hasLiveSessions() -> Bool {
+        let timestamp = now()
+        return state.withLock { state in
+            state.sessions.values.contains { isFresh($0, now: timestamp) }
+        }
+    }
+
+    /// The broker attached `sessionID`'s mod channel (#1646).
+    package func modChannelAttached(sessionID: String, claudePID: Int32, token: UInt64) {
+        let timestamp = now()
+        state.withLock { state in
+            guard state.sessions[sessionID] != nil else { return }
+            state.sessions[sessionID]?.modChannel = ClaudeModChannelLiveness(
+                token: token, claudePID: claudePID, lastSeen: timestamp
+            )
+        }
+    }
+
+    /// A remote session's mod polled on the channel `token` names (#1412): its
+    /// TTL counts from now. A remote pid names another machine's process, so
+    /// polls are the session's liveness there.
+    package func modChannelSeen(sessionID: String, token: UInt64) {
+        let timestamp = now()
+        state.withLock { state in
+            guard let channel = state.sessions[sessionID]?.modChannel, channel.token == token else { return }
+            state.sessions[sessionID]?.modChannel = ClaudeModChannelLiveness(
+                token: token, claudePID: channel.claudePID, lastSeen: timestamp
+            )
+        }
+    }
+
+    /// The channel `token` names detached. After the mod's `bye` the session
+    /// ended and goes now; otherwise its TTL counts from this moment, so a
+    /// reloaded mod finds it still there to attach again.
+    package func modChannelDetached(sessionID: String, token: UInt64, sessionEnded: Bool) {
+        let timestamp = now()
+        let ended: Bool = state.withLock { state in
+            guard let channel = state.sessions[sessionID]?.modChannel, channel.token == token else { return false }
+            if sessionEnded {
+                removeLocked(&state, sessionID: sessionID)
+                schedulePersistenceLocked(state)
+                return true
+            }
+            state.sessions[sessionID]?.modChannel = ClaudeModChannelLiveness(
+                token: nil, claudePID: channel.claudePID, lastSeen: timestamp
+            )
+            return false
+        }
+        if ended {
+            Log.claudeContext.info("Claude session registry: the mod's bye ended a session")
+        }
+    }
+
+    public func evict(sessionID: String) {
+        state.withLock { state in
+            guard state.sessions[sessionID] != nil else { return }
+            removeLocked(&state, sessionID: sessionID)
+            schedulePersistenceLocked(state)
+        }
+    }
+
+    /// Forget every SSH-remote session whose transport channel is not in `channels`.
+    ///
+    /// This is how a revoked or removed host stops having cached context here.
+    /// Revocation is immediate at the door — `ClaudeRemoteHostRegistry` refuses
+    /// the token on the next request — but that only stops NEW records; whatever
+    /// the host already published would otherwise sit in this registry until TTL
+    /// expired it, joinable the whole time. A user who revokes a
+    /// host means "that machine's context is no longer mine to use", not "no
+    /// more of it, but keep the last four hours".
+    ///
+    /// The channel is the transport's own answer (`ClaudeRemoteSessionScope.channel`,
+    /// set by the listener from the token that authenticated the connection), so
+    /// this identifies a host's sessions without consulting anything on the wire.
+    ///
+    /// `.localAuthenticated` sessions and remote sessions from any other
+    /// transport are never candidates, whatever `channels` says. Their trust
+    /// and lifecycle have nothing to do with SSH host enrollment.
+    ///
+    /// Eviction happens under one hold of the state mutex, so a reader can
+    /// never observe half of it.
+    ///
+    /// - Returns: how many sessions were evicted.
+    @discardableResult
+    public func evictRemoteSessions(notIn channels: Set<String>) -> Int {
+        let sshPrefix = ClaudeRemoteSessionScope.channel(hostID: "")
+        return state.withLock { state in
+            let doomed = state.sessions.values.filter { snapshot in
+                guard case .remote(let channel) = snapshot.origin else { return false }
+                return channel.hasPrefix(sshPrefix) && !channels.contains(channel)
+            }.map(\.sessionID)
+            for sessionID in doomed {
+                removeLocked(&state, sessionID: sessionID)
+            }
+            let heldBefore = state.unverifiedRemoteRows.count
+            state.unverifiedRemoteRows.removeAll { row in
+                guard let channel = row.origin.channel else { return true }
+                return channel.hasPrefix(sshPrefix) && !channels.contains(channel)
+            }
+            if !doomed.isEmpty || state.unverifiedRemoteRows.count != heldBefore {
+                schedulePersistenceLocked(state)
+            }
+            return doomed.count
+        }
+    }
+
+    public func removeAll() {
+        state.withLock { state in
+            state.sessions.removeAll()
+            state.focusByTTY.removeAll()
+            state.unverifiedRemoteRows.removeAll()
+            persistenceWriter?.submit(.clear)
+        }
+    }
+
+    public func flushPersistence() {
+        persistenceWriter?.flush()
+    }
+
+    // MARK: - Locked helpers
+
+    /// How long `snapshot` stays fresh without a hook. A pidless local record
+    /// keeps the short exposure bound whatever it reports: nothing can probe
+    /// it.
+    private func ttl(for snapshot: ClaudeSessionSnapshot) -> TimeInterval {
+        if snapshot.origin.isLocalAuthenticated, snapshot.process?.claudePID == nil {
+            return min(limits.sessionTTL, limits.pidlessLocalSessionTTL)
+        }
+        if snapshot.desktopSessionID != nil {
+            return max(limits.sessionTTL, limits.desktopSessionTTL)
+        }
+        return limits.sessionTTL
+    }
+
+    private func isFresh(_ snapshot: ClaudeSessionSnapshot, now: Date) -> Bool {
+        if !hasAttachedModChannel(snapshot) {
+            let lastSeen = max(snapshot.lastActivity, snapshot.modChannel?.lastSeen ?? .distantPast)
+            guard now.timeIntervalSince(lastSeen) <= ttl(for: snapshot) else { return false }
+        }
+        // `claudePID`, never `hookPID`. The publisher exits the instant it has
+        // written its line, so probing its own pid would report every local
+        // session dead microseconds after it was created — the registry would
+        // answer `.stale` to everything, forever.
+        //
+        // Only a locally authenticated pid means anything to us: a remote
+        // session's pid names a process on another machine, where it could
+        // collide with an unrelated local one. Those rely on TTL alone.
+        if snapshot.origin.isLocalAuthenticated, let pid = snapshot.process?.claudePID {
+            guard isProcessAlive(pid) else { return false }
+            // A record that carries the agent's start time is held to it: a
+            // pid is reused, and an agent with no session-end event (Vibe)
+            // would otherwise stay joinable on its old tty for the whole TTL
+            // once ANY process took its pid. An unreadable start time is not a
+            // match.
+            if let recorded = snapshot.process?.agentStartMicros {
+                return processStartMicros(pid) == recorded
+            }
+            return true
+        }
+        return true
+    }
+
+    /// Whether the session's mod holds its channel open (#1646): a session
+    /// that is alive by definition, so no TTL applies. Only a local session
+    /// whose hooks named the same Claude Code process as the attach: pid
+    /// liveness still applies, and a pidless or mismatched one keeps its TTL.
+    private func hasAttachedModChannel(_ snapshot: ClaudeSessionSnapshot) -> Bool {
+        guard snapshot.origin.isLocalAuthenticated,
+              let channel = snapshot.modChannel, channel.token != nil,
+              let pid = snapshot.process?.claudePID
+        else { return false }
+        return channel.claudePID == pid
+    }
+
+    private func pruneLocked(_ state: inout State, now: Date) {
+        for (sessionID, snapshot) in state.sessions where !isFresh(snapshot, now: now) {
+            removeLocked(&state, sessionID: sessionID)
+        }
+        // Expired focus declarations are dead weight: resolution already treats
+        // them as absent, this just keeps the table from accumulating panes.
+        for (tty, focus) in state.focusByTTY
+        where now.timeIntervalSince(focus.declaredAt) > limits.focusDeclarationTTL {
+            state.focusByTTY.removeValue(forKey: tty)
+        }
+    }
+
+    /// Every condition a focus declaration must meet BEFORE any focus state is
+    /// mutated (review C2b: writing first let an invalid declaration suppress
+    /// a live per-session TTY claim for the focus TTL even though ingest
+    /// rejected the record):
+    ///
+    /// * opencode-only — focus is that agent's mechanism, and a `.claude`
+    ///   focus record is an inconsistency to refuse (review hardening);
+    /// * LOCAL transport only — a remote host's TTY names a device on another
+    ///   machine, exactly the reason `resolve(tty:)` refuses remote candidates;
+    /// * carries the declaring pane's device — a claim with no TTY binds
+    ///   nothing;
+    /// * names a session the registry KNOWS, of the same agent, itself locally
+    ///   authenticated, registered to the declaring process. A declaration
+    ///   that could never resolve must not exist — and a session the pane
+    ///   displays but whose records were lost self-heals at the next
+    ///   heartbeat, once its own records arrive.
+    private func isValidFocusDeclarationLocked(
+        _ state: State,
+        record: ClaudeHookRecord,
+        origin: ClaudeTransportOrigin
+    ) -> Bool {
+        guard record.agent == .opencode,
+              origin.isLocalAuthenticated,
+              let process = record.process,
+              let tty = process.tty, !tty.isEmpty,
+              let target = state.sessions[record.sessionID],
+              target.agent == record.agent,
+              target.origin.isLocalAuthenticated,
+              target.process?.claudePID == process.claudePID
+        else { return false }
+        return true
+    }
+
+    private func recordFocusLocked(
+        _ state: inout State,
+        record: ClaudeHookRecord,
+        now: Date
+    ) {
+        guard let process = record.process, let tty = process.tty else { return }
+        state.focusByTTY[tty] = FocusDeclaration(
+            sessionID: record.sessionID,
+            declaredPID: process.claudePID,
+            declaredAt: now,
+            promptRelay: record.promptRelay
+        )
+        // Bounded like everything else a peer can grow: beyond the cap the
+        // oldest declaration goes — it is the one closest to expiring anyway.
+        while state.focusByTTY.count > limits.maxFocusDeclarations {
+            guard let oldest = state.focusByTTY.min(by: {
+                ($0.value.declaredAt, $0.key) < ($1.value.declaredAt, $1.key)
+            }) else { break }
+            state.focusByTTY.removeValue(forKey: oldest.key)
+        }
+    }
+
+    private func removeLocked(_ state: inout State, sessionID: String) {
+        state.sessions.removeValue(forKey: sessionID)
+    }
+
+    /// `upserted` is the sessionID this upsert just wrote: on a lastActivity
+    /// tie (frozen test clocks, sub-tick batches) the sessionID tiebreak could
+    /// otherwise select the record that triggered the enforcement — evicting
+    /// the newest data is never the right answer, so it is pinned and the
+    /// next-oldest tied sibling goes instead.
+    ///
+    /// Returns what it evicted, for the caller to log outside the lock.
+    @discardableResult
+    private func enforceCapLocked(
+        _ state: inout State, keeping upserted: String? = nil
+    ) -> CapEvictions {
+        var evictions = CapEvictions()
+        func evict(_ snapshot: ClaudeSessionSnapshot) {
+            removeLocked(&state, sessionID: snapshot.sessionID)
+            evictions.count += 1
+            if snapshot.desktopSessionID != nil { evictions.desktopCount += 1 }
+        }
+        let grouped = Dictionary(grouping: state.sessions.values, by: \.origin)
+        if grouped.count > 1 {
+            // Always reserve at least one global slot for a competing origin,
+            // even when a caller configures a sub-quota above a small test cap.
+            func reserved(_ quota: Int) -> Int {
+                min(max(0, quota), max(0, limits.maxSessions - 1))
+            }
+            let quota = reserved(limits.maxSessionsPerOrigin)
+            let desktopQuota = reserved(limits.maxDesktopSessionsPerOrigin)
+            for sessions in grouped.values {
+                // A desktop id is whatever the host sent, so it buys room only
+                // in its own origin's Desktop quota, never in another origin's.
+                let desktop = sessions.filter { $0.desktopSessionID != nil }
+                let others = sessions.filter { $0.desktopSessionID == nil }
+                // The pin never relaxes a quota: with the pinned session
+                // excluded there are still at least `count - quota` evictable
+                // siblings whenever quota >= 1.
+                for (group, groupQuota) in [(others, quota), (desktop, desktopQuota)]
+                where group.count > groupQuota {
+                    let evictable = group.sorted(by: Self.evictionPrecedes)
+                        .filter { $0.sessionID != upserted }
+                        .prefix(group.count - groupQuota)
+                    for snapshot in evictable {
+                        evict(snapshot)
+                        if snapshot.desktopSessionID == nil {
+                            evictions.originQuotaCount += 1
+                        } else {
+                            evictions.desktopQuotaCount += 1
+                        }
+                    }
+                }
+            }
+        }
+
+        // Over the global cap, the origin holding the most sessions pays, so
+        // one host's sessions, Desktop or not, can never push out a smaller
+        // origin's. Pinned here too: with Desktop records sorted last, a new
+        // record without one would otherwise be the first to go once the cap
+        // is full of them.
+        while state.sessions.count > limits.maxSessions {
+            let byOrigin = Dictionary(grouping: state.sessions.values, by: \.origin)
+            let victim = byOrigin
+                .sorted { Self.originEvictionPrecedes($0.key, $0.value.count, $1.key, $1.value.count) }
+                .lazy
+                .compactMap { _, sessions in
+                    sessions.sorted(by: Self.evictionPrecedes).first {
+                        self.limits.maxSessions < 1 || $0.sessionID != upserted
+                    }
+                }
+                .first
+            guard let victim else { break }
+            evict(victim)
+            evictions.globalCount += 1
+        }
+        return evictions
+    }
+
+    private struct CapEvictions {
+        var count = 0
+        var desktopCount = 0
+        var originQuotaCount = 0
+        var desktopQuotaCount = 0
+        var globalCount = 0
+    }
+
+    private func schedulePersistenceLocked(_ state: State) {
+        guard let persistenceWriter else { return }
+        persistenceWriter.submit(.save(StoredClaudeSessions(
+            version: StoredClaudeSessions.currentVersion,
+            bootIdentity: bootIdentity(),
+            sessions: (state.sessions.values.map(Self.storedSession) + state.unverifiedRemoteRows)
+                .sorted { $0.sessionID < $1.sessionID }
+        )))
+    }
+
+    private func restore(
+        from store: any ClaudeSessionStore,
+        allowedRemoteChannels: Set<String>?,
+        currentBootIdentity: String?,
+        currentPeerUID: UInt32,
+        timestamp: Date
+    ) {
+        let data: Data
+        do {
+            guard let loaded = try store.load() else { return }
+            data = loaded
+        } catch {
+            Log.claudeContext.error("Claude session store load failed; restored 0 sessions, file kept")
+            persistenceWriter?.keepRefusedFile()
+            return
+        }
+
+        let file: StoredClaudeSessions
+        do {
+            let decoder = JSONDecoder()
+            decoder.dateDecodingStrategy = .millisecondsSince1970
+            file = try decoder.decode(StoredClaudeSessions.self, from: data)
+        } catch {
+            Log.claudeContext.error("Claude session store is corrupt; restored 0 sessions, file kept")
+            persistenceWriter?.keepRefusedFile()
+            return
+        }
+        guard file.version == StoredClaudeSessions.currentVersion else {
+            Log.claudeContext.error(
+                "Claude session store version \(file.version, privacy: .public) is unsupported; restored 0 sessions, file kept"
+            )
+            persistenceWriter?.keepRefusedFile()
+            return
+        }
+        persistenceWriter?.adoptRestoredRows(file.sessions.map(\.sessionID))
+
+        var restored: [String: ClaudeSessionSnapshot] = [:]
+        var unverified: [StoredClaudeSessions.Session] = []
+        var dropped: [String: Int] = [:]
+        func drop(_ reason: String) { dropped[reason, default: 0] += 1 }
+
+        for stored in file.sessions {
+            guard let snapshot = Self.restoredSnapshot(from: stored) else {
+                drop("invalid schema")
+                continue
+            }
+            guard Self.hasValidNamespace(snapshot) else {
+                drop("invalid namespace")
+                continue
+            }
+            guard snapshot.activity != .ended,
+                  snapshot.firstSeen <= snapshot.lastActivity,
+                  snapshot.lastActivity <= timestamp
+            else {
+                drop("invalid lifecycle")
+                continue
+            }
+            switch snapshot.origin {
+            case .localAuthenticated(let peerUID):
+                guard peerUID == currentPeerUID else {
+                    drop("local uid mismatch")
+                    continue
+                }
+                guard file.bootIdentity != nil, file.bootIdentity == currentBootIdentity else {
+                    drop("boot mismatch")
+                    continue
+                }
+            case .remote(let channel):
+                guard channel.hasPrefix(ClaudeRemoteSessionScope.channel(hostID: "")) else {
+                    drop("inactive remote host")
+                    continue
+                }
+                if let allowedRemoteChannels, !allowedRemoteChannels.contains(channel) {
+                    drop("inactive remote host")
+                    continue
+                }
+            }
+            guard isFresh(snapshot, now: timestamp) else {
+                if snapshot.origin.isLocalAuthenticated,
+                   snapshot.process?.claudePID != nil,
+                   timestamp.timeIntervalSince(snapshot.lastActivity) <= ttl(for: snapshot) {
+                    drop("dead local process")
+                } else {
+                    drop("stale")
+                }
+                continue
+            }
+            guard restored[snapshot.sessionID] == nil,
+                  !unverified.contains(where: { $0.sessionID == stored.sessionID })
+            else {
+                drop("duplicate id")
+                continue
+            }
+            if allowedRemoteChannels == nil, !snapshot.origin.isLocalAuthenticated {
+                unverified.append(stored)
+                continue
+            }
+            restored[snapshot.sessionID] = snapshot
+        }
+
+        if !unverified.isEmpty {
+            Log.claudeContext.error(
+                "Claude remote host registry unreadable; kept \(unverified.count, privacy: .public) remote session(s) in the file, not restored"
+            )
+        }
+        let beforeCap = restored.count
+        state.withLock { state in
+            state.sessions = restored
+            state.unverifiedRemoteRows = unverified
+            enforceCapLocked(&state)
+            restored = state.sessions
+        }
+        if beforeCap > restored.count { dropped["session cap", default: 0] += beforeCap - restored.count }
+
+        let restoredCount = restored.count
+        if !dropped.isEmpty {
+            let reasons = dropped.keys.sorted().map { "\($0)=\(dropped[$0]!)" }.joined(separator: ", ")
+            Log.claudeContext.info(
+                "Claude session store restored \(restoredCount, privacy: .public) session(s); dropped \(file.sessions.count - restoredCount - unverified.count, privacy: .public) (\(reasons, privacy: .public))"
+            )
+        } else if restoredCount > 0 {
+            Log.claudeContext.info(
+                "Claude session store restored \(restoredCount, privacy: .public) session(s); dropped 0"
+            )
+        }
+        if !dropped.isEmpty {
+            state.withLock { schedulePersistenceLocked($0) }
+        }
+    }
+
+    private static func storedSession(_ snapshot: ClaudeSessionSnapshot) -> StoredClaudeSessions.Session {
+        let origin: StoredClaudeSessions.Origin
+        switch snapshot.origin {
+        case .localAuthenticated(let peerUID):
+            origin = .init(kind: "local", peerUID: peerUID, channel: nil)
+        case .remote(let channel):
+            origin = .init(kind: "remote", peerUID: nil, channel: channel)
+        }
+        let workspace: String?
+        switch snapshot.workspace {
+        case .local(let path): workspace = path.path
+        case .remoteOpaque(let label): workspace = label
+        case nil: workspace = nil
+        }
+        return .init(
+            sessionID: snapshot.sessionID,
+            origin: origin,
+            agent: snapshot.agent,
+            workspace: workspace,
+            activity: snapshot.activity.rawValue,
+            process: snapshot.origin.isLocalAuthenticated ? snapshot.process : nil,
+            remoteEnvironment: snapshot.remoteSessionEnvironment.map(StoredClaudeSessions.RemoteEnvironment.init),
+            worktreeRepository: snapshot.origin.isLocalAuthenticated ? nil : snapshot.remoteWorktreeRepository,
+            firstSeen: snapshot.firstSeen,
+            lastActivity: snapshot.lastActivity
+        )
+    }
+
+    private static func restoredSnapshot(
+        from stored: StoredClaudeSessions.Session
+    ) -> ClaudeSessionSnapshot? {
+        let origin: ClaudeTransportOrigin
+        switch stored.origin.kind {
+        case "local":
+            guard let peerUID = stored.origin.peerUID,
+                  stored.origin.channel == nil,
+                  stored.remoteEnvironment == nil
+            else { return nil }
+            origin = .localAuthenticated(peerUID: peerUID)
+        case "remote":
+            guard stored.origin.peerUID == nil,
+                  stored.process == nil,
+                  let channel = stored.origin.channel
+            else { return nil }
+            origin = .remote(channel: channel)
+        default:
+            return nil
+        }
+        guard let activity = ClaudeSessionActivity(rawValue: stored.activity) else { return nil }
+        if let process = stored.process,
+           process.hookPID <= 0 || process.claudePID <= 0 {
+            return nil
+        }
+        if let environment = stored.remoteEnvironment?.value {
+            let values = ClaudeRemoteEnvironmentField.allCases.compactMap { environment[$0] }
+            let limits = ClaudeRemoteEnvironmentLimits.default
+            guard values.count <= limits.maxFieldCount,
+                  values.reduce(0, { $0 + $1.utf8.count }) <= limits.maxTotalBytes,
+                  values.allSatisfy({ ClaudeRemoteEnvironmentCodec.isAcceptableValue($0) })
+            else { return nil }
+        }
+        var snapshot = ClaudeSessionSnapshot(
+            sessionID: stored.sessionID,
+            origin: origin,
+            agent: stored.agent,
+            firstSeen: stored.firstSeen
+        )
+        if let workspace = stored.workspace {
+            switch origin {
+            case .localAuthenticated:
+                snapshot.workspace = ClaudeWorkspaceReference.make(rawCwd: workspace, origin: origin)
+                guard snapshot.workspace != nil else { return nil }
+            case .remote:
+                snapshot.workspace = ClaudeWorkspaceReference.make(rawCwd: workspace, origin: origin)
+                guard snapshot.workspace?.displayName == workspace else { return nil }
+            }
+        }
+        snapshot.activity = activity
+        snapshot.process = origin.isLocalAuthenticated ? stored.process : nil
+        snapshot.remoteEnvironment = origin.isLocalAuthenticated ? nil : stored.remoteEnvironment?.value
+        if let repository = stored.worktreeRepository {
+            guard !origin.isLocalAuthenticated,
+                  ClaudeWorkspaceReference.make(rawCwd: repository, origin: origin)?.displayName == repository
+            else { return nil }
+            snapshot.remoteWorktreeRepository = repository
+        }
+        snapshot.firstSeen = stored.firstSeen
+        snapshot.lastActivity = stored.lastActivity
+        return snapshot
+    }
+
+    private static func hasValidNamespace(_ snapshot: ClaudeSessionSnapshot) -> Bool {
+        var transportID = snapshot.sessionID
+        if let agentPrefix = ClaudeAgentSessionScope.prefix(for: snapshot.agent) {
+            guard transportID.hasPrefix(agentPrefix) else { return false }
+            transportID.removeFirst(agentPrefix.count)
+            guard !transportID.isEmpty else { return false }
+        } else {
+            guard !ClaudeAgentSessionScope.agentPrefixes.contains(where: transportID.hasPrefix) else {
+                return false
+            }
+        }
+
+        switch snapshot.origin {
+        case .localAuthenticated:
+            return !transportID.hasPrefix(ClaudeRemoteSessionScope.prefix)
+        case .remote(let channel):
+            let channelPrefix = ClaudeRemoteSessionScope.channel(hostID: "")
+            guard channel.hasPrefix(channelPrefix) else { return false }
+            let hostID = String(channel.dropFirst(channelPrefix.count))
+            let sessionPrefix = ClaudeRemoteSessionScope.prefix + hostID + ":"
+            return !hostID.isEmpty
+                && transportID.hasPrefix(sessionPrefix)
+                && transportID.count > sessionPrefix.count
+        }
+    }
+
+    /// Which origin loses a session to the global cap: the one holding the
+    /// most, then a remote one before the local one, then by channel name.
+    private static func originEvictionPrecedes(
+        _ lhs: ClaudeTransportOrigin, _ lhsCount: Int,
+        _ rhs: ClaudeTransportOrigin, _ rhsCount: Int
+    ) -> Bool {
+        if lhsCount != rhsCount { return lhsCount > rhsCount }
+        switch (lhs, rhs) {
+        case (.remote(let lhsChannel), .remote(let rhsChannel)):
+            return lhsChannel < rhsChannel
+        case (.remote, .localAuthenticated):
+            return true
+        case (.localAuthenticated, .remote):
+            return false
+        case (.localAuthenticated(let lhsUID), .localAuthenticated(let rhsUID)):
+            return lhsUID < rhsUID
+        }
+    }
+
+    /// Least recently active first, but every record without a Claude Desktop
+    /// session id goes before any record with one: a Desktop session sits idle
+    /// between prompts while the user still has it open, and a host can run
+    /// many of them at once. Stable tie-breaking keeps eviction reproducible
+    /// when a burst lands in one clock tick (common in tests and possible for
+    /// batched hook records).
+    private static func evictionPrecedes(
+        _ lhs: ClaudeSessionSnapshot,
+        _ rhs: ClaudeSessionSnapshot
+    ) -> Bool {
+        let lhsDesktop = lhs.desktopSessionID != nil
+        let rhsDesktop = rhs.desktopSessionID != nil
+        if lhsDesktop != rhsDesktop { return rhsDesktop }
+        if lhs.lastActivity != rhs.lastActivity {
+            return lhs.lastActivity < rhs.lastActivity
+        }
+        return lhs.sessionID < rhs.sessionID
+    }
+
+    // MARK: - Defaults
+
+    /// `kill(pid, 0)` — the standard liveness probe. EPERM means the process
+    /// exists but is not ours, which still counts as alive.
+    public static let defaultLivenessProbe: @Sendable (Int32) -> Bool = { pid in
+        guard pid > 0 else { return false }
+        if kill(pid, 0) == 0 { return true }
+        return errno == EPERM
+    }
+
+    /// Start time of `pid` from the process table, in microseconds since the
+    /// epoch — the same read the hook publisher makes
+    /// (`ClaudeHookPublisher.processFacts`), so the two compare exactly.
+    public static let defaultProcessStartMicros: @Sendable (Int32) -> Int64? = { pid in
+        #if canImport(Darwin)
+        guard pid > 0 else { return nil }
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        guard sysctl(&mib, UInt32(mib.count), &info, &size, nil, 0) == 0,
+              size > 0,
+              info.kp_proc.p_pid == pid
+        else { return nil }
+        let started = info.kp_proc.p_starttime
+        let micros = Int64(started.tv_sec) * 1_000_000 + Int64(started.tv_usec)
+        return micros > 0 ? micros : nil
+        #else
+        return nil
+        #endif
+    }
+
+    public static let defaultBootIdentity: @Sendable () -> String? = {
+        #if canImport(Darwin)
+        var bootTime = timeval()
+        var size = MemoryLayout<timeval>.size
+        guard sysctlbyname("kern.boottime", &bootTime, &size, nil, 0) == 0 else { return nil }
+        return "\(bootTime.tv_sec).\(bootTime.tv_usec)"
+        #else
+        return nil
+        #endif
+    }
+
+    public static let defaultLocalPeerUID: @Sendable () -> UInt32 = {
+        #if canImport(Darwin)
+        UInt32(geteuid())
+        #else
+        0
+        #endif
+    }
+}

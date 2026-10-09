@@ -31,7 +31,8 @@ final class SettingsStoreOutOfBoxDefaultsTests: XCTestCase {
     }
 
     private func makeStore(environment: [String: String] = [:]) -> SettingsStore {
-        SettingsStore(defaults: defaults, environment: environment)
+        SettingsStore(
+            defaults: defaults, environment: environment, secretStore: InMemorySecretStore())
     }
 
     // MARK: - Fresh install
@@ -40,6 +41,63 @@ final class SettingsStoreOutOfBoxDefaultsTests: XCTestCase {
         let store = makeStore()
 
         XCTAssertTrue(store.modifierOnlyHotKeyEnabled)
+    }
+
+    func testAnyInstall_lowersOtherAudioWhileDictating() {
+        // On by default, fresh install or old (owner ruling, 2026-09-21): a
+        // plain fallback, not a seed, because the setting has never shipped
+        // off — no install anywhere has a stored `false` to be overridden.
+        XCTAssertTrue(makeStore().audioDuckingEnabled)
+
+        defaults.set(true, forKey: Self.onboardingKey)  // an existing install
+        XCTAssertTrue(makeStore().audioDuckingEnabled)
+    }
+
+    func testSpokenSendIsOffUntilTurnedOn() {
+        // It presses Return in the user's terminal: opt-in in both modes.
+        XCTAssertFalse(makeStore().overlaySpokenSendEnabled)
+        XCTAssertFalse(makeStore().liveSpokenSendEnabled)
+
+        let store = makeStore()
+        store.overlaySpokenSendEnabled = true
+        store.liveSpokenSendEnabled = true
+        XCTAssertTrue(makeStore().overlaySpokenSendEnabled)
+        XCTAssertTrue(makeStore().liveSpokenSendEnabled)
+    }
+
+    /// The send phrases (#839): the default until set, then the user's
+    /// list across a restart. A stored list that no longer validates loads
+    /// as the default, never as no phrase at all.
+    func testSendPhrasesSurviveARestart() {
+        XCTAssertEqual(makeStore().spokenSendTriggerPhrases, ["send it", "send now"])
+
+        makeStore().spokenSendTriggerPhrases = ["ship it", "over and out"]
+        XCTAssertEqual(makeStore().spokenSendTriggerPhrases, ["ship it", "over and out"])
+
+        defaults.set(["done"], forKey: "settings.spoken_send_trigger_phrases")
+        XCTAssertEqual(makeStore().spokenSendTriggerPhrases, ["send it", "send now"])
+    }
+
+    /// The wait before a send phrase stops the dictation (#1009): 3 s until
+    /// set, as before the setting existed; then the user's choice across a
+    /// restart. A value no choice has loads as the default.
+    func testSpokenStopWaitDefaultsToThreeSecondsAndSurvivesARestart() {
+        XCTAssertEqual(makeStore().spokenStopWait.duration, .seconds(3))
+
+        makeStore().spokenStopWait = .oneSecond
+        XCTAssertEqual(makeStore().spokenStopWait, .oneSecond)
+
+        defaults.set(500, forKey: "settings.spoken_stop_wait_ms")
+        XCTAssertEqual(makeStore().spokenStopWait.duration, .seconds(3))
+    }
+
+    func testAnInstallThatTurnedDuckingOffKeepsItOff() {
+        let store = makeStore()
+        store.audioDuckingEnabled = false
+
+        XCTAssertFalse(
+            makeStore().audioDuckingEnabled,
+            "a written choice outranks the default on every later launch")
     }
 
     func testFreshInstall_seedSurvivesOnceTheWizardIsDone() {

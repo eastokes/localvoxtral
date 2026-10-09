@@ -55,27 +55,6 @@ enum TerminalScreenAXReader {
         let windowID: CGWindowID?
     }
 
-    /// One focused-window title read: the parsed marker plus the identity of
-    /// the window the title was read from. Same rationale as
-    /// `VisibleScreenRead.windowID`.
-    struct FocusedWindowMarkerRead: Sendable, Equatable {
-        let marker: ClaudeSessionMarker
-        let windowID: CGWindowID?
-    }
-    /// Absolute character cap on a screen read. A tall Ghostty window on a
-    /// 6K display is ~200×80 ≈ 16k characters, so this admits the full visible
-    /// screen with headroom while bounding both the AX payload we retain and
-    /// what a later caller could put in a prompt. Generous on purpose: the
-    /// downstream excerpt cap is the prompt-budget decision, this is the
-    /// safety ceiling.
-    ///
-    /// This bounds what a read may return into MEMORY for vocabulary matching,
-    /// which is local and free. It is emphatically NOT a prompt budget — a
-    /// rendered excerpt rides the grant `PolishContextBudget` allocates across
-    /// every context source for one request, which is an order of magnitude
-    /// smaller. `nonisolated` so non-isolated callers can compare against it.
-    nonisolated static let screenCharacterCap = 24_000
-
     /// AX messaging timeout for both the app element and the focused element.
     /// `AXUIElementSetMessagingTimeout` is per-element, and the app-element
     /// timeout does NOT inherit to elements copied out of it — hence both.
@@ -110,7 +89,7 @@ enum TerminalScreenAXReader {
         if let override = debugScreenReadOverride {
             // Canned text takes the same sanitization path as live text, so a
             // test cannot assert against a form production never produces.
-            guard let raw = override(pid), let text = sanitizedScreenText(raw) else { return nil }
+            guard let raw = override(pid), let text = TerminalScreenText.sanitizedScreenText(raw) else { return nil }
             return VisibleScreenRead(text: text, windowID: debugScreenWindowIDOverride?(pid))
         }
         // Under XCTest an unpinned read would query whatever the HOST's AX
@@ -125,68 +104,40 @@ enum TerminalScreenAXReader {
             return nil
         }
         guard let raw = copyFocusedTextAreaValue(applicationPID: pid),
-              let text = sanitizedScreenText(raw.text)
+              let text = TerminalScreenText.sanitizedScreenText(raw.text)
         else { return nil }
         return VisibleScreenRead(text: text, windowID: raw.windowID)
-    }
-
-    /// The marker Claude Code wrote into the focused window's title for `pid`,
-    /// or nil when there is no window, no title, no marker, or more than one
-    /// marker.
-    ///
-    /// This is the INBOUND half of the focus join (see `ClaudeMarkerPresentation`).
-    /// It reads `AXTitle`, not screen content: a title is a few dozen characters
-    /// the terminal already advertises, and reading it is what tells us whether
-    /// this pane is a Claude session at all. Distinct from `readVisibleScreen`
-    /// on purpose — this is the cheap question that gates the expensive answer.
-    ///
-    /// PID-pinned exactly like the screen read: the window is reached from
-    /// `AXUIElementCreateApplication(pid)` and the element's own PID is
-    /// re-verified before its title is trusted, so a recycled PID or a window
-    /// that changed owners yields nil instead of another app's title.
-    ///
-    /// Callers must treat nil as "we do not know", never as a cue to guess.
-    static func markerInFocusedWindowTitle(applicationPID pid: pid_t) -> FocusedWindowMarkerRead? {
-        #if DEBUG
-        if let override = debugWindowTitleOverride {
-            guard let marker = override(pid).flatMap({ ClaudeMarkerTitleParser.marker(inTitle: $0) })
-            else { return nil }
-            return FocusedWindowMarkerRead(
-                marker: marker, windowID: debugTitleWindowIDOverride?(pid)
-            )
-        }
-        if TerminalTargetDetector.isRunningUnderXCTest { return nil }
-        #endif
-        guard AXIsProcessTrusted() else { return nil }
-        guard let read = copyFocusedWindowTitle(applicationPID: pid),
-              let marker = ClaudeMarkerTitleParser.marker(inTitle: read.title)
-        else { return nil }
-        return FocusedWindowMarkerRead(marker: marker, windowID: read.windowID)
     }
 
     /// The identity of `pid`'s focused window, or nil when it cannot be
     /// established.
     ///
-    /// This exists for the TTY join: the marker read reports the window it
-    /// parsed the marker from, but a tty-resolved join never touches the
-    /// marker — the title has typically been clobbered by Claude Code's own
-    /// conversation title — so the window the user was focused on is
-    /// identified by this separate bounded AX read. Nil abstains at the
-    /// authorizer, exactly like a nil marker-read identity (review F2).
+    /// Nothing here reads what the window is CALLED. A window title is a
+    /// fought-over channel — Claude Code writes its own conversation titles,
+    /// herdr and cmux rewrite theirs — and no join arm consults one; this is
+    /// purely the identity that pairs a screen capture with the join that
+    /// authorized it, so a focus change between those two AX reads cannot pair
+    /// one window's screen with another window's session (review F2). Nil
+    /// abstains at the authorizer.
+    ///
+    /// PID-pinned exactly like the screen read: the window is reached from
+    /// `AXUIElementCreateApplication(pid)` and the element's own PID is
+    /// re-verified, so a recycled PID or a window that changed owners yields
+    /// nil instead of another app's identity.
     static func focusedWindowIdentity(applicationPID pid: pid_t) -> CGWindowID? {
         #if DEBUG
-        if let override = debugTitleWindowIDOverride { return override(pid) }
+        if let override = debugFocusedWindowIDOverride { return override(pid) }
         if TerminalTargetDetector.isRunningUnderXCTest { return nil }
         #endif
         guard AXIsProcessTrusted() else { return nil }
-        return copyFocusedWindowTitle(applicationPID: pid)?.windowID
+        return copyFocusedWindowIdentity(applicationPID: pid)
     }
 
-    /// The AX round trip for the title. Returns the focused window's `AXTitle`
-    /// and window identity, only if that window is still owned by `pid`.
-    private static func copyFocusedWindowTitle(
+    /// The AX round trip for the focused window's identity, only if that
+    /// window is still owned by `pid`.
+    private static func copyFocusedWindowIdentity(
         applicationPID pid: pid_t
-    ) -> (title: String, windowID: CGWindowID?)? {
+    ) -> CGWindowID? {
         let appElement = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(appElement, messagingTimeoutSeconds)
 
@@ -211,124 +162,19 @@ enum TerminalScreenAXReader {
             return nil
         }
 
-        var titleObject: AnyObject?
-        let titleStatus = AXUIElementCopyAttributeValue(
-            window,
-            kAXTitleAttribute as CFString,
-            &titleObject
-        )
-        guard titleStatus == .success, let title = titleObject as? String else { return nil }
-        return (title: title, windowID: windowID(ofWindow: window))
-    }
-
-    /// Sanitizes and caps a raw AX string. Split out so tests can exercise the
-    /// text rules without any AX involvement, and so the DEBUG seam's canned
-    /// text goes through exactly the same path as live text.
-    ///
-    /// Control scalars are stripped through the shared clipboard sanitizer
-    /// (newlines and tabs survive, so the grid's line structure does), then the
-    /// head is capped. Returns nil for text that is empty or whitespace-only —
-    /// a freshly cleared terminal is not context.
-    static func sanitizedScreenText(_ raw: String) -> String? {
-        // Chrome stripping needs trailing-trimmed lines to match, and can
-        // leave a blank run where the frame stood — hence compaction on both
-        // sides. Both passes are deterministic, so identical screens still
-        // sanitize identically (the reconcile comparison depends on that).
-        let sanitized = compactedGridWhitespace(
-            strippedIdleInputChrome(
-                compactedGridWhitespace(
-                    PolishContextClipboardReader.sanitizeControlCharacters(raw)
-                )
-            )
-        )
-        guard !sanitized.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return nil
-        }
-        return sanitized.count > screenCharacterCap
-            ? String(sanitized.prefix(screenCharacterCap))
-            : sanitized
-    }
-
-    /// Claude Code's idle input frame: a box-drawing separator row, a bare `❯`
-    /// prompt, a second separator, and optionally the shortcut-hint row under
-    /// it (`⏵⏵ auto mode on …`). With the input EMPTY the frame is pure
-    /// chrome — no term to ground, the hint row is the pane's one perpetually
-    /// animating line, and rendered into a prompt it reads as stray dividers
-    /// (field report 2026-07-21). A frame with typed text (`❯ fix the bug`)
-    /// is content and is kept. Lone separator rows are also kept: Claude Code
-    /// uses the same rule between conversation turns, and only the exact
-    /// empty-input triple is chrome. The match is STRUCTURAL, not semantic:
-    /// content that reproduces the exact triple (a heredoc or pasted mock of
-    /// this very UI) is stripped too — accepted, it is indistinguishable by
-    /// construction. The hint row is matched by its `\u{23F5}\u{23F5}` prefix
-    /// because its text varies with the mode cycle.
-    static func strippedIdleInputChrome(_ text: String) -> String {
-        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
-        var kept: [Substring] = []
-        var index = 0
-        while index < lines.count {
-            if index + 2 < lines.count,
-               isInputFrameSeparator(lines[index]),
-               lines[index + 1] == "❯",
-               isInputFrameSeparator(lines[index + 2])
-            {
-                index += 3
-                if index < lines.count,
-                   lines[index].drop(while: { $0 == " " }).hasPrefix("⏵⏵")
-                {
-                    index += 1
-                }
-                continue
-            }
-            kept.append(lines[index])
-            index += 1
-        }
-        return kept.joined(separator: "\n")
-    }
-
-    private static func isInputFrameSeparator(_ line: Substring) -> Bool {
-        line.count >= 10 && line.allSatisfy { $0 == "─" }
-    }
-
-    /// The AX grid pads rows toward the pane width and reports every blank
-    /// viewport row, so a mostly-empty pane arrives as kilobytes of spaces
-    /// (field report 2026-07-20: an idle pane rendered ~40 blank padded lines
-    /// into the polish prompt). Trailing whitespace carries no term to ground
-    /// and a run of blank rows no structure worth more than one line, so both
-    /// are compacted — and BEFORE the cap, where padding could otherwise evict
-    /// real text from the capped head. Applied at the single sanitization seam
-    /// so matching, start/stop comparison, and the rendered excerpt all see
-    /// the same form (compaction is deterministic: identical screens stay
-    /// identical).
-    static func compactedGridWhitespace(_ text: String) -> String {
-        var lines: [Substring] = []
-        var pendingBlank = false
-        for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
-            var trimmed = line
-            // Every trailing whitespace scalar except newline is padding: plain
-            // space/tab, NBSP (U+00A0, which grids use for padding that must not
-            // wrap), and the wider Unicode space separators (U+2000–U+200A,
-            // U+3000) a terminal may emit. `isWhitespace` minus newline is that
-            // class — we split on "\n" already, so a line-internal newline is
-            // out of scope and preserved. A line that is ALL such whitespace
-            // trims to empty and is treated as blank below, so blank-line
-            // detection widens with the trim, at no extra cost.
-            while let last = trimmed.last, last.isWhitespace, !last.isNewline {
-                trimmed = trimmed.dropLast()
-            }
-            if trimmed.isEmpty {
-                // Leading and trailing blank runs vanish entirely (pending is
-                // only flushed when a later non-blank line arrives).
-                pendingBlank = !lines.isEmpty
-            } else {
-                if pendingBlank {
-                    lines.append("")
-                    pendingBlank = false
-                }
-                lines.append(trimmed)
-            }
-        }
-        return lines.joined(separator: "\n")
+        // No `kAXTitle` round trip. No JOIN reads a title (the arm that did
+        // was removed 2026-09-05), and requiring one here would make identity
+        // depend on a string this code does not consult. The one title read
+        // left in the app is a different feature on a different gate —
+        // `TerminalWorkingDirectoryResolver.windowTitle(forApplicationPID:)`,
+        // which mines a terminal title for a git root under
+        // `repoVocabularyEnabled` and decides no join.
+        // Consequence, stated because it is a change:
+        // a focused window with no readable title now yields an identity where
+        // it used to abstain. That can only make the authorizer's
+        // join-window == capture-window comparison MORE precise — it compares
+        // two established ids and never treats an unknown as a match.
+        return windowID(ofWindow: window)
     }
 
     /// The AX round trip. Returns the raw (unsanitized) `AXValue` string of the
@@ -448,16 +294,12 @@ enum TerminalScreenAXReader {
     /// unit tests; mirrors `TerminalTargetDetector.debugFocusedElementProbeOverride`.
     static var debugScreenReadOverride: ((pid_t) -> String?)?
 
-    /// Test seam for the focused window's raw title. Canned titles take the
-    /// same parse path as live ones, so a test cannot assert against a form
-    /// production never produces.
-    static var debugWindowTitleOverride: ((pid_t) -> String?)?
-
     /// Window-identity seams, one per read path so a test can script the F2
-    /// race: the screen read and the title read landing on DIFFERENT windows
-    /// of one process. Defaulting to nil mirrors live identity failure, which
-    /// every consumer must treat as "not provably the same window".
+    /// race: the screen read and the focused-window read landing on DIFFERENT
+    /// windows of one process. Defaulting to nil mirrors live identity
+    /// failure, which every consumer must treat as "not provably the same
+    /// window".
     static var debugScreenWindowIDOverride: ((pid_t) -> CGWindowID?)?
-    static var debugTitleWindowIDOverride: ((pid_t) -> CGWindowID?)?
+    static var debugFocusedWindowIDOverride: ((pid_t) -> CGWindowID?)?
     #endif
 }

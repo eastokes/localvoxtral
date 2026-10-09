@@ -32,6 +32,47 @@ final class DictationSessionRecord {
     /// content — just character counts. Additive optional field: SwiftData
     /// lightweight-migrates existing stores, and old records decode as nil.
     var polishContextSummary: String?
+    /// The joined coding-agent session's project, for `localvoxtral history
+    /// --project` (#721): its directory or `remote:<label>`
+    /// (`LearnedTermProjectResolver`), and the name a person would use. Nil
+    /// when the dictation joined no session. Additive optional fields, like
+    /// the two above.
+    var projectKey: String?
+    var projectName: String?
+    /// `claude`, `vibe`, `opencode`: the agent whose session it joined.
+    var joinedAgent: String?
+    /// Where a quick capture went (#725): "Inbox" when saved, then the
+    /// project it was routed to, then "Filed in owner/name". Nil for every
+    /// other dictation. Additive optional field, like those above.
+    var quickCaptureDestination: String?
+
+    /// `outputMode` of a quick capture, which is never inserted anywhere.
+    static let quickCaptureOutputMode = "quickCapture"
+
+    /// Whether the user erased the insertion within seconds of it
+    /// (`EditSignalOutcome`: `edited`, `clean`, `superseded`), copied from the
+    /// diagnostic record when its watch window closes. Nil when nothing was
+    /// watched: records off, Live Auto-Paste, a failed insertion, or an older
+    /// build. Additive optional field, like the ones above.
+    var editOutcome: String?
+
+    /// The prompt tokens the dictation's polish request sent, as the backend
+    /// reported them. Nil when no polish answered or the backend reported no
+    /// usage. Additive optional field, like the ones above.
+    var polishPromptTokens: Int?
+
+    /// When the user stopped the dictation, so `finishedAt` minus this is the
+    /// stop-to-commit time: the final transcript, then the polish. Set by the
+    /// Overlay Buffer commit; nil for other paths and older builds.
+    /// Additive optional field, like the ones above.
+    var stoppedAt: Date?
+
+    /// Who answered the polish request (`UsageEntry.Backend`: `mistral`,
+    /// `bundledHelper`, `userServer`) and the model id it named. Never the
+    /// endpoint URL. Nil when no polish request went out. Additive optional
+    /// fields, like the ones above.
+    var polishBackend: String?
+    var polishModel: String?
 
     init(
         id: UUID = UUID(),
@@ -47,7 +88,12 @@ final class DictationSessionRecord {
         status: DictationSessionStatus,
         commitSucceeded: Bool,
         polishProfile: String? = nil,
-        polishContextSummary: String? = nil
+        polishContextSummary: String? = nil,
+        projectKey: String? = nil,
+        projectName: String? = nil,
+        joinedAgent: String? = nil,
+        quickCaptureDestination: String? = nil,
+        editOutcome: String? = nil
     ) {
         self.id = id
         self.startedAt = startedAt
@@ -63,5 +109,10 @@ final class DictationSessionRecord {
         self.commitSucceeded = commitSucceeded
         self.polishProfile = polishProfile
         self.polishContextSummary = polishContextSummary
+        self.projectKey = projectKey
+        self.projectName = projectName
+        self.joinedAgent = joinedAgent
+        self.quickCaptureDestination = quickCaptureDestination
+        self.editOutcome = editOutcome
     }
 }

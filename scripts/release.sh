@@ -14,31 +14,207 @@ set -euo pipefail
 #   ./scripts/release.sh 1.2.3-rc.1 <branch>  # prerelease from a branch,
 #                                             # installable for hand-testing
 #                                             # before the branch merges
+#   ./scripts/release.sh daily                # what the 03:15 UTC cron does:
+#                                             # a minor release of the newest
+#                                             # main commit the e2e dictation
+#                                             # check passed on, if any
+#   ./scripts/release.sh nightly              # a prerelease of main's head,
+#                                             # on demand, no e2e gate
+#   ./scripts/release.sh rehearse [target] [ref]
+#                                             # every gate, no tag, no
+#                                             # release: the artifacts land on
+#                                             # the run instead. Any ref.
+#                                             # target defaults to patch and
+#                                             # may be daily or nightly.
+#   ./scripts/release.sh publish <tag>        # finish a release whose
+#                                             # publish step failed after
+#                                             # tagging, from that run's
+#                                             # artifact: no rebuild
+#   ./scripts/release.sh --dry-run ...        # check, print what would be
+#                                             # dispatched, dispatch nothing
+#
+# A stable release (every form but daily, nightly and rehearse) needs the
+# e2e dictation check to have passed on the release commit. That check
+# (scripts/e2e-dictation.sh) is the only one where the packaged app dictates
+# into another app's window; it holds the owner's Mac and keyboard, so it
+# runs here, when the owner is at the Mac, rather than on every PR (#574).
+# Run it with the Mac unlocked:
+#   gh workflow run ui-smoke.yml --ref <ref>
+# A daily release applies the same rule inside the workflow
+# (scripts/ci/daily-release-plan.sh), which picks the commit, so this script
+# does not check it.
+#
+# The channels: stable and daily follow GitHub's /releases/latest; stable is
+# cut by hand, daily by the cron. nightly is a prerelease of main that never
+# touches that pointer. Same pipeline, same gates.
+
+DRY_RUN=false
+if [[ "${1:-}" == "--dry-run" ]]; then
+  DRY_RUN=true
+  shift
+fi
+
+if [[ "${1:-}" == "publish" ]]; then
+  TAG="${2:-}"
+  if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+    echo "Usage: $0 [--dry-run] publish <tag>   (finish a release whose publish step failed)" >&2
+    exit 1
+  fi
+  # A release run whose publish failed after the Tag step uploads its
+  # notarized assets as this artifact; a run that failed earlier made no tag
+  # and has nothing to finish.
+  ARTIFACT="localvoxtral-release-$TAG"
+  RUN_ID="$(gh api "repos/{owner}/{repo}/actions/artifacts?name=$ARTIFACT&per_page=100" \
+    --jq '[.artifacts[] | select(.expired | not)][0].workflow_run.id // empty')"
+  if [[ -z "$RUN_ID" ]]; then
+    echo "No unexpired $ARTIFACT artifact. Only a release run that failed after tagging uploads one, and it expires after 14 days." >&2
+    exit 1
+  fi
+  if $DRY_RUN; then
+    echo "Dry run: would publish $TAG from run $RUN_ID's $ARTIFACT artifact"
+    exit 0
+  fi
+  ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd -P)"
+  DIR="${LV_RELEASE_PUBLISH_DIR:-$ROOT_DIR/.build/release-publish/$TAG}"
+  rm -rf "$DIR"
+  mkdir -p "$DIR"
+  echo "Downloading $ARTIFACT from run $RUN_ID"
+  gh run download "$RUN_ID" -n "$ARTIFACT" -D "$DIR"
+  GITHUB_REPOSITORY="${GITHUB_REPOSITORY:-$(gh repo view --json nameWithOwner --jq .nameWithOwner)}" \
+    "$ROOT_DIR/scripts/ci/publish-release.sh" "$TAG" "$DIR" "$DIR/localvoxtral-$TAG.release-notes.md"
+  rm -rf "$DIR"
+  # The run's cask job never ran, so pin the tap here, as it would have.
+  if [[ "$TAG" != *-* ]]; then
+    gh workflow run cask.yml -f "tag=$TAG"
+    echo "Dispatched cask.yml to pin the Homebrew tap to $TAG"
+  fi
+  echo "Done. Release page: https://github.com/T0mSIlver/localvoxtral/releases/tag/$TAG"
+  exit 0
+fi
+
+PUBLISH=true
+if [[ "${1:-}" == "rehearse" ]]; then
+  PUBLISH=false
+  shift
+fi
 
 ARG="${1:-patch}"
 REF="${2:-main}"
 
+DISPATCH_ARGS=()
 case "$ARG" in
+  daily|nightly)
+    DISPATCH_ARGS=(-f "channel=$ARG") ;;
   patch|minor|major)
-    FIELD="bump"; VALUE="$ARG" ;;
+    DISPATCH_ARGS=(-f channel=stable -f "bump=$ARG") ;;
   *)
     if [[ "$ARG" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
-      FIELD="version"; VALUE="$ARG"
+      DISPATCH_ARGS=(-f channel=stable -f "version=$ARG")
     else
-      echo "Usage: $0 [patch|minor|major|X.Y.Z|X.Y.Z-rc.N [ref]]" >&2
+      echo "Usage: $0 [--dry-run] [patch|minor|major|X.Y.Z|X.Y.Z-rc.N [ref]|daily|nightly] | $0 [--dry-run] rehearse [patch|minor|major|X.Y.Z|X.Y.Z-rc.N|daily|nightly] [ref]" >&2
       exit 1
     fi
     ;;
 esac
+DISPATCH_ARGS+=(-f "publish=$PUBLISH")
 
-echo "Dispatching release ($FIELD=$VALUE, ref=$REF)..."
-gh workflow run "Release App" --ref "$REF" -f "$FIELD=$VALUE"
-sleep 5
-RUN_ID="$(gh run list --workflow "Release App" --limit 1 --json databaseId --jq '.[0].databaseId')"
+if [[ ( "$ARG" == "daily" || "$ARG" == "nightly" ) && "$PUBLISH" == "true" && "$REF" != "main" ]]; then
+  echo "$ARG releases publish from main only. Use 'rehearse $ARG $REF' to exercise the pipeline from that ref." >&2
+  exit 1
+fi
+
+# Must match the step name in ui-smoke.yml, as scripts/ci/ui-smoke-guard.sh
+# does: the step runs only when every scenario was scored and passed. The
+# dictation step itself also concludes success when the Mac could not run it.
+E2E_STEP="E2E dictation scored"
+
+GATE_E2E=false
+if [[ "$PUBLISH" == "true" && "$ARG" != "daily" && "$ARG" != "nightly" ]]; then
+  GATE_E2E=true
+fi
+RELEASE_SHA=""
+if $GATE_E2E; then
+  # Encoded: a branch name may hold '#', '&' or '?'.
+  ref_uri="$(jq -rn --arg r "$REF" '$r | @uri')"
+  RELEASE_SHA="$(gh api "repos/{owner}/{repo}/commits/$ref_uri" --jq '.sha')"
+  runs="$(gh api "repos/{owner}/{repo}/actions/workflows/ui-smoke.yml/runs?head_sha=$RELEASE_SHA&status=completed&per_page=100" \
+    --jq '.workflow_runs[].id')"
+  scored_run=""
+  for id in $runs; do
+    conclusion="$(gh api "repos/{owner}/{repo}/actions/runs/$id/jobs" \
+      --jq "[.jobs[].steps[] | select(.name == \"$E2E_STEP\") | .conclusion] | first // empty")"
+    if [[ "$conclusion" == "success" ]]; then
+      scored_run="$id"
+      break
+    fi
+  done
+  if [[ -z "$scored_run" ]]; then
+    echo "Refused: the e2e dictation check has not passed on $REF at ${RELEASE_SHA:0:9}." >&2
+    echo "Run it with the Mac unlocked, then release again:" >&2
+    echo "  gh workflow run ui-smoke.yml --ref $REF" >&2
+    exit 1
+  fi
+  echo "e2e dictation check: passed on ${RELEASE_SHA:0:9} in UI Smoke run $scored_run"
+else
+  case "$ARG" in
+    daily) echo "e2e dictation check: the workflow picks a commit that passed it" ;;
+    *) echo "e2e dictation check: not required for a nightly or a rehearsal" ;;
+  esac
+fi
+
+if $DRY_RUN; then
+  echo "Dry run: would dispatch Release App ($ARG, ref=$REF, publish=$PUBLISH)"
+  exit 0
+fi
+
+if [[ "$PUBLISH" == "true" ]]; then
+  echo "Dispatching release ($ARG, ref=$REF)..."
+else
+  echo "Dispatching release REHEARSAL ($ARG, ref=$REF) — no tag, no release..."
+fi
+# Our run is the one on this ref that was not there before the dispatch: the
+# newest run can be the 03:15 cron's or an earlier dispatch's while ours has
+# not registered yet.
+list_runs() {
+  gh run list --workflow "Release App" --branch "$REF" --limit 20 --json databaseId --jq '.[].databaseId'
+}
+RUNS_BEFORE="$(list_runs)"
+gh workflow run "Release App" --ref "$REF" "${DISPATCH_ARGS[@]}"
+RUN_ID=""
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+  sleep 5
+  RUN_ID="$(list_runs | grep -vxF -f <(printf '%s\n' "$RUNS_BEFORE") | head -n 1 || true)"
+  [[ -n "$RUN_ID" ]] && break
+done
+if [[ -z "$RUN_ID" ]]; then
+  echo "Dispatched, but no new Release App run on $REF appeared within a minute. Find it with:" >&2
+  echo "  gh run list --workflow 'Release App' --branch $REF" >&2
+  exit 1
+fi
+if $GATE_E2E; then
+  # The ref may have moved between the check and the dispatch. The workflow
+  # gates for minutes before it tags, so cancelling now leaves no tag.
+  run_sha="$(gh run view "$RUN_ID" --json headSha --jq '.headSha')"
+  if [[ "$run_sha" != "$RELEASE_SHA" ]]; then
+    echo "Refused: $REF moved to ${run_sha:0:9} after the e2e dictation check passed on ${RELEASE_SHA:0:9}." >&2
+    if gh run cancel "$RUN_ID"; then
+      echo "Cancelled run $RUN_ID before it tagged anything. Run the check on the new head, then release again." >&2
+    else
+      echo "Could not cancel run $RUN_ID; cancel it by hand before it tags: gh run cancel $RUN_ID" >&2
+    fi
+    exit 1
+  fi
+fi
 echo "Watching run $RUN_ID (Ctrl+C detaches; the release continues remotely)"
 gh run watch "$RUN_ID" --exit-status
-if [[ "$FIELD" == "version" ]]; then
-  echo "Done. Release page: https://github.com/T0mSIlver/localvoxtral/releases/tag/v$VALUE"
+if [[ "$PUBLISH" != "true" ]]; then
+  echo "Rehearsal done. Artifacts: https://github.com/T0mSIlver/localvoxtral/actions/runs/$RUN_ID"
+elif [[ "$ARG" == "nightly" || "$ARG" == "daily" ]]; then
+  # A daily run with nothing to ship ends green without a release; its
+  # summary says why.
+  echo "Done. Releases: https://github.com/T0mSIlver/localvoxtral/releases (run $RUN_ID's summary says what shipped)"
+elif [[ "$ARG" =~ ^[0-9] ]]; then
+  echo "Done. Release page: https://github.com/T0mSIlver/localvoxtral/releases/tag/v$ARG"
 else
   echo "Done. Release page: https://github.com/T0mSIlver/localvoxtral/releases/latest"
 fi

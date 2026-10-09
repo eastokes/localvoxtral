@@ -2,7 +2,7 @@
 
 Read this in full before changing text insertion, LLM polishing, or anything
 in the Claude Code context path (`Sources/ClaudeContext*`,
-`Sources/localvoxtral/ClaudeContext/`, `integrations/claude-code/`, the
+`Sources/localvoxtral*/ClaudeContext/`, `integrations/claude-code/`, the
 remote listener/enrollment/forward code). The trust boundaries here are
 load-bearing and non-obvious; several of them are the residue of measured
 failures, with the evidence cited inline.
@@ -23,29 +23,1218 @@ there is not.
   `testPrePopulatedFieldTextCannotRescueTheTrailingSpace`). Single-component
   tokens naming an EXISTING absolute path (`/tmp `) abstain via a
   filesystem-existence seam; non-existing ones (`/compact`) stay commands.
+- **An Overlay Buffer commit starts with a space only when it continues
+  the unsent prompt** (#802, owner ruling). The commit text is trimmed and
+  the app cannot read the field, so the evidence is the join: the previous
+  commit went to the same app pid and joined session, and that session's
+  submit count (`ClaudeSessionSnapshot.promptsSubmitted`, every
+  `UserPromptSubmit` with or without text) has not moved since. A failed
+  commit, one the spoken trigger sent, one with no join, or a Live Auto-Paste
+  dictation clears it. "Send that to <name>" into a terminal pane is judged
+  the same way against the pane's pid and the named session; its Return, or
+  a failed typing, clears a landing in that session and no other (#1480).
+  A route or mod refusal that answers late clears only the landing of the
+  dictation that handed its text off, by its start generation: a later
+  commit to the same session keeps its continuation space (#1660).
+  Anything looser puts a space in front of `/compact`
+  in a fresh prompt. No trailing space after a commit. Where the joined
+  session's mod read its prompt box at the stop (a polished commit into a
+  local Claude Code session, below), the box decides instead: a space only
+  when the cursor follows a character that is not whitespace, so text typed
+  by hand is continued too, and a box cleared without a submit takes
+  `/compact` as written. An empty answer from a Claude Desktop session does
+  not decide, since a surface that draws its own prompt box gives the mod
+  `""` whatever it holds (the Code tab binds none: a fill there answers
+  `no_composer`, #1643); there the guess above still runs, as it does for
+  an unpolished commit, a mod that does not answer, and every other agent.
+- **The prompt draft is the person's unsent words, read only from the
+  joined session's own mod** (#1406). At the stop of a polished Overlay
+  Buffer commit, `SessionContextResolver.promptDraft` asks the mod of the
+  joined session for `$.prompt.read`, only for a Claude Code session on this
+  Mac joined by an exact mechanism (tty, local herdr pane, cmux surface,
+  Claude Desktop; `ClaudePromptDraft.isReadable`) and still live, with a
+  1.5 s cap that the repository reads overlap. The reply names its session
+  and is dropped for any other; the mod sends at most 3,000 UTF-16 units
+  before the cursor and 1,000 after. The draft reaches polish only through
+  `claudeSessionTextIfEnabled`, under the session block's three gates, and
+  leaves with it when consent is withdrawn at the stop; it leads that block,
+  one line per side of the cursor behind `ClaudePromptDraft`'s labels. The
+  leading space reads it whatever the context settings say, since that never
+  leaves the Mac. The app logs its length only. A diagnostic record takes it
+  out as it takes out the prior prompt (`DiagnosticRecordRedaction.Withheld`):
+  behind its labels, line by line, and soft-wrapped on the screen; lines
+  under eight characters that the screen shows outside the label stay, as
+  for the prior prompt. The draft is read at the stop, and the commit lands
+  after the polish: words typed in between are not seen.
+- **A mid-dictation reconnect resumes the session; it never replays it.**
+  When the realtime socket drops without the user asking
+  (`DictationSessionController+Reconnect.swift`, #380), the mic keeps recording and the
+  socket is retried on a bounded backoff. Four things hold that apart from a
+  session restart, and each is load-bearing:
+  (1) the run dials the endpoint/key/model snapshot latched at session start
+  (`sessionRealtimeConfiguration`), never a fresh read of Settings — a backend
+  mode flipped mid-dictation would otherwise carry this session's audio, and
+  its bearer token, to a server it never agreed to;
+  (2) it sends no commit of its own — the reconnected backend holds no audio
+  buffer to commit. The one commit after a reconnect is a stop's final commit,
+  sent behind the replayed gap;
+  (3) the partial in flight is promoted into the committed transcript at the
+  drop, so the reconnected backend — which starts with an empty transcript of
+  its own — can only produce text Live Auto-Paste has never typed. There are no
+  backspaces in the insertion path, so anything typed twice stays typed twice;
+  (4) every resume point re-checks `reconnectRunID`, which every cancel, abort
+  and stop without finalization bumps. A socket that opens a moment after them
+  finds a run that no longer owns the session and changes nothing. A stop that
+  finalizes keeps the run instead (#1582): once its socket is ready the gap is
+  flushed and the stop's final commit follows, and the stop's watchdog gives
+  the run no longer than a finalization may take. A run that does not get
+  through ends the stop with the text received before the drop, and the status
+  says its end may be missing. So does any stop that ends on the idle rule,
+  the timeout or a closed socket without the backend's answer to its final
+  commit, once the backend has shown it sends finals: one this session, or an
+  answered stop on the same endpoint (#1659). A backend that only streams
+  deltas ends every stop on the idle rule, silently.
+  For the bundled helper the run spends no attempt while speechd reads
+  `.starting` (#1583): the helper binds its port only once its model is
+  loaded, so every connect meanwhile is refused at once. That wait is bounded
+  by `managedHelperStartBudget`, inside the buffer's retention.
+  The audio spoken into the gap is kept, not dropped: the run cancels the
+  send loop so the chunks pile up in `AudioChunkBuffer` and the restarted loop
+  replays them once the new server session is ready (#1457): its handshake,
+  or the compatibility fallback, has opened the client's send gate. The
+  WebSocket upgrade alone is not enough, because audio handed over before the
+  handshake waits in the client and dies with a socket that closes first; that
+  close fails the attempt inside the run's budget instead of ending the run.
+  Audio a socket closed on before sending it (a context rollover's carried
+  audio, queued for a replacement that failed before its handshake) never
+  reached a server: the client hands it back (`takeUnsentAudio`) and the
+  session puts it ahead of the buffer (#1672). A stop that finds the socket
+  already closed, before its `.disconnected` reaches the main queue, keeps the
+  refused flush in the buffer and reconnects as if the event had come first
+  (#1673).
+  The buffer's retention cap is sized above
+  `RealtimeReconnectPolicy.worstCaseDuration`, so a run that reconnects within
+  its retry cap loses nothing — past the cap the OLDEST audio goes first.
+  What IS lost either way is audio that was already sent when the socket died
+  but whose transcript never came back, and the words at the cut, which the new
+  session hears mid-utterance.
+- **Every realtime event names the socket that raised it, and the session
+  refuses every other one.** `RealtimeEvent` still says only what happened, so
+  the identity rides beside it: `connect()` stamps a
+  `RealtimeConnectionGeneration` on the socket it opens, `emit(_:from:)`
+  carries it in the same call as the event (a parallel channel could be dropped
+  or reordered; the main-queue FIFO only orders what it is handed together),
+  and `DictationSessionController.handle(event:from:)` drops anything not stamped with
+  the generation the session is on. That one comparison is the whole check —
+  nothing downstream re-derives which socket it is hearing (#417). Three things
+  make it hold:
+  (1) the stamp is captured in `listenForMessages`, under the same lock as the
+  `socketState == .connected && webSocketTask === task` admission check, and
+  threaded down to every emit the frame produces. Re-reading it at emit time
+  would defeat the point: the whole failure is a frame admitted by a socket that
+  is closed and replaced before the emit runs, which would then come out wearing
+  the LIVE socket's name;
+  (2) generations come from one process-wide counter, so the idle client's
+  retired socket cannot answer to the live client's name after a mode switch;
+  (3) the session is on `.none` whenever it holds no socket — before a dial,
+  from a `.disconnected` until the reconnect's next `connect()`, and after a
+  cancel. That window is what refuses a straggler emitted before the
+  generation has moved on;
+  (4) stamping the events is only HALF the job, and the half a reviewer had to
+  find (Codex review of #448). A frame handler also mutates handshake and
+  finalization state, under a different lock acquisition from the one that
+  admitted the frame — so every such mutation re-checks the frame's generation
+  through `isCurrentConnectionLocked`, inside the lock that makes it. Applied
+  to the socket that REPLACED it, a stale `session.created` marks the new
+  socket handshaked and drains its pending queue onto the wire ahead of its own
+  `session.update`, and a stale `transcription.done` clears a commit gate the
+  new socket is still waiting on. Neither shows up as a wrong event, so the
+  view model's check cannot see either. `RealtimeAPIWebSocketClient`'s
+  session-ready timer carries the same re-check: cancelling a
+  `DispatchSourceTimer` does not unqueue a handler already on its way.
+  This replaced three guards that stood in for the missing identity (Codex
+  review of #415): the `.disconnected` ignored when
+  `activeRealtimeClient.isConnected`, and the wholesale refusal of transcript
+  events while a reconnect run is in flight. What did NOT go is
+  `cancelRealtimeReconnect()` closing the socket its attempt opened: the stamp
+  refuses everything that socket SAYS, but a WebSocket left in `connecting`
+  still transmits the audio the stop flushed into its pending queue, and only
+  closing it stops that.
+  A context rollover (#1139) is the one socket swap the client makes on its
+  own. The retiring socket raises `.sessionRolledOver(to:)` after its last
+  transcript and before the new socket is resumed, so the FIFO hands the
+  session its new name before that socket can say anything; from there the
+  retiring socket is refused like any other retired one.
 - **Live Auto-Paste holds back the tail of the transcript.** Replacements are
   applied before typing (nothing is ever un-typed — there are no backspaces in
   the insertion path, and terminals can't support them: field bug 2026-07-06),
   so `LiveHoldBackReplacementStream` withholds the trailing partial word plus
   any suffix that is still a live prefix of a dictionary rule. Nothing is lost
   (`flushRemainder()` releases it at stop) but it costs latency of appearance.
+- **The spoken send trigger withholds whole segments in Live Auto-Paste.**
+  "send it" / "send now" at the end of a segment must be cut before it is
+  typed, and nothing typed can be taken back, so with the opt-in on in an
+  app where Return submits NO partial is typed: each segment is typed at its final (or at the
+  promotion a stop or dropped socket does), then Return is pressed. That is
+  the owner's accepted cost (2026-09-24), shown next to the toggle. The
+  Return is pressed only in the PID the session pinned, only while that PID
+  is frontmost (it never activates an app for a Return; the one exception
+  is the named session of "Send that to <name>" below), never under Secure
+  Keyboard Entry, and only once the hold-back stream has released every
+  word — a Return ahead of the last word would submit half a prompt. Every
+  Live decision is taken when it is needed, from the app frontmost THEN
+  (by bundle ID only, on `ReturnSubmitsAppList`: every terminal plus Claude
+  Desktop, whose prompt box sends on Return but which is not a terminal,
+  #660); nothing sampled at session start or connect
+  time takes part, because focus can move in between (Codex round 2 on #494:
+  a verdict from before the connect and a PID from audio start sent both
+  text and Return to an editor). A segment is withheld only if an app on the
+  list is frontmost at its first insertion. Live text goes to whatever has focus, so
+  `TextInsertionService` records the frontmost PID at every live insertion;
+  the Return goes to the frontmost app only when every one since the
+  last Return SENT is that PID (an unreadable one, or one made under Secure
+  Keyboard Entry, which swallows posted keys while reporting success, counts
+  as elsewhere). The Return is decided before the segment is typed, and the
+  trigger is cut only when it will be sent; otherwise the final is typed
+  whole. The
+  record is cleared only by a Return sent or a new session, never by a
+  refusal: once text landed elsewhere, the trigger does nothing for the rest
+  of that dictation. A pid cannot tell two tabs of one terminal apart, nor
+  two Claude Desktop sessions (#1354), so when the words are for a known
+  session (the one a go-to brought forward with `.focused`, else the joined
+  one) whose pane can be read back, the Return also waits for that read-back,
+  later segments queued behind it as behind a go-to; a pane that no longer
+  shows the session types the final whole and ends the trigger for the
+  dictation. After an `.unverified` go-to there is no Return. With no such
+  session (no join, or a plain ssh or cmux one), the pid is the only check
+  and a same-terminal tab switch goes unseen. Only a non-empty backend final can trigger; an empty
+  final or a promotion types the merged text as text. The accumulator's
+  merge is never parsed: it keeps partial words the final dropped and glues
+  a disagreeing partial onto it, and either can read as a trigger the final
+  does not hold.
+  `SendNowResubmitLatch` refuses a submission equal to the previous one until
+  a non-submitting final comes between: no backend names its segments, and
+  partials cannot tell a repeat from a straggler, so "send it" twice in a row
+  presses Return once. In Overlay Buffer the trigger is cut from the raw
+  transcript before the dictionary and the polisher; the target qualifies
+  only by its own bundle ID on `ReturnSubmitsAppList` (the AX probe reads the
+  element focused NOW, which need not be the commit target's), and the Return
+  follows only a commit that reported `.succeeded`.
+  A dictation joined to a local Claude Code session whose mod is attached
+  (#1644) is sent by the mod instead (`send`): no key, so neither focus nor
+  Secure Keyboard Entry gates it. It reaches the session the dictation
+  joined; the one other session it reaches is the one "Send that to
+  <name>" names (#1693, below). The mod fills at the cursor, then submits the
+  box's whole text as the person's own (`$.prompt.submit` with `asUser`)
+  and empties the box, so a typed draft goes with it and nothing is sent
+  twice. A box with a paste or image placeholder, an `@` mention, or a
+  leading `/` or `!` is refused unchanged, since a plugin's submit sends
+  those as plain text. A plugin's submit resolves only once a running turn
+  ends (measured on Claude Code 2.1.287), so the mod answers `queued` when a
+  main-loop turn is running or the submit has not entered within 1.5 s; the
+  popover then says the prompt runs after the turn, not that it was sent. A
+  submit a hook drops puts the text back in the box and answers not
+  submitted, only while the process is still in the session it was sent
+  from (#1802): after a `/clear` it never reaches the new session's box. A
+  box that refuses it back (a dialog) is tried again a second apart for two
+  minutes, and the reply says `not_restored`, which the popover reports as
+  not in the box (#1803); a text the box never took back, or one whose
+  session the process left, goes on the clipboard with a toast. The mod
+  makes every write to the box one at a time, in the order the app's
+  messages arrived: fills, appends, a send's read, fill and emptying, and
+  its put-back (#1804). The submit's wait for a running turn is outside
+  that order, so a later fill is never emptied by an earlier send. A
+  refusal, or a request the mod never got, is typed under the
+  fill rule below and followed by Return under this bullet's gates, judged
+  then; an unanswered one is kept, with no Return. A channel that closed
+  between the stop and the commit sends by Return under the same gates.
+- **An Overlay Buffer commit that waited types only into the pane it was
+  for** (#1056, #1668, #1712). A pid cannot tell two tabs of one terminal apart,
+  nor two Claude Desktop sessions, so as the last await before the keys
+  the focused pane is read back (`SessionNavigator.focusedPaneShows`): the
+  pane Tab picked, after the polish and after the second pass; with none
+  picked, the joined session's after the polish or a second pass with no
+  polish (#1712), when keys carry the commit (no relay or mod takes it) into the joined app and its pane can
+  be read back (any route but `.unsupported`). A pane that no longer shows the session gets nothing:
+  the text is saved not inserted; a picked pane's goes on the clipboard
+  only with History off (#1546), a joined one's always, as a commit the
+  keys could not make. With no join, or a plain ssh or cmux one, the pid
+  is the only check and a same-terminal tab switch goes unseen. The relay
+  and the mod reach the session by id, whatever pane is in front.
+- **A voice stop is the stop key, never a second commit path** (#839).
+  An Overlay Buffer dictation whose words (settled segments plus the
+  partial in flight: the Mistral API sends no final before the stop) end in
+  a send phrase, followed by the user's `SpokenStopWait` (3 s unless set,
+  #1009) with no new words, calls `stopDictation` like the key; the stop's commit then
+  cuts the phrase and sends as above. It arms only when the commit would
+  send (`planOverlaySpokenSend`, asked again when the timer fires), so a
+  phrase the commit would keep as text never ends the dictation. A held
+  dictation never arms: its release is the stop, and a stop while the key
+  is down would leave a release with nothing to stop (#840). A quick
+  capture stops the same way, saves without the phrase and presses
+  nothing. The 3 s default is measured, not guessed: on the owner's 138
+  dictations with audio, 5.6 % of speech pauses reach 3 s and the one
+  mid-sentence "send it" was followed by 2.4 s; a false stop sends half a
+  prompt, a late one costs a key press. No choice goes under 1 s: streaming
+  ASR delivers words 0.5–1 s behind speech, so a shorter wait can fire
+  before the rest of the sentence arrives. The user's phrase list
+  (`SendTriggerPhrases`) refuses one common word and anything over four
+  words, and a stored list that no longer validates loads as the default.
+- **A stop phrase ends only the joined session's turn, and never by a
+  key** (#1696; owner ruling 2026-10-04). An Overlay Buffer dictation that
+  is only one of the user's stop phrases (`SpokenAbortPhrases`: empty, and
+  so off, by default; the whole dictation must be the phrase, so a common
+  word is allowed, but not a send phrase) is checked before every other
+  spoken command, and before the destination guards that keep text in
+  History during a Tab switch or once the picked pane left the front:
+  those guard an insertion, and a stop phrase inserts nothing. It asks the mod of the session the dictation joined for
+  `abort`, which ends that session's running main-loop turn
+  (`$.turn.abort` with the id `turn.start` gave; with none running it
+  answers `no_turn`). The request goes only down that session's channel,
+  under the same join rule as a fill (`modChannelSessionID`: a local
+  Claude Code session joined by tty, herdr pane or cmux surface, mod
+  attached; Claude Desktop is not measured), and the mod refuses it with
+  `session_changed` once its process left that id. With no such session,
+  or any refusal, nothing is stopped and no key is posted: an Escape sent
+  to whatever is frontmost could cancel another app's work, which is
+  worse than a turn that runs on. Either way the phrase is a command:
+  nothing is typed and nothing goes to History. The voice stop arms on it
+  as on a send phrase, so it needs no key press. Live Auto-Paste does not
+  listen for it yet (#1704).
+- **"Go to <name>" is a command only when the name resolves** (#723 step
+  1). An Overlay Buffer dictation (a Live Auto-Paste segment, #747) that
+  is only "go to" plus at most four words is looked up against the live
+  registry's names (`SessionNameResolver`: nickname, the folder name with
+  duplicates told apart, the git root's directory or named branch, the main
+  checkout's, the harness's title, the title's first two to four words)
+  before the spoken send cut, the dictionary and the polisher. A title
+  never outranks a folder name: the session sets its own title (Desktop's
+  `titleSource: tool`), so it could otherwise take a name the user meant
+  for another session. No match: it is ordinary text
+  and commits as dictated, because "go to the tests" is a prompt too. A
+  match: nothing is inserted, no Return is pressed, and nothing is saved to
+  History. Two panes on one name is ambiguous and does nothing; sessions on
+  one local tty count as one pane. The pane is found by the tty the hooks
+  reported, asked only of Ghostty, iTerm2 and Terminal.app while they run
+  (`tell application id` would launch one that is not), and the tty is
+  spliced into AppleScript only when it is `/dev/tty` plus letters and
+  digits. The result is read back with the join's focused-pane reader:
+  `.focused` only when that tty is the session's and the terminal is still
+  frontmost after the read (#1465). A Return after a focus
+  (#723 step 3) or #717's answer hotkey must require `.focused`, never
+  `.unverified`.
+- **A session's title is a name, never evidence** (#1013, #1020). Claude
+  Desktop's title for a session is read from Desktop's own file on this
+  Mac (`ClaudeDesktopSessionTitles`, keyed by the `local_<uuid>` the hooks
+  reported), for an ssh-host session too. The other harnesses' titles ride
+  on the hook record as the optional `session_title` (owner ruling on
+  #1013: a title the harness made from the first prompt may cross, the app
+  never summarizes a prompt itself): Claude Code's from `SessionStart`
+  input, local or remote; opencode's from `session.updated`, placeholder
+  titles skipped; Codex's `thread_name`, which the publisher reads from the
+  tail of `~/.codex/session_index.jsonl` (`CodexSessionIndex`). Vibe's
+  `meta.json` title is still null on every measured session, so it is not
+  sent. The wire makes a title one sanitized line of at most 320 bytes and
+  drops it from focus records; an app that predates the key ignores it.
+  Desktop's title wins over the record's. Either names the session in the
+  overlay, the popover, banners and go-to, and nothing else: no join, route
+  or capture reads it (`ClaudeSessionSnapshot.harnessTitle` has no other
+  reader), the registry file does not keep it, and no log line carries it.
+- **Live Auto-Paste holds back only what may still read "go to"** (#747).
+  Typed words cannot be taken back, so while a session is live a segment is
+  held while its words so far may still become "go to" ("G", "Go", "go t")
+  or "call this session",
+  and one that opens with "go to" and at most four more words is held until
+  its final. Any other segment is released the moment a letter rules the
+  phrase out, then typed live; with no session live nothing is held. Only
+  the backend's non-empty final names a session, as only it can trigger a
+  send; a held segment that is not a command, or is promoted at a stop, is
+  typed whole, through the spoken send trigger when that withholds the
+  segment. A resolved name types nothing: the terminal hold-back's tail is
+  released into the old pane first; text that did not land there is kept
+  (`keepUndeliveredAgentText`) and dropped from the pending buffers, never
+  retried into the new pane (#1663); and a focus ends the prompt relay, whose
+  pane is the old one. Segments that end while the go-to resolves and
+  focuses wait and land after it, in order; a stop waits for them too.
+  History keeps the live dictation whole, the phrase included.
+- **"Call this session <name>" names only a session the dictation is
+  in** (#723 step 2). The phrase ("call this session" or "name this
+  session", then at most four words; never "call this one", a coding
+  prompt) is parsed and held back like go-to. Its target is the session the
+  dictation joined or, in Live Auto-Paste after a go-to, the session whose
+  pane read back as `.focused`; after an `.unverified` go-to there is none.
+  No target, or one no longer live: the phrase is text. A nickname is
+  matched ahead of every default name, one session holds it at a time (the
+  last one named), and it is kept per registry session id in
+  `UserDefaults`, at most 100.
+- **"Send that to <name>" writes only into the named session** (#723
+  step 3; owner rulings on #723, 2026-09-26). An Overlay Buffer dictation
+  ending in "send that to" plus at most four words, with text before it, is
+  looked up like go-to after the go-to check and before the spoken send
+  cut, the dictionary and the polisher. No match: it commits as dictated.
+  Ambiguous: nothing is typed anywhere and the text goes to History. A
+  match: the phrase is cut, the rest is polished, and the commit goes to
+  that session and is submitted there; the spoken send trigger is not
+  applied, so "send it" inside the text stays text. The focused app never
+  gets the text or a key. Routes, in order:
+  (0) the session's mod (#1693; owner ruling 2026-10-04, which lifts the
+  Return exception below for these sessions only): a local Claude Code
+  session outside Claude Desktop (whose fill is unmeasured, #1643) with
+  its mod attached gets a `send` addressed by its session id, the same
+  request as a spoken send, after a `draft` read that decides the leading
+  space. No pane is brought forward and no key is posted. The channel is
+  the one the session's own local hook named, and the mod refuses with
+  `session_changed` once its process left that id (#1651): that refusal,
+  to the `draft` read or to the `send`, and an unanswered request, which
+  may have submitted, keep the text in History and try no other route (a
+  detach with no clean bye leaves the old registry entry, whose tty and
+  pid still match the pane after `/clear`). A mod that refused for any other reason
+  (a dialog, a placeholder, a command, an `@` mention), or never got the
+  request, changed nothing in the session, so the routes below run as if
+  it had no mod, logged to `Log.backends`; a new dictation started by
+  then sends nothing anywhere and keeps the text.
+  (1) opencode's prompt relay, from a fresh declaration by the session's
+  pid; (2) the herdr pane the session's own hooks reported, only when it is
+  the one live local herdr, the registry maps the pane to that session
+  alone, and herdr lists the session's pid in the pane's foreground (the
+  route asks both again before every append and Enter, the mapping after
+  the foreground query, since `/clear` starts another session in the same
+  process and pane); (3) a Ghostty, iTerm2 or Terminal.app
+  tab, or a Claude Desktop session view (#1825), on this Mac or on an ssh
+  host, since its view is on this Mac either way. Anything else, cmux
+  included (its route can prove a surface only while it is the focused
+  one), is refused in one sentence. Every route
+  refusal is `keepInHistory`, never `typeInstead`: keys would go to the
+  focused app. **The Return exception** (owner ruling, which names Claude
+  Desktop with the terminals): in a terminal tab or a Desktop session view,
+  and only there, Return may be pressed in an app the app itself brought
+  forward. The pane must first read back `.focused` (a tab's tty through the
+  join's reader, a Desktop view's `local_` id through the Desktop arm's
+  reader, never a window title) and the registry still list the
+  session after the focus, since the shell left by an agent that exited
+  holds the same tty (#1219); only then is the text typed, into
+  the terminal pid that is frontmost and carries the focused bundle ID.
+  After the typing the pane is read back again, and Return is pressed only
+  if it still matches, the registry still lists the session after that
+  read-back, that pid is frontmost and on `ReturnSubmitsAppList`,
+  and Secure Keyboard Entry is off. A failed check before the typing types
+  nothing and keeps the text in History (on the clipboard with History
+  off, #1499); one after it leaves the text
+  unsubmitted, and the popover says so. Right before the typing and
+  again before the Return, the session's agent pid must be in its tty's
+  foreground process group (the process table, the herdr route's
+  foreground test), and the destination list's picked pane must pass the
+  same test before its words go in: a suspended agent stays alive and
+  registered, and its tab reads back as the session's, while its shell
+  owns the terminal (#1249). **Once the text is handed over** (to a
+  route's sink, to the mod's `send`, or typed into the tab), the commit
+  awaits the delivery, and two rules hold. Escape is released at the
+  hand-off to a route or the mod (#1666): neither write can be called
+  back, so a cancel there would show while the text is still sent and
+  submitted. In a terminal tab Escape stays until the Return, and a cancel
+  during the read-back stops the Return, never the typed text. A quit
+  before the commit saves its record (#1667) saves it as not inserted,
+  exactly once (`HandedOffAddressedCommit`): the commit's own save, also
+  when a new dictation superseded it, and the quit's claim the same record. A mod
+  refusal gives the text back to the usual route, and the record with it.
+  Correction learning and term
+  proposals skip an addressed dictation: they key on the join of the pane
+  it started in. Live Auto-Paste has no addressed send: its words are
+  typed before the phrase at the end is heard.
+- **A mod channel opens only for a session a local hook named, and a send
+  names its session exactly** (#1408). The localvoxtral-mod plugin's
+  `--attach` process asks the broker for a channel to one session id; the
+  broker refuses unless the registry already holds that session from a
+  locally authenticated hook, so a channel can never be the first word about
+  a session. `ClaudeModChannelHub.send` writes only to the channel of the id
+  it is given: no channel, a failed write or no reply in time answers nil,
+  never another session, and the caller keeps its own path. The attach
+  carries the Claude pid the process runs under, but it is not checked
+  against the hook's: both come from the same user, the residual threat the
+  hook path already accepts below, and a mismatch would only silently turn
+  the channel off. An Overlay Buffer fill the mod refused, or never got, is
+  typed only while the commit's terminal is frontmost and its focused pane
+  still shows the session (`ClaudeSessionJoinResolver.sessionShown`): a pid
+  cannot tell two tabs apart. For a local herdr pane the focused pane is read
+  again after its foreground query, as the last await before the keys, and
+  the frontmost app after that (#1498). Otherwise, and for a fill the mod got
+  but never answered, the text stays in History (on the clipboard with
+  History off). Unless keys put it in, the next
+  commit gets no continuation space. Mod replies ride one-shot connections
+  and carry a short reason code, never what the person dictated. Two
+  replies carry text: the session model's answer to the project-terms
+  question (#1410), which the same parser and filters read as a one-shot
+  run's, and the prompt draft (#1406, above), which only the stop that
+  asked for it reads.
+  **An attached channel is the session's liveness** (#1646). While a local
+  session's channel is open and its attach named the same Claude pid as
+  the session's hooks, the registry applies no TTL to it; pid liveness
+  still does, and a pidless or mismatched session keeps its TTL. Once the
+  channel detaches, the TTL counts from the detach, so a reloaded mod or a
+  restarted publisher still finds the session to attach again. The attach
+  only extends a session a hook created, and a same-user process could
+  keep one fresh by sending hooks just as well. The mod's `session.end`
+  sends a `mod_bye` line through `--mod-reply`; the broker acts on it only
+  for a session with an attached channel: it writes a `bye` message down
+  that channel and closes it, and that detach removes the session at once.
+  A forged bye ends only an attached session early, as a forged
+  `SessionEnd` already can. After `/clear` the process goes on under a new
+  session id: the mod's channel ends with the bye and attaches again under
+  the new id, never under the old one. A request already on the old
+  attach when the process moved acts on nothing: the mod answers every kind
+  but `ping` with `session_changed` once `$.session.id()` no longer names
+  the attach's session, and the app logs it to `Log.backends` and takes its
+  own path. With no bye (an app or mod that
+  predates it, a crash), the session's own SessionEnd hook and the TTL
+  from the detach end it as before.
+- **A remote mod channel needs the host's channel key both ways** (#1412).
+  The remote plugin carries a copy of the mod's hooks module
+  (`scripts/sync-remote-mod.sh` writes it, CI checks it), which long-polls
+  `POST /v1/mod/poll` on the listener through the forward and answers on
+  `/v1/mod/reply`. The token alone does not open these routes. A process
+  squatting the forward port on the host receives the token from every hook,
+  so every request also carries `X-Lvx-Mod-Proof`, an HMAC of the body under
+  the channel key, and every poll answer carries one over the poll's nonce
+  and the body. A proven poll can still be captured by the squatter and
+  replayed once the forward is back, so a poll gets a lease or a line only
+  when it carries a challenge the listener issued in an earlier answer's
+  `next`, for that host, session and `instance`, unused and at most `grace`
+  (10 s) old; any other poll gets a fresh challenge and nothing else
+  (Codex review, 2026-10-04). The window is the Mac's clock alone, so a
+  host's clock skew cannot break or widen it. RESIDUAL: a squatter that
+  captures a poll and gets the forward back within those 10 s replays it
+  once. The key is `HMAC(storedTokenHash, "lvx-mod-channel-v1")`. The
+  Mac derives it and never stores it, and setup writes it into the plugin's
+  config through `plugin configure --values-stdin`, never through argv. The
+  key never crosses the tunnel, and a token without the salt cannot produce
+  it. Rotating the token changes the key, so a host needs setup again. The
+  mod acts on nothing whose answer proof fails and backs off as after a dead
+  dial. The listener refuses a request without the proof with 403, before
+  any lease is touched.
+  The listener scopes the poll's session id under the authenticated host and
+  attaches the hub channel under that scoped id. It attaches only when the
+  registry holds that session from a hook of the same host, the twin of the
+  local rule above. A reply's id is scoped the same way before
+  `ClaudeModChannelHub.deliver`, so one host cannot answer another's
+  request. A held poll gives back its one-shot connection slot and takes one
+  of `maxHeldPolls` (16), so hooks never queue behind polls. Lines wait
+  bounded on the Mac (64 lines, 256 KiB) and go again until a poll acks them,
+  so an answer lost with the forward loses no line. An ack counts only in
+  the attach it names (a random id, so an app restart cannot reuse one): a
+  new lease numbers its lines from 1 again. No poll for 10 s after
+  the last one ended detaches the channel, and the hub answers every waiting
+  request as unanswered. Revoking or removing a host closes its channels at
+  the same reconcile that evicts its sessions, and a held poll checks the
+  host's credential again before it answers, so a forward kept up by hand
+  carries nothing the app writes after the revoke. A mod drops its waiting
+  band whenever its transport fails. A second process of the same session (another
+  `instance`) gets 409 until the first's lease expires. The mod's dials back
+  off 300 s after a failure, as post.sh does, because each dial at a forward
+  with no app behind it prints a `connect_to` line on the Mac's terminal. A
+  newer `ok` in post.sh's `hook-status` stamp ends the wait early. A residual
+  accepted here: the reply that answers a proven request (a `draft` carries
+  the prompt box) goes in a new connection, and a squatter that took the port
+  in between reads it.
+  The commit paths use a remote session's mod for the joins that name it
+  exactly (`ClaudePromptDraft.fillsPrompt`): a remote or federated herdr
+  pane, the ssh connection, the local tty it carried, or a `cmux ssh`
+  surface. A fill, append or send the remote mod refused is typed only while
+  the frontmost terminal, joined again from scratch, still names that
+  session (`ClaudeSessionJoinResolver.shows`), since a remote session has no
+  tty on this Mac to look up. The join's arms await forwards, sockets and
+  process queries after reading the focus, so `shows` reads what the join
+  saw again after them: the tty and machine of a herdr surface, then its
+  pane last; a `cmux ssh` surface's focused id; the tty of an ssh join
+  (Codex review, 2026-10-04). An addressed send it refused keeps the text,
+  because a remote session has no other addressed route. The dictation band
+  goes to any joined Claude Code session whose mod is attached, remote ones
+  included. A remote pid means nothing on this Mac, so a remote session never
+  gets the TTL exemption of the liveness rule above. Each poll moves its
+  channel's `lastSeen` instead, so the TTL counts from the last poll, and
+  from the detach once polls stop. A mod clears its band and drops its
+  challenge whenever a poll fails on its side, even when the lease outlives
+  the failure. So an unchallenged poll from the instance holding the lease
+  makes the app send the band's state again, as after an attach (#1799).
+  It does so once until a poll redeems a challenge, so a replayed poll
+  cannot fill the queue, and the unchallenged poll itself still gets only a
+  new challenge.
+
+- **A remote `/inbox` sends capture titles to the host, never the words**
+  (#1412, the owner's ruling of 2026-10-04). It is the first route that sends
+  quick capture data to a host unasked by a draft: `POST /v1/mod/inbox` lists,
+  `POST /v1/mod/inbox/open` opens, both signed both ways like a poll, so a
+  squatter on the forward port neither reads the list nor feeds the pane one.
+  The list holds what the local pane shows and nothing else: id, drafted
+  title, kind, state and capture date (`RemoteInboxRoute.Capture` is the
+  whole wire type). A capture with no drafted title goes with an empty one,
+  because the title the Mac derives for it is the start of its words. Its
+  text, note, draft body, changes and repository never cross. It lists only
+  the captures of the project the asking session is in
+  (`RemoteQuickCaptureRequests.remoteProjectKey`), for a session id scoped
+  under the authenticated host that a hook of that host named; any other
+  session gets 409. An open takes a capture id and opens it only when it is
+  a capture of that same project, so an id read elsewhere opens nothing.
+  `RemoteInboxRouteTests` pins all of this over a socket.
+- **The Mistral second pass holds the text back, never the world** (#317).
+  An Overlay Buffer dictation in Mistral API mode is sent whole to the batch
+  endpoint on stop (`DictationSessionController+StopCommit.swift`,
+  `StopSecondPass`), and the commit waits up to the deadline for it. What
+  the polish is grounded in is sampled at the stop itself, before that wait
+  (`OverlayStopSample`): the screen re-read compares against the start
+  capture, and seconds of agent output scrolling past would drop it as
+  mutated. The target, the record's fields and the join go with it. Only
+  what depends on the text runs after: the spoken send cut, the dictionary,
+  the payload macro and the polish. The macro's clipboard read therefore
+  comes up to the deadline after the grounding read, so a copy made in that
+  window reaches one and not the other; accepted, since nobody copies while
+  waiting on their own dictation. Three more rules hold it:
+  (1) the pass dials the key and host the realtime socket latched at start,
+  never a fresh read of Settings;
+  (2) the audio lives in memory for the pass, and reaches the disk only
+  through the audio-store latch taken at start (`sessionStoresAudio`);
+  (3) the batch text replaces the realtime text when it answers in
+  time, and is never merged with it at seams: the two segment and
+  punctuate differently, and a merge would repeat or drop words at every
+  seam. The one exception is a run of realtime words the batch text dropped
+  outright (#1649): aligned word by word, a run of at least
+  `minimumRestoredRunWords` with nothing in its place and mostly words its
+  neighbours lack goes back between the batch words around it
+  (`StopSecondPass.keepingDroppedRealtimeRuns`). Shorter runs and restarts
+  stay dropped, since removing them is the batch model's job. A blank
+  answer, a failure or a missed deadline keeps the realtime text and is
+  only logged.
+  The term list leaves the Mac. The user's own words go to any endpoint, as
+  they do in the polish prompt. Everything else comes from screen, session
+  and repository context, so it goes only with the trusted-endpoint opt-in,
+  and each source also passes the gate it passes for the polish (#647):
+  learned terms, the project's agent proposals (repo vocabulary on), the
+  joined session's text (live join, session context on) and the start
+  screen the stop sample reconciled. They are read from what the stop
+  holds; the repository pipeline is not run for the pass, since it can take
+  3 s and nominates only what the realtime text nearly spells. The project
+  (its proposals, and its confirmed terms first) needs the git root for an
+  unjoined terminal or a session in a worktree (#705): the pass resolves it
+  the way the pipeline does, without the index, under its own single-flight
+  gate so the polish never skips its vocabulary, and sends without the
+  project after 250 ms. The screen
+  goes last against the 100-term cap: a listed term nobody says is
+  sometimes written anyway. A new dictation that cancels
+  the pass saves the realtime text as not inserted, as it does for a polish.
+- **Early polish reuses a piece only when the stop would have sent it the
+  same way** (#709). In Overlay Buffer with polishing, `EarlyPolishRun`
+  polishes each settled piece (whole sentences past 30 words of backend
+  finals, `EarlyPolishPlan`) while the user speaks, alone and one at a
+  time. A piece request carries only the templates, the reference guide and
+  About you. The stop still gathers and assembles the request for the whole
+  text, and polishes only the tail when that request equals the bare one
+  (`PolishRequestAssembler.bareRequest`), the templates and endpoint are the
+  pieces', and the prepared text starts with the pieces' exact prefix.
+  Otherwise the pieces are dropped and the whole text is polished: context,
+  vocabulary or a pre-applied spelling from the stop sample, a changed
+  profile, the dictionary, the payload macro and the spoken send cut all
+  land here, so learned terms, the macro and the trigger keep working on
+  the whole text. A piece is never given the text polished before it, and
+  the stop never re-polishes a piece's last sentence: both changed more
+  words than polishing it alone on the #709 replay. The stop waits for the
+  piece in flight and keeps it rather than cancelling it, because polishd
+  keeps generating a dropped request on its one slot. Sessions with a
+  second pass never start early polish: Mistral's realtime stream settles
+  nothing before the stop, and the batch text replaces the realtime text.
+  With **Polish while you speak** off (`SettingsStore.earlyPolishEnabled`,
+  default on for the bundled helper only) no run starts, and the stop takes
+  the pre-#709 path unchanged.
+- **Claude Desktop is a text field whose Return sends, and gets its
+  newlines as Shift+Return** (#660). Three lists name it, each for one
+  capability: `TerminalTargetDetector`'s text-field list fixes its verdict
+  (the AX probe cannot: Electron builds its tree only once the join read has
+  set `AXManualAccessibility`, after the verdict, so the first dictation after
+  the app launched found nothing focused and read as a terminal);
+  `ReturnSubmitsAppList` lets the spoken send trigger press Return there; and
+  `TextInsertionService`'s Shift+Return list changes how a newline is typed.
+  MEASURED on Claude Desktop 2.9939.2 (2026-09-26), posting exactly what
+  `postUnicodeTextEvents` posts: a newline never submitted, but one opening
+  an event or making up a whole event was dropped (`alpha` + `\n` + `beta`
+  landed as `alphabeta`), and a fenced block sent as consecutive 20-unit
+  events came out with pieces reordered. So in Desktop each line is typed on
+  its own and each newline is pressed as Shift+Return, which the prompt
+  handles as a key; the same probe then posted exactly that sequence back to
+  back and the text arrived in order. A text holding a code fence line is
+  the exception (#695): typed key by key, a line that opens with a fence
+  triggers Desktop's markdown shortcut and opens a code block that also takes
+  the text after the closing fence, so that text is pasted whole with Cmd+V
+  (`MarkdownCodeFence`), and typed as above only if the paste fails.
+  Desktop reads the clipboard after the post returned, so a paste never
+  replaces a clipboard an earlier paste's Cmd+V may still read (#1664): its
+  text stays pending, in order, until that paste's restore, and a stop
+  waits for it. The
+  list is judged from the app frontmost when the keys
+  are posted, after the insertion made its target frontmost. Listing Desktop
+  under Settings → Terminals overrides the verdict (the user list wins), and
+  a terminal session collapses its newlines before any reach the keyboard.
+- **The overlay panel's click-through is insertion machinery, not window
+  chrome.** `NonActivatingPanel` refuses key and main and swallows every click
+  on its body, because the panel is on screen exactly while the app it is
+  about to insert into must keep focus. @joostliebregts's fork made the whole
+  panel draggable and lost the Overlay Buffer's auto-paste — to AppKit's
+  window-drag machinery, which moves a window by making the click belong to
+  it. What is load-bearing is therefore HOW the panel moves, not where the
+  user grabs it: `OverlayDragRegionView` sets the frame itself and swallows
+  the event, with no `performDrag(with:)`, no `isMovableByWindowBackground`
+  and no path that lets a mouse event reach the window. Reaching for either of
+  those to simplify the drag is the fork's change. The region covers the whole
+  panel (owner ruling, 2026-09-21, after hand-testing that a dragged overlay
+  still auto-pastes) and hands the scroll wheel back to the transcript by
+  re-running the hit test with itself hidden.
+- **A remembered overlay position is re-validated against the live displays,
+  never trusted.** `OverlayManualPlacement` stores the panel's top-left as an
+  offset inside ONE display's own frame, identified by its ColorSync UUID —
+  not a global point, and not the display number, which macOS reassigns per
+  session. On every use `OverlayManualPlacementResolver` requires that display
+  to still be attached (gone: the overlay falls back to the anchored position
+  and the stored point is KEPT, so replugging restores it) and clamps the
+  panel back inside its visible frame. Dragging runs through the same clamp as
+  restoring, so a position can never be dropped where the next session would
+  have to rescue it. The failure this exists for is silent and unrecoverable
+  by the user: an overlay restored onto a monitor that is no longer there has
+  no handle to drag it back with.
+
 - **LLM polishing trusts the model's text in both profiles.** Human dictation
   evaluation found that `PolishTokenGuard` could reduce fidelity by undoing
   useful formatting and reconstructed identifiers, so it is not in the commit
-  path. Repo/clipboard vocabulary is an INPUT-side exception: matcher-approved
-  `(heard span, exact local term)` pairs are boundary-checked and pre-applied
-  before the single polish call. When the existing exact/edit-distance-one
-  matcher finds nothing, a bounded aligned fallback may emit at most one pair;
-  it score/margin-gates, abstains on ambiguity/glued prose, and will not add an
-  unspoken filename extension without a nearby file cue. This is grounding,
+  path. Repo/clipboard vocabulary is an INPUT-side exception: a transcript
+  span that NORMALIZES TO A LOCAL TERM ITSELF ("use auth dot ts" ->
+  `useAuth.ts`) is boundary-checked and pre-applied before the single polish
+  call; a LONE word may change letter case and nothing else (French "Sans"
+  equals the flag `--sans` once dashes are ignored). Nothing weaker rewrites
+  the transcript. The sound-alike tiers (edit
+  distance one, Double Metaphone key, bounded aligned fallback) only NOMINATE:
+  their terms reach the model as a plain list (four, growing with the length
+  of the dictation up to twelve), with no heard
+  span beside them, and a file name whose extension the speaker never said is
+  withheld altogether. Owner field history 2026-09-18: those tiers, applied
+  silently or shown as `"heard" -> "term"` pairs, wrote `toolInput`,
+  `SessionStart`, `--sans` and `localvoxtral.js` over ordinary French and
+  English prose; on replay the pair rendering produced five wrong insertions
+  on Mistral Medium where the list produced three and no section none, and
+  every survivor on GLM 5.3 was an unspoken extension. Do not restore
+  pre-application or the pair rendering without replaying that set
+  (`SoundAlikeNominationTests` pins the field spans). This is grounding,
   not an output guard. No content-based leak detector scans or rejects model
   output. Only explicit clipboard-paste payload-placeholder count integrity
   remains active for both profiles. The token guard type remains as a recognizer
   used by clipboard vocabulary and by focused unit coverage; do not infer that
   it runs at commit.
 
-- **Claude Code context reaches the prompt only through a positive marker
-  join.** The joined session's repository (status, uncommitted diffs, contents
+- **Learned terms leave the Mac whatever the context toggles say now.**
+  A spelling the cross-source merge pre-applied is recorded per project
+  (`LearnedTerms`, `LearnedTermProjectResolver` — the project key is the
+  main checkout of the git root the vocabulary pipeline already resolved off
+  the main actor, widened to contain a joined session's directory; a linked
+  worktree is not a project of its own (#652), and its main checkout is read
+  from its `.git` file in that same pipeline (`RepoIndexing.mainCheckout`);
+  the commit path never walks the filesystem for it, and it inherits that
+  pipeline's title parsing, ssh titles included. A remote session's key is
+  the basename of its repository's main checkout when its host's shim sends
+  `X-Lvx-Env-Project`, else the `<repo>` of a Claude Code worktree cwd
+  (`…/<repo>/.claude/worktrees/<name>`: a Desktop session keeps the plugin
+  it started with for days), else its cwd label, so two repositories with one
+  basename on one host share a bucket: the price of never holding a remote
+  path. That key names a checkout; the terms live on its repository's
+  record, `repo:<host/owner/repo>`, once its `origin` is known (#971,
+  `ProjectRemote`). The Mac reads a local checkout's `origin` off the
+  commit path (`QuickCaptureProjectLinker`, once a launch), and a host
+  sends its own as `X-Lvx-Env-Repository`, a label like the project name.
+  So a host that claims a repository shares that repository's record with
+  the Mac's checkout: its sessions' dictations are polished with the
+  record's confirmed terms, at the user's own endpoint, and what they
+  teach counts toward it. What a host can push into it unasked is
+  `/v1/terms` proposals, which stay unconfirmed under the three-dictation
+  bar. The record is never keyed or reached by a path.), and once three separate
+  dictations have resolved it, it grounds later ones and rides in the prompt
+  under its own header — with no endpoint check and no re-check of the
+  setting that first produced it. Owner ruling, 2026-09-20: a name the
+  speaker keeps saying is their vocabulary, exactly like a name typed into
+  Global terms, which has always been sent to whatever endpoint is
+  configured. What the app owes in exchange is stated here rather than
+  enforced by a gate: each term keeps the sources that proposed it, so a
+  later setting can drop what one source taught; nothing below the
+  three-dictation bar is ever sent unless the user pinned it or fixed it by
+  hand (a quick capture's polish, #970, matches every routable project's
+  confirmed terms, which the router already sends with each project), and
+  an import (`LearnedTerms.merge`, #523) confirms nothing the
+  file does not record as earned, taking the max of the counts, never the
+  sum; a remembered term never outranks a live
+  source (`.learned` is LAST in `PolishContextSource`, so a contested span
+  abstains); unpinned terms decay at 90 days; and a forget in Settings →
+  Projects (one term, or a project's Forget All, #972) rewrites the file
+  without them, so nothing forgotten comes back after a relaunch. Verification candidates are never
+  recorded — they are questions put to the model, not answers. A dictation
+  whose project cannot be established teaches nothing at all, which is not
+  the same as one with no project: the latter teaches the shared bucket,
+  and filing the former there would put one repo's spellings where every
+  project-less dictation reads them. Known limit of the bar: it counts
+  dictations, not independent evidence, so one stale clipboard read across
+  three dictations is three confirmations.
+
+- **Every polish carries every listed project's name** (#1024). The
+  About-you block ends with `Their projects (repository names): …`, built by
+  `PolishProjectNames` from quick capture's project list
+  (`QuickCaptureProjects.projects`): each project's name and its
+  repository's, sorted, the 30 most recent projects. That list holds no
+  label a tool generated (a folder name ending in a hex hash, such as a
+  Claude Desktop worktree's, `LearnedTerms.isGeneratedLabel`, #1026). It goes to every endpoint whatever the context toggles say,
+  on the same ruling as learned terms above: a repository name is the
+  speaker's vocabulary. A remote project's name is a label its host sent, so
+  a host can put up to 60 characters of its choosing in every prompt; the
+  host is one the user enrolled, and the label is sanitized like a term
+  (`SpeakerTerms.sanitized`: one line, no quotes, no commas). The list sits
+  in the SYSTEM prompt and is sorted rather than ordered by recency, so the
+  helper's cached prefix changes only when a project is added or dropped,
+  never because the user dictated into another one. Measured on GLM 5.3
+  with Tom's dictations (#1024): with the names, 117/122 repository names
+  came out right against 58 without and 104 with his hand-typed Global
+  terms, and no control got a name written into it. A name already among
+  the Global terms is listed there only, and Settings offers to remove such
+  a term; nothing removes it without a click.
+
+- **A host's skill names reach every polish, as names only** (#1024). The
+  remote shims send `X-Lvx-Skills`: the Claude Code plugin on SessionStart,
+  Vibe's at each turn's end (it has no start hook). The value is the names of
+  the skill folders (holding `SKILL.md`) and command files under the host's
+  Claude Code, Codex, opencode, Vibe and `~/.agents` folders, the installed
+  Claude Code plugins' skills, and the session folder's `.claude/`. Never a
+  file's contents, never a path. The Mac lists the same folders on itself
+  (`AgentSkillDirectories`). It is its own header, not an `X-Lvx-Env-*`
+  one: a list outgrows the environment's 200-byte values, and it is content,
+  not a label about where a session runs. It is untrusted text a host
+  writes into the prompt, so `AgentSkillNamesCodec` keeps only folder-shaped
+  names (ASCII letters, digits, `.`, `_`, `-`, 64 bytes, no leading dot or
+  dash), at most 80, and reports nothing for a value over 2 KiB. The
+  listener passes them on only after the re-authentication, so a revoked
+  host's list is never kept. `AgentSkillStore` keeps one list per host id in
+  `agent-skills.json`, rewrites it at most daily while a list is unchanged,
+  never overwrites a file it could not read, and drops a host after 30 days
+  without a report. Every polish gets the union, sorted, as `Skills they
+  invoke in their coding agents: …` after the project line, whichever
+  harness the dictation joined: the joined harness's list alone would change
+  the system prompt at every join and break the cached prefix, and the #1024
+  eval found no cost in sending 43 names where 11 were used (no control got
+  a name written into it). Built-in commands that exist on no disk are not
+  listed.
+
+- **A host's agent projects leave as name and origin only** (#1027). The
+  Claude Code remote shim sends `X-Lvx-Agent-Projects` on SessionStart:
+  `<epoch>:<name>:<repository>` entries, newest first, for each repository
+  Claude Code ran in on that host in the last 30 days. `hooks/agent-projects.sh`
+  reads only the first top-level `cwd` key of each transcript folder's newest
+  `.jsonl`, never anything else in a transcript, and never decodes a folder
+  name into a path. It names the repository as the shim names a session's
+  project (the main checkout's basename, the origin from `capture.sh
+  repository`); a cwd outside git or without an origin is not listed, so no
+  path ever leaves. The scan takes seconds, so the hook sends the value cached
+  in its state folder and rescans detached when the cache is six hours old.
+  Each field is checked against an enumerated charset before it is cached and
+  the whole value again before it is sent; at most 30 entries and 2000 bytes.
+  The Mac reads its own `~/.claude/projects` the same way
+  (`AgentTranscripts`), at launch and at most hourly after, and takes a
+  checkout's `origin` from its git config file, never from git. A project
+  only agents' work listed (`LearnedTermProject.agentActiveAt`) goes 30 days
+  after that work unless a dictation, hook or proposal touched it since.
+
+- **A learned term does not rewrite ordinary words** (#522). The exact tier
+  pre-applies any span that normalizes to a term, so a learned `useAuth`
+  would turn "we should use auth tokens" into code. For the `.learned`
+  source only, `RepoVocabularyMatcher.withholdingOrdinaryReadings` moves a
+  two-word span of plain lowercase words with no code word next to it
+  (`codeNounCues`, `codeVerbCues`) from the pre-applied entries to the
+  verification pairs: the model sees the sentence and decides. Live sources
+  are not guarded: a term on screen now is evidence this dictation is about
+  it; memory is not. A withheld term is neither recorded nor counted as
+  applied, which also stops a learned term confirming itself on prose.
+  Single words (the exact tier only changes their case), spans of three
+  words or more, acronyms and spans with a capital, digit or spoken
+  separator are applied as before. `LearnedTermOverApplicationEvalTests`
+  pins the numbers; its known misses are a three-word join said as prose
+  ("push to talk") and identifiers said with no code word nearby.
+
+- **An agent's proposals are vocabulary with a source, confirmed only by use
+  or a pin** (#609). With the opt-in setting on, the first dictation that
+  joins a LOCAL Claude Code, Vibe or opencode (#642) session in an unstamped
+  project runs that
+  agent headless in the project (`ProjectTermProposer`), after the commit
+  inserted its text and off the commit path. The run is the app's own
+  process, never the user's session, so it cannot interrupt a turn, and the
+  hooks still print nothing. Its bounds are each a measured failure:
+  `claude -p` gets Read/Glob/Grep only, `disableAllHooks` (a project's
+  `SessionStart` hook fired inside `-p` without it; `--bare` would skip hooks
+  but never reads a Claude.ai login), `--strict-mcp-config`, 12 turns, $0.50;
+  `vibe -p` gets read-only file tools under `--auto-approve` (bash is refused
+  even so), 12 turns, $0.30, `--experimental-harness` (legacy looped to the
+  turn limit), and an app-owned `VIBE_HOME` holding only links to the user's
+  `config.toml` and `.env` (Vibe has no flag to skip hooks, and under the
+  user's home our `post_agent` hook would publish a phantom session);
+  `opencode run` gets `--pure` (without it our plugin in the global plugin
+  directory loads into the run), its own agent through
+  `OPENCODE_CONFIG_CONTENT` that denies every tool but read/glob/grep/list
+  (denied tools are not offered, even when the user's config allows them),
+  12 steps, 4096 output tokens a step, `OPENCODE_DISABLE_PROJECT_CONFIG` (a
+  repo's `opencode.json` could start MCP servers) and `OPENCODE_DB=:memory:`
+  (the run stays out of the user's session list); opencode has no price cap,
+  so the 120 s timeout is its budget. There is no remote opencode shim, so a
+  remote opencode join is never asked. The
+  working directory comes only from `localWorkspacePath` via the git root,
+  so a remote label can never become one (a remote project is run on its
+  host: "The Mac asks a host to spend", below). The
+  answer is untrusted text repo contents can steer: only term-shaped strings
+  are kept (`DictationTermsFile.accepted`, no control characters, 40 at most),
+  terms already known or refused are dropped, and a proposal starts at zero
+  dictations with source `agent:<name>`. Until three dictations or a pin
+  confirm it, it matches only in the `.learned` exact tier, only where repo
+  vocabulary may go (setting on, loopback or trusted endpoint), is never a
+  sound-alike nomination or verification pair, is pre-applied but never
+  listed under `[Learned vocabulary]` (which tells the model the speaker has
+  used the spelling), and is not in `confirmedTerms`; it is evicted first
+  and decays like any unpinned term.
+  One stamp per project key (main checkout, #652), whichever agent answers
+  first; a failure stamps only an attempt time and retries after 24 h.
+
+- **A fix is learned only from the prompt the joined session submits** (#520).
+  `CorrectionLearning` compares the text a commit inserted with the next
+  `UserPromptSubmit` of the session the dictation JOINED, within 3 minutes,
+  once. No screen, AX field or keystroke is read for it: the agent hands over
+  the final prompt through the hook the join already trusts, so a fix is seen
+  only when the user sends it, and only in a positively joined session.
+  Screen reads were rejected as the source (comment on #520, 2026-09-24): a
+  Ghostty or `pane.read` grid re-wraps the prompt inside TUI chrome, and the
+  insertion path has no field read at all. Claude Code 2.1.280 hands a long
+  paste to the hook wrapped in `<pasted_content id=…>` markers, which the
+  classifier strips. The registry calls the observer outside its lock with
+  the scoped session id; the inserted text and the prompt live in memory for
+  one comparison, nothing but the spelling is written, and the log gets
+  verdict categories only. `CorrectionDiffClassifier` favours precision: one
+  substitution of at most 4 words, few other changed words, a spelling that
+  sounds like what it replaced, and a capital that is not a sentence start, a
+  digit or an inner joiner, unless the spelling is already a known term. An
+  edit that only moves the space after a sentence end, comma or semicolon
+  before a capital (`doing. Usually` ↔
+  `doing.Usually`), or a span holding a sentence end, is never a term: two
+  Overlay Buffer dictations sent in one prompt arrive glued while the learner
+  joins them with a space (#801). Nor is a case-only fix of a word of two
+  letters or fewer (`i` → `I`, `ok` → `OK`), or dots put between
+  a word's letters (`eg` → `e.g`), unless already a known term (#803). A
+  hand fix is confirmed at once (`confirmedByCorrection`), bypassing the
+  three-dictation bar, because that bar guards against polish repeating
+  itself and a hand fix is not polish. Undo, or a later fix that changes a
+  learned spelling back, deletes the term outright rather than lowering its
+  count. The feature inherits the join's gates: no polish endpoint, both
+  context settings off, or an endpoint that is neither loopback nor trusted
+  means no join and nothing learned. A prompt that arrives before its
+  dictation's commit (Enter pressed as the last word appears) waits 10 s,
+  no longer. A Live dictation is compared as the insertion service
+  recorded it typing, and not at all when text is still pending or the
+  spoken send trigger pressed Return: the user sent that unedited. Known
+  limit (GLM review of #532): without polish the project key is the
+  joined session's own directory, not the repository the vocabulary
+  pipeline would widen it to, so a session in a subdirectory learns into
+  a separate bucket; resolving the root would walk the filesystem on the
+  commit path, which `LearnedTermProjectResolver` forbids. A hand fix in a
+  worktree's root reaches the main checkout at the next launch: the store
+  folds worktree keys into their main checkout each time it loads its file
+  (`LearnedTerms.foldWorktreesIntoMainCheckouts`, max of counts, never the
+  sum).
+
+- **"About you" is the only place the model is told to infer a misheard name.**
+  `LLMPromptTemplates.withSpeakerProfile` appends the user's own text to the
+  SYSTEM prompt (stable, so it stays inside the prefix polishd checkpoints —
+  the warmup applies the same call). The same "sounds like it AND fits better"
+  rule was tried in the bundled prompts with no profile present and made both
+  GLM 5.3 and Mistral Medium guess ("Coin 3.6" -> Claude, -> Code; "H200" ->
+  H100); with the profile the same dictations came back as Qwen. Keep the rule
+  attached to evidence the user supplied.
+
+- **The terms list stores correct spellings only, and a plain capitalized word
+  never becomes a rule.** `SpeakerTerms.replacementEntries` derives a
+  case/spacing rule from a term only when it has a space, a non-letter or
+  mixed case ("Claude Code", "useAuth.ts", "vLLM"). "Work", "Vibe" or the
+  acronym "IT" would otherwise rewrite the ordinary word in every sentence, in Live Auto-Paste
+  too, where no model can tell the product from the noun; those terms reach
+  the About-you block of the prompt only. File-dictionary rules sort first, so
+  a hand-written rule wins a tie. The polisher never sees
+  `replacement_dictionary.toml` (owner ruling 2026-09-18) — only the terms;
+  the `{{replacement_dictionary}}` slot survives because the vocabulary
+  sections ride in it. The About-you text and terms are user-typed
+  and go to ANY polishing endpoint, like the replacement dictionary.
+
+- **Suggested terms: the model judges what a name is; the app guarantees the
+  rest.** No capitalization or dictionary heuristic decides name-vs-word
+  (owner ruling 2026-09-18: German capitalizes every noun). The app's own
+  guarantees hold whatever the model returns: nothing is added without a
+  click, and `SpeakerTermSuggestions.filtered` drops anything already a term
+  or ever dismissed, compared by a key that ignores case, spacing and
+  punctuation. `ranked` only REORDERS, by counting in how many dictations a
+  candidate literally occurs — it must never drop, because a spelling the
+  model recovered from misrecognitions ("Qwen" from Coin/Kuen) occurs in no
+  text. Measured on the owner's history: GLM 5.3 returns a clean list; Mistral
+  Medium lists everything it saw, which the ranking makes usable. The request
+  is user-initiated and the row names the model the dictations go to; it may
+  include dictations made while a different endpoint was configured.
+  On a hosted model the request asks for `reasoning_effort: "high"` while a
+  polish keeps the model's lowest level: at polish effort Mistral Medium
+  returned ~70 items including "Coin 3.6" and "Kuen"; at high it returned 11
+  clean terms with "Qwen" recovered (170 s; GLM 5.3: 69 s — hence the 420 s
+  timeout). `high` needs no per-model table: `/v1/models` reports only whether
+  a model reasons, and `high` is the one level every reasoning model accepted
+  (GLM low/high/max, Mistral none/high). Self-hosted shapes are untouched.
+  The button is unavailable on the BUNDLED helper ("Needs a hosted polishing
+  model."): measured on the owner's Mac 2026-09-19, the 4B took 177 s on 133
+  dictations, listed the polish mistakes it was told to leave out (OpenShift,
+  Cohere, `toolInput`, Coin, Kuen) and ended in a repetition loop, all while
+  holding the helper's single generation slot against every polish; batches
+  of ten returned nothing. On a hosted or external endpoint a run continues in
+  the background while the user dictates. The request is ONE user message
+  with no system message: an external server may be another polishd, which
+  checkpoints every message but the last, and its two prompt-cache slots
+  belong to the dictation profiles.
+
+- **The app writes into an agent only through its routes.** Everywhere
+  else the app reads from agents and types into whatever has focus; a route
+  writes into an agent's own prompt, so every route is held to three rules,
+  and each adds its own below:
+  (1) *One route, resolved at start.* `SessionContextResolver.resolveAgentPromptRoute()`
+  picks at most one route per dictation, next to the join, for the session
+  the join resolved and nothing else. It is dropped with the join, and
+  both are dropped before an Overlay Buffer commit into a session Tab
+  picked (#1054): that pane gets the words by keyboard after its read-back,
+  and the start session's route would write them into the start session's
+  prompt. The one exception is a dictation addressed by name ("Send that to <name>" above):
+  its route is resolved at commit, for the named session, by
+  `ClaudeSessionJoinResolver.addressedRoute(for:)`, and never falls back
+  to keys.
+  (2) *Append and submit only* (`AgentPromptCall`). Widening a route (clear,
+  commands, another session or pane) is a new capability and needs the
+  owner's decision.
+  (3) *Keystrokes are the fallback, not a race.* `AgentPromptSink` sends one
+  call at a time, in order, and counts a call delivered only when the target
+  confirmed it, or, for a route whose appends go unanswered, once the
+  route's `settle` confirmed it (the Claude Code mod's, below); the first failure (refused, timed out, unconfirmed) hands
+  that call's text and every append queued behind it to the keyboard path,
+  in order, for the rest of the dictation, and drops any queued submit: that
+  text may have landed elsewhere. A route failure records a nil landing,
+  which blocks a keyboard Return for the rest of the dictation, like text
+  typed under Secure Keyboard Entry. A route that cannot tell whether a call
+  landed, or whose target is not where keys would go, answers
+  `keepInHistory` instead: the text is typed nowhere for the rest of the
+  dictation, and the popover says it is in History. Typing it would put it
+  in the wrong app, or in twice. A refusal that answers after the next
+  dictation started, or after a go-to moved the keys, stays in History
+  too (#1466): the keyboard path and its pending text belong to that
+  dictation or pane now, and would carry the text into its route. That
+  holds for an Overlay Buffer commit's own fallback and for a fill the
+  session's mod gave back, which carry the start generation of the
+  dictation that handed the text off (#1657). With
+  History off, every path below that keeps text puts all of it on the
+  clipboard instead and says so (`keepUndeliveredAgentText`, #1499): Copy
+  last dictation alone would lose it to the next dictation.
+  - *opencode's prompt relay* (#719, `OpencodePromptRoute`).
+    *Loopback only:* the wire carries a port and a token
+    (`OpencodePromptRelayAddress`), never a host; `OpencodePromptRelayClient`
+    dials `127.0.0.1` with no proxy, and a malformed port or token is dropped
+    at decode.
+    *Published by a verified peer:* the address rides only on an opencode
+    `FocusChanged`, which the broker accepts only when the record's pid is
+    the socket peer's, and the registry only when that pid owns the session.
+    `ClaudeSessionRegistry.opencodePromptRelay(sessionID:)` answers only from
+    a fresh declaration by the session's own pid, and two declarations naming
+    different relays abstain. Declarations stay in memory, so the token never
+    reaches the persisted registry file.
+    *The relay's own limits:* the plugin implements `/tui/append-prompt` and
+    `/tui/submit-prompt` and refuses everything else, any caller without the
+    token, a `Host` other than its own address, and any call for a session
+    the pane no longer displays. It forwards through the TUI's in-process
+    client, so the app never needs or sees opencode's server password.
+    *Typed only into the same prompt* (#1057): a call the relay refused
+    with a status other than 409, or one that never reached it (connection
+    refused, text too long), is typed only while the terminal the dictation
+    started in is frontmost and its focused pane still resolves to this
+    relay. A 409 (the pane shows another session now) and a request with no
+    answer read back (timeout, dropped connection: it may have landed) stay
+    in History (`keepInHistory`).
+    *Resolution:* it reuses the join's session when the join resolved, and
+    otherwise asks only local questions
+    (`ClaudeSessionJoinResolver.opencodePromptRelay(target:)`): the focused
+    TTY, then, when that TTY is a local herdr client's, that herdr's focused
+    pane, with exactly the local herdr arm's checks
+    (`focusedLocalHerdrPaneSession`, #733). Never the remote or federated
+    herdr, ssh or cmux arms: those open sockets and tunnels on a context
+    consent that writing does not have. A herdr showing a saved machine, or
+    whose machine state is unreadable, is not asked. These questions are
+    asked only while some fresh declaration carries a relay, so a Mac
+    without the updated plugin sends no Apple event and dials no herdr for
+    it.
+  - *herdr panes* (#726, `HerdrPanePromptRoute`; owner ruling on #723,
+    2026-09-26). herdr's socket is unauthenticated full control of every
+    pane, so what the app sends is bounded here, not by herdr.
+    *Two calls, nothing else:* an append is `pane.send_text {pane_id, text}`
+    and a submit is `pane.send_keys {pane_id, keys: ["enter"]}`
+    (`HerdrPaneWriting`; wire shapes from herdr 0.9.0, the version installed
+    when this was written). Never `pane.run`, never another key, never
+    `agent.prompt`, `agent.send_keys`, `pane.send_input` or a focus call
+    (navigation's focus, below, is its own bounded write).
+    *Only the joined pane:* the route exists only for a herdr pane join
+    (local, remote or federated) and is keyed by the binding the arm captured
+    (`ClaudeSessionJoinResolver.herdrPromptRoute(for:)`), so it writes to
+    that pane id over the socket or `ssh -L` forward the join already
+    trusted, and only while that dictation runs. It never asks herdr which
+    pane to write to. A remote or federated pane is written only while the
+    host its session's transport origin names is enrolled and not revoked,
+    asked before every call (#1117): a revoked host's pane gets neither a
+    write nor typed keys, and the text stays in History.
+    *No control characters:* herdr writes `send_text` to the pane's input
+    byte for byte, with no bracketed paste, so a newline would press Enter
+    and an escape would start a key sequence. Text holding any Unicode
+    control character (or over 32 KiB) is never sent.
+    *Typed only into the same pane:* a text herdr refused (its own error
+    answer for that request, or a request that never reached the socket) is
+    typed only while keys would land in the joined pane: its terminal is
+    frontmost, herdr's `pane.current` is that pane, and the terminal still
+    shows the surface the join saw (#1105, `HerdrJoinedSurface`): the same
+    focused tty, and on it the same machine, read as the arm read it
+    (herdr's machine selection, alone on screen once machines are saved, or
+    the tty's ssh session). A client switched to another saved machine
+    keeps its tty, and the server it left keeps a focused pane it no longer
+    shows, so the pane check alone would type into the other machine.
+    Otherwise, and
+    whenever the request went out with no valid answer (it may have landed),
+    the text stays in History (`keepInHistory`).
+    *Text and Enter only over the joined agent:* before each append and
+    each Enter the route asks the pane's foreground processes again, with
+    the test its arm joined on (the registered pid for a local pane, the
+    parent pid or agent name for a remote one). A pane back at its shell, or
+    running another agent, gets neither: the text would land in that prompt
+    and an Enter would run it. The text stays in History, never typed.
+    *Resolution:* only when opencode's relay did not resolve, so an opencode
+    pane with a relay keeps it; from the context join's herdr binding when
+    the join resolved one, and, when no join ran (polishing off), from a
+    LOCAL herdr's focused pane with the local arm's checks
+    (`ClaudeSessionJoinResolver.localHerdrPromptRoute`, #759). That lookup is
+    never kept as a join, reads nothing from the pane, never reaches a
+    remote or federated herdr, and asks the focused TTY only while a live
+    local session sits in a herdr pane.
+  - *herdr focus for navigation* (#1012, `HerdrSessionPaneFocuser`; owner
+    ruling on #1012, 2026-09-28). *One call, nothing else:* `pane.focus
+    {pane_id}` (`HerdrPaneFocusing`), only for the pane of the session the
+    user asked to reach (Tab, the answer shortcut, "go to"), over the pane's
+    local socket or the join's `ssh -L` forward. No keys, no text, no layout,
+    tab, workspace or pane creation, no `agent.focus`, no machine switch.
+    *Confirmed by reading back:* `.focused`, the only outcome that starts a
+    dictation, needs herdr's `pane.current` to name that pane AND the
+    terminal's focused tty, read again after herdr answered with the
+    terminal still frontmost (#1465), to be the window raised, AND the
+    registry to still resolve that pane to the session asked for
+    (`ClaudeSessionRegistry.sessionID(shownIn:)`, #1601): one opencode TUI
+    hosts several sessions in a pane, and focusing the pane cannot pick the
+    one it shows. The answer to `pane.focus` alone never is. *Window first* (#1033): `pane.focus` is sent
+    only after the window reads back in front, so a window that does not
+    come up leaves herdr's pane as it was, and a failure after the raise is
+    `.unverified`, never an outcome that reads as nothing moved. The
+    previous pane is not restored: that would be a second `pane.focus`.
+    *The window, never by title:* herdr has no client introspection, so
+    `HerdrWindowLocator` takes the join's process-table evidence and wants
+    exactly one tty. For a local pane: the one live local herdr socket is the
+    pane's, the machine selection shows Local (a lone client once machines
+    are saved), and one tty runs a herdr client. For a remote pane: a tty
+    whose foreground ssh goes to exactly that enrolled host with a plain herdr
+    client of that socket's session and no competing herdr view, or the lone
+    herdr client whose selection names that host and session. Several
+    candidates raise none, even though clients of one server mirror it.
+    Not reached: `ssh host` then a typed `herdr` (only the panel nonce could
+    prove that window, and it needs the window frontmost first), argv an ssh
+    wrapper hides, and a client showing another machine.
+    *herdr's side, measured on 0.9.0 and 0.9.1:* `pane.focus` answers
+    `pane_info` with `focused: true`, or `pane_not_found`, and switches
+    workspace and tab itself. The CLI has no command for it (`herdr pane
+    focus` is directional only); `agent.focus {target}` refuses a pane herdr
+    does not see as an agent (`agent_not_found`). Focus is per server: every
+    attached TUI client moves to the pane, and an explicit focus marks the
+    agent seen (`done` becomes `idle`).
+  - *cmux surfaces* (#727, `CmuxSurfaceRoute`). *Exactly two calls:*
+    `surface.send_text` with `surface_id` and `text`, and `surface.send_key`
+    with `surface_id` and `key: "enter"`. Never a call without `surface_id`:
+    cmux then writes to whatever surface is focused. Never `surface.focus`,
+    another key, or another surface.
+    *Only the resolved surface:* the route exists only for a `.cmuxSurface`
+    join (`ClaudeSessionJoinResolver.cmuxSurfaceRoute(for:frontmostPID:)`).
+    Writing needs none of the context join's gates, so when no context
+    join ran (context settings off, no permitted polishing endpoint), the
+    route asks the cmux arm alone, behind the cmux opt-in; that join reads
+    the surface's id and tty, never its text, and no context ships from it.
+    The route
+    names its binding's surface id, and dials only a socket whose peer is
+    the cmux process the join was about, with the join's password, one
+    connection per call. Before every call it re-reads the opt-in
+    (`cmuxSurfaceJoinEnabled`) and whether the joined session still holds
+    the surface in the registry, and asks again right before the write:
+    once the agent exits, the surface is a shell, and an Enter there runs
+    the dictation as a command. A local agent must also be in its tty's
+    foreground process group (the process table, the herdr route's
+    foreground test): a suspended agent stays alive and registered while
+    its shell owns the terminal.
+    *Only the dictation in progress:* armed at start, dropped at stop.
+    *No control characters:* cmux turns `\n` and `\r` into Return and Tab,
+    Escape and Backspace into keys, so text with any C0 or C1 control is
+    never sent.
+    *Delivery:* cmux answers `queued: false` (sent) or `queued: true` (the
+    terminal is starting and gets it then); either is delivered, wherever
+    focus is. A success without `queued` comes from a build that can drop
+    text sent to a surface whose tab is not focused (manaflow-ai/cmux#3129),
+    so it counts only while the surface is cmux's focused one, and is
+    otherwise `keepInHistory`. An error answer or a request never written
+    types instead while cmux is frontmost, unless cmux says another of its
+    surfaces is focused; with another app frontmost it is `keepInHistory`.
+    A request written with no clean answer, or a success naming another
+    surface, is `keepInHistory`.
+    *Never asks for password mode* (owner ruling, 2026-09-26): the route
+    exists only because the user already put cmux in `password` mode for
+    the join. In cmux's default `cmuxOnly` mode there is no join and so no
+    route, and dictation types as before, with no alert and no setting. A
+    connection refused mid-dictation falls back to keystrokes the same way.
+  - *the Claude Code mod* (#1645, `ClaudeModPromptRoute`). Live Auto-Paste
+    only; an Overlay Buffer commit fills through the mod on its own
+    (`ModChannelOverlayCommitter`). *Only a local session's own channel:*
+    a tty, local herdr or cmux join of a Claude Code session on this Mac,
+    or, with no context join, the focused pane's session as the local arms
+    alone answer it (`sessionShown`), and only once its mod answered an
+    opening `ack` (an older mod answers `unknown_kind` and the dictation
+    types as before). *Unanswered appends, counted at the stop:* each delta
+    is an `append` with its place in the stream, and counts delivered once
+    written. The mod fills them one at a time in that order; a gap or a
+    refused fill ends the stream there, so nothing lands out of order. The
+    stop (and a spoken send, before its empty `send` submits the box) asks
+    `ack`, which answers how many filled; the rest are typed, sanitized as
+    keys need, only while Secure Keyboard Entry is off and the terminal the
+    dictation started in is frontmost with its focused pane on the session,
+    and stay in History otherwise. An `ack` with no answer, or a channel
+    gone mid-dictation, leaves every unconfirmed delta possibly filled: all
+    of them stay in History, none is typed. *One attach:* the route writes
+    and asks only the attach of the mod it opened on. A mod that reloads
+    attaches again under the same session with a fresh stream, whose count
+    says nothing about what the old one filled, so the route treats it as
+    a lost channel. *A cancel stops the queue:* the sink drops what it has
+    not handed over and the route writes an unanswered `cancel`, after which
+    no append that arrived before it fills, though one already filling may
+    (#1805). A mod older than `cancel` fills them as before. The live
+    record waits for the stop's `ack`, behind a
+    go-to still running at the stop too. *No key, so no key rules:* the
+    terminal newline guard and the trailing-space policy do not apply to
+    filled text, and Secure Keyboard Entry neither refuses the start nor
+    warns. Every text the keys type instead, until the next dictation,
+    has its newline runs collapsed: what the mod gave back, and every delta
+    after the route failed over or a go-to retired it. Their trailing
+    whitespace waits for the next text or the stop, which applies the
+    trailing-space policy to what the keys typed; what the mod filled is
+    unseen to it, like a field's earlier text (#1734).
+- **Claude Code context reaches the prompt only through a positive join.**
+  The joined session's repository (status, uncommitted diffs, contents
   of files the agent just touched) and its prior user prompt are attached as
   untrusted reference blocks, behind `claudeRepoContextEnabled` (default off)
   and loopback endpoints only. Invariants to keep:
@@ -54,6 +1243,20 @@ there is not.
     filesystem" is a compile error — do not add one. Its only derivations
     (`ancestor`, `descendant`) preserve that, and `ClaudeRepoCollecting` takes
     it rather than a `String` for exactly this reason.
+  - **The session registry persists join metadata, never captured content.**
+    Its versioned Application Support file contains the session id, origin,
+    agent, workspace reference, activity, local process metadata, remote
+    environment labels, first-seen time, and last-activity time. It never
+    contains a prior prompt, prompt timestamp, recent file, tool snippet, or
+    focus declaration. The file belongs to the same user but carries no hook
+    token or transport proof, so restore treats every row as untrusted input.
+    It re-checks agent and remote-host namespacing, TTL, local pid liveness,
+    the current boot identity for local pids, active non-revoked host
+    enrollment for SSH origins, and the session caps. These checks prevent a
+    same-user file edit, pid reuse after reboot, or revoked host from restoring
+    a join candidate. Atomic 0600 writes live in a 0700 directory. Mutations
+    submit snapshots to one serial latest-value writer, and explicit clearing
+    removes the file.
   - The join is resolved ONCE per dictation, at start
     (`ClaudeSessionJoinResolver`), and every consumer — raw screen attachment,
     the session block, repo collection — shares that one answer. Three
@@ -66,32 +1269,77 @@ there is not.
     AppleScript (`AppleScriptTerminalTTYReader` — Ghostty ≥ 1.4's focused
     terminal, iTerm2's current session, Terminal.app's selected tab; sdef- or
     docs-confirmed, any error abstains) matched exactly against the
-    hook-reported session TTY,
-    LOCAL sessions only — the title is a fought-over channel (Claude Code's
-    own conversation titles clobber the marker mid-turn), the process table is
-    not. Any TTY non-answer falls through to the marker in the PID-pinned
-    window title — but LOCAL sessions only carry that marker when the user
-    enabled the opt-in title fallback (default off; the broker still allocates
-    markers either way, it just withholds them from local hook responses). The
-    title marker remains the ONLY join for SSH-remote sessions, emitted for
-    them unconditionally: a remote TTY names another machine's device, and
-    `resolve(tty:)` refuses remote candidates so an SSH host can never claim a
-    local pane by echoing its TTY.
+    hook-reported session TTY, LOCAL sessions only. A TTY non-answer does not
+    fall through to a weaker reading of the same surface; the arms after it
+    (herdr pane, remote herdr, cmux surface, browser tab) each ask a DIFFERENT
+    question, and when none answers, the dictation gets no join.
+  - **NO JOIN EVER READS A WINDOW TITLE** (owner decision 2026-09-05). Until
+    then the broker allocated an `lvx-…` marker per session, returned it in
+    the hook reply, and Claude Code wrote it into the window title over OSC 2;
+    a PID-pinned `AXTitle` read joined on it. All of it is gone — the marker,
+    the reply field, the `terminalSequence` the local and remote hooks
+    printed, the opt-in "Local Claude title fallback" setting, and the
+    title-arm suppression rules that had accreted around it. The reason is one
+    sentence: a window title is a channel every party in the stack rewrites at
+    will — Claude Code its conversation titles (which clobbered the marker
+    mid-turn, field finding 2026-07-17), herdr and cmux their pane titles, the
+    user their own — so a marker sitting in one is evidence about the past,
+    not about what the surface displays now, and every arm it fell through
+    from had already refused for a reason.
+    That was MEASURED on the owner's setup before this removal shipped
+    (2026-09-05): polling a herdr pane's captured `terminal_title` at ~325 Hz
+    for 69.4 s across a hook event, the broker marker was the title for 0.88 s
+    in total — **1.26 % of the window**. The other 98.74 % it was Claude
+    Code's own conversation title. The numbers and what they cost the remote
+    arm are in the remote-herdr bullet below. `TerminalScreenAXReader` retains
+    only `focusedWindowIdentity`, which reads no title: it exists so the
+    authorizer can pair a screen capture with the join that authorized it.
+    Precision matters in that sentence: no JOIN reads a title. One title read
+    survives elsewhere in the app and is deliberately untouched —
+    `TerminalWorkingDirectoryResolver.windowTitle(forApplicationPID:)` mines
+    the commit target's title for a git root, behind `repoVocabularyEnabled`,
+    to extract local vocabulary. It selects no session, authorizes no capture,
+    and reaches no `ClaudeSessionJoin`; a wrong answer there costs a few
+    unhelpful vocabulary terms rather than another session's repository.
+    The one session shape the title marker uniquely served — a PLAIN ssh remote
+    session, Claude Code in `ssh host` with no herdr, no cmux, no Remote
+    Control — went armless for the length of one PR and is served again by the
+    CONNECTION arm below. Nothing else ever lost an arm: a remote session also
+    joins through `cmux ssh`'s round-tripped surface id, the remote-herdr pane
+    arm, or the bridge-allocated Remote Control session id.
+    A remote TTY names another machine's device, and `resolve(tty:)` refuses
+    remote candidates so an SSH host can never claim a local pane by echoing
+    its TTY.
   - herdr (the tmux-like agent multiplexer) is a first-class join target with
-    its own arm, and it is MARKER-FREE by design (owner decision 2026-07-21):
-    herdr intercepts OSC 2 per pane, so a title marker can neither reach
-    Ghostty's title nor describe an inner pane — the broker never emits one to
-    a herdr-hosted session, even under the title-fallback opt-in. The arm runs
+    its own arm. It was the first arm to be marker-free (owner decision
+    2026-07-21, for the reason the whole mechanism was later removed for:
+    herdr intercepts OSC 2 per pane, so a title marker could neither reach
+    Ghostty's title nor describe an inner pane). The arm runs
     only after the surface TTY positively binds to herdr (a `herdr` client
-    process on the focused terminal surface's TTY, `HerdrClientTTYProbe` —
+    process in the foreground process group of the focused terminal
+    surface's TTY, `HerdrClientTTYProbe`; a client suspended with Ctrl-Z
+    keeps the tty while its shell owns the screen, #1602; every herdr process
+    in that job must classify as a whole-view client by its argv, with the
+    ssh arm's `HerdrInvocation` classifier: `herdr terminal attach <id>`
+    shows one pane without moving the server's focus, `herdr --remote` shows
+    another server, and an unreadable argv is neither —
     herdr's socket has no client introspection, so the process table is the
     only binding; the probe needs only the surface TTY string, so the herdr
     arm works on all three supported terminals), and from that point the join
-    is herdr-or-nothing: no
-    marker fallback, because a lingering title marker could only mis-join.
+    is herdr-or-nothing: a surface showing an inner pane is a surface no other
+    arm can describe.
+    The same property binds anything OUTSIDE the app that tries to identify a
+    herdr-hosted window by its title: the UI gate's `term open` did exactly
+    that and could never see the window it opened (field failure 2026-08-30),
+    so it now identifies a window by a CGWindowID diff taken before the window
+    exists (`scripts/mac/localvoxtral-ui-gate.sh`).
     The hook publishes `HERDR_PANE_ID`/`HERDR_SOCKET_PATH` from the pane env;
-    `HerdrSocketClient` (hand-written and READ-ONLY — only `pane.current`,
-    `pane.process_info`, `pane.read` are ever sent. herdr was AGPL when this
+    `HerdrSocketClient` (hand-written and capability-bounded — reads are only
+    `pane.current`, `pane.process_info`, and `pane.read`; its mutations are
+    the remote panel probe's short-lived `lvmark` through
+    `pane.report_metadata`, the herdr pane route's two writes, bounded in
+    "The app writes into an agent only through its routes", and navigation's
+    `pane.focus`, bounded in "herdr focus for navigation". herdr was AGPL when this
     was written and is Apache-2.0 since v0.8.0, repo `herdrdev/herdr`, so its
     docs and source are freely readable; the client stays hand-written anyway,
     because a vendored dependency would be a second implementation of the trust
@@ -114,6 +1362,59 @@ there is not.
     reach a herdr socket through it. On any pane.read failure the session falls
     back to the pre-existing behavior — composite AX text, vocabulary-only,
     nothing attached.
+    A herdr 0.9 client can federate several machines (`herdr machine add`), and
+    while a remote machine is selected the local server keeps a focused pane it
+    has merely stopped presenting. `pane.current` would then name a pane nobody
+    is looking at, and every cross-check above would pass on it, so the failure
+    would be a WRONG join rather than an abstention (issue #286). The arm
+    therefore reads herdr's saved machine state FIRST
+    (`HerdrMachineFederationReader` over `<state dir>/client/endpoints.json`
+    and `client/endpoint-selection.json`, the two files `herdr machine list`
+    itself reads). `.notFederated` and `.showingLocal` take the local arm
+    exactly as before; `.unreadable` abstains because it is not knowing, not
+    "no machines saved". With machines saved the local selection also requires
+    a LONE herdr client surface
+    (`HerdrClientTTYProbe.clientSurfaceCount`), because herdr keeps one
+    selection per user rather than one per client, so a second client on screen
+    makes the file unable to say which machine the FOCUSED surface shows. Users
+    with no saved machines keep the pre-0.9 arm, second window included.
+    `.showingMachine(profile)` no longer abstains: it dispatches to the
+    federated `.federatedHerdrPane` arm (issue #288, Part B).
+    That arm's confirmation set is: one herdr client surface; the profile
+    target naming exactly one non-revoked enrolled host, by exact alias and
+    then by `ssh -G` canonicalization (`ssh://user@host:port` machine targets
+    included); live sessions on exactly one socket path with the shape of the
+    profile's named herdr session (`HerdrSessionSocket`); over the app-managed
+    forward, exactly one candidate claiming the focused pane, herdr's own
+    `agent_session` claim not disagreeing, and the registered agent in the
+    pane's foreground; and finally one panel stamp whose fresh token must
+    appear in the focused grid. The token no longer names the machine: the
+    selection state did. On a 0.9 client it proves the surface is a whole-view
+    client federating that server—attach/observe surfaces render no sidebar.
+    It does NOT prove the selection is fresh: a token stamped on machine B's
+    pane renders while the user views machine A, so a selection file lagging
+    the live client joins B, the #286 wrong-join shape. That lag is bounded by
+    the lone-surface rule and herdr's own selection writes (herdr rewrites
+    `endpoint-selection.json` on every switch, and `machine remove/disable`
+    rewrite it too; a failed write is only a warning), and closing it needs an
+    upstream herdr change (an active-endpoint report on the socket), not a
+    stronger token. A match keeps the
+    token as the mic indicator with the same forward/indicator lifecycle as
+    the remote arm; a miss abstains under its own federated cause and points at
+    the LOCAL panel-row config. Like every herdr join, it authorizes no raw AX
+    capture and its screen context is a `pane.read` of exactly the joined pane.
+    THREE RESIDUALS. First, herdr's state directory moves with
+    `XDG_STATE_HOME`, which a GUI app cannot see in the user's shell, so such a
+    user reads back "no machines saved" and keeps the unguarded behavior.
+    Second, the files describe what a client STARTING NOW would show, so they
+    lag a live client that has not caught up: a client polls the catalog once a
+    second and returns to Local when the machine it displays is removed or
+    disabled (herdr `src/client/catalog_reload.rs`), which bounds the window
+    but does not close it. Third, multi-client ambiguity remains: one selection
+    cannot name the focused surface when several herdr clients are visible, so
+    that state abstains. None is closable with the file interface herdr
+    offers. The real closure is herdr reporting its active endpoint on the
+    socket, which is an upstream ask (issue #288).
   - cmux (github.com/manaflow-ai/cmux — a native Swift/AppKit terminal on
     libghostty) is a join target with its OWN arm, keyed on the surface id
     cmux injects into the session environment. It is opt-in
@@ -122,8 +1423,8 @@ there is not.
     mode with a password (cmux's default `cmuxOnly` mode does a peer-ancestry
     check we cannot pass — we are not a cmux child). The password lives in the
     Keychain (`CmuxSocketPasswordStore`); the socket is dialed by
-    `CmuxSocketClient` (hand-written, read-only — cmux is GPL-3, never vendor
-    its code), which asks `system.tree` for the focused surface (and its tty)
+    `CmuxSocketClient` (hand-written — cmux is GPL-3, never vendor its code;
+    its two writes are the cmux route's, above), which asks `system.tree` for the focused surface (and its tty)
     and `surface.read_text` for that one surface's VIEWPORT (never
     `scrollback`, and never `lines` — in cmux that parameter implies
     scrollback). Auth is per CONNECTION, not per message: `auth.login` is the
@@ -141,17 +1442,14 @@ there is not.
     `SecCode`'s signing identifier is not guaranteed to equal the bundle id, so
     requiring equality could kill the feature against a legitimately signed
     cmux, and the pid binding is the stronger claim anyway.
-    Both origins join here, and only here does a REMOTE session join by
-    something other than a marker: cmux's ssh relay puts the surface id into a
+    Both origins join here: cmux's ssh relay puts the surface id into a
     `cmux ssh` shell's environment, so the id is ours travelling out and back
     (`resolveRemote(cmuxSurfaceID:)`). But a remembered label is NOT evidence
     that the session still holds the surface — a compromised enrolled host can
     replay an id from an earlier `cmux ssh` session after that surface returned
     to a local shell, and as sole remote candidate it would join, pairing
-    attacker-chosen context with the user's current local screen. That is
-    strictly weaker than the marker fallback, which at least has to ride the
-    PTY the session presently controls. So a remote claim additionally requires
-    FRESH evidence from cmux that the focused surface is currently
+    attacker-chosen context with the user's current local screen. So a remote
+    claim additionally requires FRESH evidence from cmux that the focused surface is currently
     remote-hosted. cmux exposes none of that on the surface (a `cmux ssh`
     surface is an ordinary `type: "terminal"`; remoteness lives on the
     WORKSPACE), so the client reads `workspace.remote.status` for the focused
@@ -165,7 +1463,7 @@ there is not.
     process that inherited a stale surface id and moved panes publishes no tty
     to contradict. The cost is stated where it is paid — an opencode session
     inside cmux never joins over this arm (its server half publishes no tty by
-    design, and opencode receives no title marker either).
+    design), so opencode inside cmux gets no join at all.
     Ambiguity on EITHER origin abstains: exactly one side may resolve, and the
     other must have no candidate at all. Rejecting only resolved/resolved made
     it asymmetric — two local claimants plus one remote used to join the
@@ -173,25 +1471,116 @@ there is not.
     consulted (regenerated on restore), and `CMUX_SURFACE_ID` is itself
     session-scoped — cmux re-mints it on restore, which is safe here only
     because both sides of the match come from the same cmux run and stale
-    UUIDs cannot collide. Unlike herdr's, a cmux abstention DOES fall through
-    to the marker arm: cmux forwards inner OSC 2 to the window title (defeated
-    by custom names and AI auto-naming, which is why the surface arm exists).
+    UUIDs cannot collide. A cmux abstention used to fall through to the
+    window-title marker arm — cmux forwards an inner OSC 2 to its window title
+    — and since that arm was removed (2026-09-05) an abstention here is the
+    dictation's answer. The title was never reliable anyway: a custom
+    workspace name or cmux's AI auto-naming replaces it, which is why the
+    surface arm exists.
     cmux exposes no AX text at all, so the join never authorizes raw AX
     attachment and its screen context is `surface.read_text` through the same
     `SocketPaneScreenContext` gate as herdr's `pane.read`.
   - A herdr running on an ENROLLED REMOTE host is its own arm
     (`.remoteHerdrPane`), tried only after every local arm declined, and it
-    reaches that herdr over an app-managed, on-demand `ssh -L`
-    (`ClaudeRemoteHerdrForward`) opened at dictation start and closed when the
-    dictation is done with it. The bindings, ALL required, in cost order so an
-    ordinary ssh session never pays for a tunnel:
-    (1) the focused surface's own TTY hosts EXACTLY ONE FOREGROUND `ssh`
-    session, whose destination is exactly one enrolled host's alias. One,
+    reaches that herdr over an app-managed, supervised `ssh -L`
+    (`ClaudeRemoteHerdrForward`). An authenticated hook carrying a usable herdr
+    socket label starts it off the dictation path; a successful cold join also
+    retains it. Dictations lease the local socket, and the app keeps the process
+    through a bounded injected-clock idle window so later dictations reuse the
+    completed SSH/ProxyJump handshake. Its PRIMARY surface authorization is the
+    herdr agents-panel binding, not ssh argv. For each plausible enrolled host
+    (the readable ssh destination when available; when an ssh is PRESENT but
+    unreadable, at most three enrolled hosts with live herdr-bearing
+    sessions; a surface with NO ssh at all never probes — a local shell must
+    not pay cold-forward latency or flash nonces in panels the user is not
+    looking at), the resolver preserves the
+    single-socket rule, opens the forward, reads `pane.current`, and identifies
+    the unique live session claiming that pane. It then stamps that pane through
+    `pane.report_metadata` with a fresh `lv-mic-…` nonce (more than 40 random
+    bits, 8 s TTL) and requires that token in the focused terminal's
+    existing visible-grid route within a bounded injected-clock settle window.
+    Not the WHOLE token: herdr truncates an agents-panel row to the sidebar's
+    column budget, which the user's own sidebar width decides, so the match is
+    the longest rendered prefix with a FLOOR of 8 nonce digits
+    (log2(36^8) ~= 41.4 bits — the "more than 40 bits" bound is what the floor
+    exists to hold, and a shorter run is refused as `row-truncated`, never
+    accepted as weaker evidence). Field measurement 2026-09-05 is why: at
+    `sidebar_width = 20` the 17-column token rendered as `lv-mic-<8 digits>…`
+    and an exact match could never succeed while the row was visibly there.
+    A whole-view
+    App client renders the agents sidebar; `terminal_attach` and
+    `terminal_observe` render only the raw pane and cannot render this token.
+    The nonce travels only over the owner/mode-checked forwarded socket and is
+    unguessable inside its short lease, so remote-influenceable terminal text
+    cannot manufacture the match without already observing that herdr server.
+    Two hosts whose distinct nonces both appear abstain. A matched token stays
+    alive as the dictation's visible mic indicator (refresh about every 4 s,
+    TTL 8 s) and is explicitly cleared before its forward closes.
+    EXTERNAL ASSUMPTION: herdr upgrades must re-verify BOTH that attach/observe
+    clients still omit the sidebar (`src/server/headless.rs` render loop) and
+    that all App clients still render one server-global panel/focus
+    (`tests/multi_client.rs`). Per-client focus or a sidebar in attach mode
+    invalidates this authorization argument. The first half is now MEASURED
+    rather than assumed: the `integration-herdr` lane stamps a nonce through a
+    real forward and asserts that a whole-view client renders it while a
+    `terminal attach` client of the same pane does not
+    (`HerdrIntegrationTests`, `docs/agent/test-tiers.md`). The server-global
+    focus half remains unmeasured — see the panel-binding doc's "Pinned against
+    a live server" section for exactly which assumptions are covered and which
+    are still documented hopes.
+
+    herdr 0.9.0 CHANGED WHAT A RENDERED TOKEN PROVES, so the whole-view
+    sentence above is no longer the discriminator on a 0.9 client. That client
+    composes the agents panel itself, from every federated machine at once
+    (`src/client/shell/endpoint_agents.rs`), out of its OWN
+    `[ui.sidebar.agents]` rows (`ClientShellConfig::from_config`), and marks the
+    active machine by background color alone, which a text grid read cannot
+    see. A token stamped on machine B's pane therefore renders while the user
+    views machine A: the match proves that the surface federates that server,
+    not that it displays it. This costs nothing for the argv-based arm,
+    because that arm never probes a surface with no ssh and a federated client
+    has none — unless the federating client runs on the far side of ssh
+    (`ssh builder herdr`, builder's client federating B). Its panel renders
+    builder's token while B is shown, so a match in a grid that also shows
+    herdr's ` machines` sidebar header (`HerdrPanelBindingProbe
+    .showsMachineList`) is refused as `federated-client`, with no argv
+    fallback. A collapsed or hidden sidebar renders no token and no header,
+    and the argv fallback cannot see the federation: that residual stays.
+    The federated `.federatedHerdrPane` arm is the extension that
+    names the machine from herdr's own selection state first (issue #286) and
+    only then uses the token, which keeps its whole-view-prover and
+    mic-indicator roles (it never proved freshness or display — see the
+    federated arm paragraph above). The argv-based `.remoteHerdrPane` arm below
+    is a behavior- and string-preserving refactor into `confirmRemoteHerdrPane`
+    — no argv semantics changed — and still serves non-federated ssh surfaces.
+
+    Any stamp refusal, unavailable grid, hidden/unconfigured/scrolled panel row,
+    a row cut below the entropy floor, or a bounded settle timeout can only
+    produce NO MATCH. It closes that attempt
+    and falls through to the pre-existing argv authorization below; it never
+    weakens the pane-level confirmations. The fallback first requires that the
+    focused surface's own TTY host EXACTLY ONE FOREGROUND `ssh`
+    session, whose destination identifies exactly one enrolled host. Exact
+    alias matching wins without spawning anything; only when it finds no host,
+    the app resolves the operand and each active enrolled alias through the
+    user's effective `ssh -G` config and compares `(hostname, port)` — never
+    `user`, which `ssh -G` always emits and which is always the local default
+    on the operand side because the probe strips `user@` upstream; comparing
+    it would reject an alias that sets `User`, the common build-host shape,
+    while two same-box enrollments still land in the multiple-match
+    abstention. Any refused operand, spawn/timeout
+    failure, or unparseable output discards the whole fallback; two canonical
+    matches remain ambiguous. An argv that sets the port (`-p`) is refused
+    before any match: both comparisons describe the alias's own port, while
+    `ssh -p 2222 builder` reaches another sshd on that address. The panel
+    proof needs no port, since it reads what the screen shows. Results are briefly TTL-cached because ssh config
+    can change on disk. One,
     because several in a group cannot be told apart from here, and unioning
     them let a plain connection borrow a sibling's herdr signal. `SSHDestinationTTYProbe`
     is deliberately paranoid here, because every way an argv can name one host
-    while the connection goes elsewhere is a mis-join: it verifies the
-    EXECUTABLE against three EXACT absolute paths (`/usr/bin/ssh` and
+    while the connection goes elsewhere is a mis-join — and since 2026-09-05
+    it answers for the plain-ssh arm too, so a refusal here costs both: it
+    verifies the EXECUTABLE against three EXACT absolute paths (`/usr/bin/ssh` and
     Homebrew's two `bin/ssh`, via `proc_pidpath` — not `p_comm`, not argv[0],
     and never by directory prefix, since `/opt/homebrew` and `/usr/local` are
     user-writable and a prefix rule trusted `/opt/homebrew/tmp/ssh`; a symlink
@@ -204,80 +1593,219 @@ there is not.
     a background one, or `scp`/`rsync`'s helper is not mistaken for the screen),
     and ABSTAINS on `-o`/`-F`/`-O`/`-S`/`-N`/`-f`/`-M`/`-D`/`-W`/`-w` rather
     than skipping them — `ssh -o HostName=other builder` must never answer
-    `builder`;
-    (2) that ssh session IS herdr — its remote command's first argv token has
-    basename `herdr` — AND this terminal holds the ONLY ssh connection to that
-    destination on the machine (a `KERN_PROC_ALL` scan counting every other ssh
-    with a controlling terminal, including suspended ones on this same device).
-    BOTH, because each covers what the other cannot. Uniqueness alone does not
-    prove what the terminal DISPLAYS: a herdr whose client detached, or whose
-    pane still carries a marker and a running agent inside the registry TTL,
-    keeps answering `pane.current` with that pane, so a later sole `ssh builder`
-    would join a session the user cannot see. The argv signal alone is not
-    enough either — argv is written by whoever launched the process, which is
-    why it is matched on the FIRST command token only (`ssh host sh -lc 'printf
-    herdr; exec claude'` mentions herdr and is not it).
-    Requiring the argv signal is what the absence of a better one forces:
-    herdr exposes NO read-only attachment signal — verified against the 0.7.5
-    socket schema and the 0.8.0 docs, the only `client.*` methods are
+    `builder`. The exact, case-insensitive `SetEnv=` and `SendEnv=` `-o` keys
+    are the only exception: they can neither move the destination nor change
+    the session's interactivity, and accepting them keeps terminal wrappers
+    such as Ghostty's from making every probe abstain. ssh MACHINERY is
+    invisible to this count and to the uniqueness
+    competing-view scan below: an ssh that is a direct CHILD of another scanned
+    ssh — a ProxyJump's `ssh -W` hop, which OpenSSH spawns on the same tty in
+    the same foreground process group (field abstention 2026-08-06) — is its
+    root connection's transport, not a second connection. The partition rides
+    kernel ppid, which no launcher gets to write, so it cannot hide a
+    connection (the demoting parent is itself counted); sibling ssh processes
+    in one group have no ssh parent and stay refused, and a shell-mediated
+    ProxyCommand's grandchild stays a root and abstains — conservative on
+    purpose. Probe abstentions carry a content-free cause category
+    (`SSHProbeIndeterminacy` — never a host, path, or option letter) into the
+    log and the diagnostic record, because three field dictations were diagnosed
+    blind without one;
+    It then requires that ssh session to BE a plain whole-view herdr client — classified, not
+    boolean (`HerdrInvocation`): the remote command's first argv token has
+    basename `herdr` and the rest is empty or `--session <name>`. Every other
+    herdr shape is REFUSED because it displays something other than the
+    server-global focus the join reads: `herdr terminal attach <id>` renders
+    ONE pane, and a `--session` we cannot normalize may be a DIFFERENT server
+    (named sessions have separate sockets) — both were mis-joins reachable
+    with a single connection while the signal was a boolean. AND no OTHER
+    tty-holding ssh root on the machine may be a COMPETING herdr view of that
+    destination (a `KERN_PROC_ALL` scan, including suspended ones on this same
+    device): a client with a different session selector, a herdr subcommand
+    shape, an argv that was refused and mentions `herdr` (substring,
+    one-sided), or anything unreadable. What deliberately does NOT compete
+    (2026-08-06, replacing blanket machine-wide uniqueness): ANOTHER USER's
+    ssh (kernel `e_ucred.cr_uid`, never self-reported) — their herdr view
+    lives in their own login session, not on a surface this user dictates
+    into, and their metadata is never read; a cross-uid ssh ON the focused
+    surface itself (`sudo ssh`) still abstains as an unreadable client rather
+    than vanishing; a plain shell or
+    non-herdr ssh to the same host — it is on another tty and the probe only
+    reads the FOCUSED surface's tty — and a second whole-view client with a
+    byte-identical selector, because herdr focus is SERVER-GLOBAL and
+    multi-client attach is a mirror (verified in herdr source at v0.8.0 /
+    protocol 19: `src/app/api/panes.rs::handle_pane_current` resolves the
+    app's single active pane; `tests/multi_client.rs` proves frames broadcast
+    to all clients), so both clients display the same focused pane and the
+    join is correct for either. EXTERNAL ASSUMPTION: that focus model. If
+    herdr ever grows per-client views, same-selector coexistence becomes a
+    mis-join — re-verify `handle_pane_current` + the multi-client tests on
+    herdr upgrades before trusting this paragraph. A SECOND external
+    assumption rides with it: "byte-identical selector ⇒ same server" holds
+    only while the remote side derives the socket from the selector alone —
+    a shell with `HERDR_SOCKET_PATH` or a different `XDG_RUNTIME_DIR`
+    exported can attach two bare `herdr` invocations to DIFFERENT servers,
+    which this rule cannot see from the Mac (the argv is all it has). The
+    residual is bounded downstream — candidates spanning two sockets abstain
+    at the single-socket rule, and the pane-level confirmations still have to
+    agree — but a candidate set living entirely on the OTHER
+    server confirms against that server, so the honest statement is: env
+    divergence on the remote defeats the selector comparison, and we accept
+    that because the divergence is the user's own deliberate configuration.
+    The argv signal is trustworthy here in a way the old comments undersold:
+    it is the EXEC-TIME vector of a VERIFIED OpenSSH binary (kernel
+    `KERN_PROCARGS2`), i.e. the command ssh actually ran, not a self-report —
+    but it is still matched on the FIRST command token only (`ssh host sh -lc
+    'printf herdr; exec claude'` mentions herdr and is not it), because what a
+    shell wrapper goes on to run is not something any argv can promise. The
+    invocation requirement exists because being the sole connection proves
+    nothing about what the terminal DISPLAYS: a herdr whose client detached,
+    or whose pane still runs an agent inside the registry TTL, keeps answering
+    `pane.current`, so a plain `ssh builder` must never reach the join no
+    matter how alone it is.
+    The argv fallback remains necessary when the direct panel proof cannot
+    render. Its historical limitation is:
+    herdr exposes NO read-only attachment signal — re-verified at v0.8.0 /
+    protocol 19 (2026-08-06), the only `client.*` methods are
     `window_title.set`/`clear`, both MUTATIONS (so `no_foreground_client` is not
-    an acceptable probe), and `session.snapshot` carries no attachment field.
-    The accepted cost, stated accurately: the manual flow — `ssh host`, then
-    typing `herdr` — gets no HERDR join. It does NOT get "no context": the arm
-    returns `.notApplicable`, so the title-marker arm still runs, and a marker
-    an earlier session on that host left in the OUTER title can still win. That
-    residual is pre-existing (it is what remote sessions have always done) and
-    cannot be closed from here, because nothing on the surface reveals a remote
-    herdr running inside it — e.g. run Claude in a plain ssh so its marker sits
-    in the title, suspend it, then start herdr by hand: dictation joins the
-    suspended session. What this arm refuses is a wrong HERDR join. It also
-    makes the arm free for everyone else: a plain ssh to an enrolled host no
-    longer spawns a forward before falling through;
-    (3) that host has live remote sessions reporting a herdr pane, all from ONE
+    an acceptable probe), `session.snapshot` carries no client records, and
+    the event stream has no client lifecycle events.
+    The manual flow — `ssh host`, then typing `herdr` — now joins through the
+    panel binding whenever the agents sidebar and configured token row are
+    visible. Its residual is narrow/collapsed/covered sidebar or an unconfigured
+    row: panel authorization fails closed, then argv still cannot identify the
+    manually launched herdr, and there is nothing under it — the dictation gets
+    no join. The plain-ssh arm does NOT rescue that flow and must not be made
+    to: those sessions carry `HERDR_PANE_ID`, so they are refused there by the
+    multiplexer rule (a herdr server keeps the FIRST connection's
+    `$SSH_CONNECTION`, exactly as tmux does), and joining them on a connection
+    would bind a pane's session to whichever window started the server. The whole "title-marker arm suppression" rule
+    that used to live here (the exact `SSHProbeIndeterminacy` categories that
+    did and did not suppress an outer title) is gone with the arm it protected;
+    `SSHProbeIndeterminacy` remains as a content-free diagnostic category only.
+
+    Both surface-authorization paths retain the remaining bounds: the host has
+    live remote sessions reporting a herdr pane, all from ONE
     herdr socket (`liveRemoteHerdrSessions(hostID:)`, the mirror of the local
     single-socket rule). The count that matters is SOCKETS, not sessions:
     several live sessions on one herdr are expected and fine — panes are what a
     multiplexer is for, and serving that workflow is the point of this arm — so
     only two herdr SERVERS leave the surface ambiguous;
-    (4) over the forward, exactly ONE of those candidates claims that herdr's
-    FOCUSED pane id (two candidates claiming the same pane id abstain), and that
-    pane's captured `terminal_title` carries exactly that session's
-    broker-allocated marker;
-    (5) herdr's own `agent_session` claim for the pane does not disagree, and
-    the pane is running that session's agent.
-    Herdr-or-nothing begins at CONFIRMATION, not before: everything up to and
-    including step 4 falls THROUGH to the title marker on failure, and only
-    steps after it abstain. Registry candidates existing on the host is not a
-    binding for this connection — a detached herdr, or one whose sessions are
-    merely still inside their TTL, would otherwise cost a sole plain ssh session
-    the outer marker join it has always had. Once the pane id AND our own
-    broker-allocated marker both match, the connection IS displaying that
-    session, and from there a marker in the outer window could only describe
-    something else, so a later fail-closed refusal joins nothing at all. The
-    residual: while the arm has not confirmed, a marker left in the outer title
-    by a pre-herdr session on the same host can still win — exactly the behavior
-    that predates this arm.
-    Note WHY the marker works here and not locally: herdr captures an inner
-    pane's OSC 2 into `PaneInfo.terminal_title`, and the remote listener
-    already returns a marker to every remote session unconditionally — so the
-    marker is sitting in the joined pane's title, invisible to the outer
-    terminal. The `agent_session` cross-check is fail-closed exactly like the
+    over the forward, exactly ONE of those candidates claims that herdr's
+    FOCUSED pane id (two candidates claiming the same pane id abstain);
+    herdr's own `agent_session` claim for the pane does not disagree; and the
+    pane is running that session's agent. Registry candidates existing on the
+    host is NOT itself a binding for this connection — a detached herdr, or one
+    whose sessions are merely still inside their TTL, keeps answering
+    `pane.current` — which is why the surface authorization above (panel nonce,
+    or argv classification) has to come first.
+
+    **The pane confirmation used to have a fourth member. Losing it is the one
+    place this removal costs security rather than only reach — but the field
+    measurement below is why it had to go anyway. Read both halves before
+    touching the arm.**
+
+    MEASURED on the owner's setup, 2026-09-05, with the panel nonce matching
+    and everything else healthy: the join ended at `remote-herdr: panel-bound
+    pane marker confirmation failed`. Polling that pane's `terminal_title` at
+    ~325 Hz for 69.4 s across a hook event, the broker marker was the title
+    for **0.88 s total — 1.26 % of the window**; the rest of the time it was
+    Claude Code's own conversation title (`✳ …`), which clobbers the OSC 2
+    write. Restarting the same session with
+    `CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1` left the marker standing and the
+    join succeeded immediately. So the "fought-over channel" hazard this file
+    documents for LOCAL titles applies to a herdr PANE title too — herdr
+    captures whatever the inner program last wrote, and the inner program is
+    the one rewriting it. The confirmation was not a second binding in
+    practice; it was a ~1 % lottery that blocked the shipped feature for any
+    user who had not exported that variable. Removing it is the fix, not a
+    weakening of a working check. What follows is the honest accounting of
+    what the check would have bought had it fired. herdr captures an inner pane's OSC 2 into
+    `PaneInfo.terminal_title`, and the remote listener returned a
+    broker-allocated marker to every remote session, so the marker was sitting
+    in the joined pane's captured title where the arm could require it. Its
+    value was that a pane id is a LABEL THE ENROLLED HOST CHOSE, while a marker
+    is a value WE minted and handed to exactly one authenticated session: a
+    compromised enrolled host could publish another session's `HERDR_PANE_ID`,
+    but it could not make that pane's title carry its own marker.
+
+    What a compromised enrolled host could do BEFORE: publish a pane id it does
+    not own, and be refused at the marker check (unless it could also write
+    that other session's marker into the pane title — which it could, since
+    both sessions run on the host it controls and OSC 2 is just bytes on a pty.
+    So the marker was never a boundary against a host that had ALREADY been
+    compromised; it was a boundary against a host that was merely CONFUSED, and
+    against a session lying about a pane it never occupied).
+    AFTER: the same host publishes the same forged pane id and is refused by
+    herdr's own `agent_session` claim when herdr has one, and by the pane's
+    foreground process list when it does not.
+
+    **Read the strength of those two carefully; they are not equal, and the
+    second is weaker than it looks.** The `agent_session` claim is an answer
+    from herdr — the party that actually watches the pane — and a forger cannot
+    produce it. The foreground check is not: `remoteAgentIsForeground` is
+    satisfied by EITHER the session's own published `hookParentPID` (the remote
+    shim's `$PPID`, an `X-Lvx-Env-Hook-Parent-Pid` header the CLAIMANT wrote)
+    appearing in herdr's list, OR any foreground process merely NAMED for the
+    agent. So it asks "is an agent running in that pane", not "is THIS session
+    running in that pane" — and both satisfiers are things a claimant on the
+    host can arrange without occupying the pane: same-uid code can read the
+    victim pane's foreground pid and publish it, and any pane running `claude`
+    at all satisfies the name check.
+
+    Which makes the residual wider than a forgery story, and it has an innocent
+    form that matters more: an ordinary session carrying a STALE
+    `HERDR_PANE_ID` — inherited by an exec, or left over after herdr moved
+    panes — joins onto whichever session is actually in that pane, whenever
+    herdr reports no `agent_session` for it and an agent is running there. And
+    the lane measured that absence as the COMMON case
+    (`remote-herdr-panel-binding.md`, "Pinned against a live server":
+    `pane.current` did NOT carry `agent_session` for a pane whose agent session
+    id had been reported through `herdr pane report-agent-session`). The marker
+    was the check that told two sessions in one pane apart, and nothing
+    replaces it; what bounds this now is that the candidate set is scoped to
+    ONE enrolled host, that only ONE candidate may claim the focused pane id at
+    all, and that enrollment is revocable. Do not build a new argument on the
+    foreground check without re-reading this paragraph.
+    The refusals that DO hold are pinned by
+    `testASessionForgingAnotherPaneIDIsRefusedByHerdrsOwnClaim` and its
+    foreground sibling; the residual above is deliberately not pinned by a test
+    that would assert a mis-join is possible.
+
+    What the panel nonce still proves, and it is the load-bearing half: that
+    the FOCUSED LOCAL SURFACE — the window the user is looking at, read through
+    our own AX capture — is displaying a whole-view client of the specific
+    herdr server we just stamped, within an ~8 s TTL, with a token of more than
+    40 random bits that travelled only over an owner- and mode-checked
+    forwarded socket. That is a statement about THIS Mac's screen, which no
+    remote host can forge and which the marker never made: the marker said
+    "this pane belongs to this session", never "this window shows this
+    server". Surface authorization and pane confirmation answer different
+    questions, and removing the marker removed a second answer to the second
+    question, not the first.
+    The `agent_session` cross-check is fail-closed exactly like the
     local arm's and is what catches a REUSED pane (a session that died without
-    a SessionEnd leaves a live entry, its marker and its pane id behind).
+    a SessionEnd leaves a live entry and its pane id behind).
     The foreground check takes EITHER a `hookParentPID` (the shim's `$PPID`,
     compared as a STRING — a remote pid is another machine's number) or a
     process named for the agent; requiring both would fail closed forever on
     two ordinary installs (Claude Code spawns hooks through a shell, so `$PPID`
     is often that shell, and an npm install appears as `node`).
-    The tunnel is owned by `DictationViewModel`, never by the join value that
-    travels: the commit path CONSUMES the join, so an owner reaching the child
-    through `claudeSessionJoin` was nil at exactly the moments that mattered
-    (quit during polish, an aborted connect) and the ssh outlived the app.
+    The process is owned by the app-level `ClaudeRemoteHerdrForwardService`,
+    never by the join value that travels: the commit path CONSUMES the join, so
+    an owner reaching the child through `claudeSessionJoin` was nil at exactly
+    the moments that mattered (quit during polish, an aborted connect) and the
+    ssh outlived the app. `DictationViewModel` owns only leases, releasing every
+    one on its existing session-exit paths; the service owns idle, revoke, quit,
+    supervision, pid-ledger and next-launch orphan-reap lifecycles. Replacing
+    a forward removes the old entry before waiting for its teardown, so a
+    revoke or quit during that wait has nothing to stop; the waiter checks
+    enrollment and quit again when it resumes and spawns nothing (#1104).
   - **The remote herdr forward is a trust inversion, and it is bounded by what
     we SEND, not by what the socket allows.** herdr's JSON socket is
     full-control: over that same forwarded stream one could create panes, write
     keystrokes into them, kill them. We dial OUT to it and send only
-    `pane.current` / `pane.process_info` / `pane.read`, and that restraint —
+    `pane.current` / `pane.process_info` / `pane.read`, plus only the bounded
+    `pane.report_metadata` `lvmark` lease described above, and that restraint —
     plus the one client in the codebase being hand-written — is the whole
     boundary. In exchange, `ClaudeRemoteSessionEnvironment.herdrSocketPath`
     stays what PR #216 made it: a label that is NEVER handed to `FileManager`,
@@ -292,15 +1820,19 @@ there is not.
     session — into a fatal error for this connection (measured: ssh exits).
     Readiness is a bounded connect-poll of the local socket instead, on an
     injected clock, with a ~2 s ceiling that is a dictation-start latency
-    budget as much as a correctness one. The RESIDUAL of dropping them: this
-    short-lived connection still requests whatever forwards the alias's own
+    budget as much as a correctness one and is UNCHANGED for a cold dictation.
+    Before reuse, BOTH the supervised process and a fresh connect to the local
+    socket must be healthy; either failure tears the entry down and returns to
+    that cold path. Activity-driven preparation does not block a dictation, so
+    a slow ProxyJump may finish before the next one. The RESIDUAL of dropping
+    the two options: this retained connection still requests whatever forwards the alias's own
     `Host` block declares, including the enrollment `RemoteForward` — since
     #217 that is this Mac's own port, so a collision with the user's live
     session is a warning on a stderr we send to `/dev/null`, not a failure.
     Three options ARE forced, because the alias's config would otherwise reach
     into this child: `ControlPath=none` (so the forward belongs to our own
-    process and killing it IS the teardown, at the cost of one handshake per
-    dictation), `ForkAfterAuthentication=no` (a detached ssh is an orphan we
+    process and killing it IS the teardown; persistence amortizes the handshake
+    without borrowing the user's master), `ForkAfterAuthentication=no` (a detached ssh is an orphan we
     can neither observe nor kill), and `PermitLocalCommand=no` (a dictation
     must not be able to trigger `LocalCommand` on this machine). Teardown
     signals the process GROUP — the child is spawned as its own group leader
@@ -316,22 +1848,61 @@ there is not.
     with it the pgid — is reserved only while the child is unreaped, so the
     zombie is what keeps `-pid` meaning OUR group; teardown signals first and
     reaps last, and once reaped NOTHING may signal that group again (a tunnel
-    that exits by itself mid-dictation is closed at stop time seconds later,
-    which is exactly when a reused pid would be someone else's). Cost: one
-    zombie per open forward, for the life of one dictation — and that bound
+    that exits by itself is finalized by the supervisor before restart, which
+    is exactly when a reused pid could otherwise be someone else's). Cost: one
+    zombie per supervised forward between leader exit and teardown — and that
+    bound
     only holds because the reap COMMITS only on a definitive answer (the child
     collected, or `ECHILD`), retrying `EINTR` and leaving anything else
     unreaped for the next teardown. Claiming the reap before calling `waitpid`
     turned an interrupted collection into a permanent lie about a zombie that
-    was still there, i.e. one leaked per dictation without bound. The collect
+    was still there, i.e. one leaked per restart without bound. The collect
     is also NON-BLOCKING first (`WNOHANG`, bounded poll, then handed to a
-    background queue): every caller is a user-visible path — stop, commit,
-    cancel, app quit, all on the main actor — and a child wedged in an
+    background queue): every caller is a user-visible path — idle, health
+    replacement, revoke, app quit, all on the main actor — and a child wedged in an
     uninterruptible wait must cost a background thread, never the UI.
+    The arms read their host and session before the forward opens and
+    build the join after it and the pane reads answer, so each re-asks, after
+    its last await, that the host is still enrolled and not revoked and the
+    session still live in the same pane (`remoteHerdrJoinLapse`, #1117). A
+    revoke or a session end in between leaves no join.
     A remote herdr join authorizes no more than a local one: never the raw AX
     capture (that grid is the composite herdr TUI, on someone else's machine),
     and never local repo collection — the origin is remote, so
     `localWorkspacePath` is nil by type.
+  - **The `--probe-surface` diagnostic verb runs the real resolver, so its
+    read-only-ness is enforced by what it is HANDED, not by what it chooses to
+    do.** A one-shot process is the worst possible owner for the two arms that
+    write anything: an `ssh -L` it opens has no supervisor and no idle window,
+    and a `pane.report_metadata` `lv-mic-…` stamp it leaves behind has nobody
+    left to clear it if the process is killed between stamping and clearing. So
+    `ClaudeSurfaceProbeCommand` passes `remoteHerdrForwards` and
+    `herdrPanelMetadata` as `nil` — the resolver's own documented "this arm can
+    never spawn anything" configuration — and the arm reaches `forward
+    capability unavailable` and stops. There is no flag that re-enables them,
+    which is the point: an opt-in would be a cleanup obligation, and this is the
+    absence of the capability. The arm's read-only halves (the process-table
+    ssh probe, enrolled-host matching including `ssh -G`, which resolves config
+    and opens no connection) DO run, because they are what the field questions
+    are about. Withheld for their own reasons and by the same construction:
+    `cmuxSurfaces`/`cmuxJoinEnabled` (the arm reads a Keychain password — a
+    diagnostic must not raise that prompt), `focusedBrowserTabURL` (a tab URL
+    is a page the user is looking at), and `readFocusedGrid` (screen text; only
+    the panel-nonce match ever needed it, and that match cannot happen here).
+    One reader is wired only on request: `--desktop` probes the running Claude
+    Desktop instead of the frontmost app and hands the resolver the Desktop
+    arm's Accessibility read, which switches Electron's accessibility tree on
+    and is therefore never a default.
+    What the verb PRINTS is bounded by `ClaudeSessionJoinSummary`, the single
+    mapper the diagnostic record also uses: an arm name, the resolver's own
+    content-free abstention categories, an origin CLASS, a terminal NAME, and
+    two Bools — never a session id, pane id, socket path, host, nonce, or
+    workspace path. The live registry is in the app, so the verb restores the
+    copy the app saves (`ClaudeSessionFileStore`), through the app's own
+    restore checks and a store that never writes: a restore that drops a row
+    rewrites the file, and the file belongs to the app. It is only as fresh as
+    the app's last save, and an empty one is the verb's first cause rather
+    than letting the arms' resulting declines read as a surface failure.
   - Screen capture is split by ROUTE (`TerminalScreenAllowlist`): raw AX grid
     capture remains Ghostty-only (its single-`AXTextArea` grid is verified;
     iTerm2's AX tree is ambiguous across splits, Terminal.app's unverified).
@@ -347,7 +1918,322 @@ there is not.
     reconcile, vocab-always / raw-excerpt-only-after-authorized-join). A TTY
     join in iTerm2/Terminal.app authorizes attaching that focused pane's
     contents; herdr and cmux joins never attach AX surface text on any
-    terminal.
+    terminal. A TTY join authorizes only the pane it matched: the start
+    capture carries the focused pane's tty, read just before its text, and
+    the join's own tty read just after it closes the bracket. The two must
+    be equal, because a window's tabs share its window identity and a tab
+    switch between the capture and the join would otherwise pair one tab's
+    screen with another tab's session (#1226). This is the one extra surface
+    read per dictation; it selects nothing, it only binds the capture.
+  - **The local-tty echo arm (`.remoteLocalTTY`, 2026-09-06).** The tty arm,
+    with the identifier taking one extra trip — and the arm that actually
+    serves the configs people have. `resolve(tty:)` compares the focused
+    pane's device against a device a LOCAL session's hooks read from `/dev`
+    here; this compares it against a device name that came FROM here, carried
+    into the remote session by ssh itself.
+
+    The carrier is `$LC_LVX_TTY`: the user's own shell exports it, ssh's
+    `SendEnv` sends it, sshd's stock `AcceptEnv LANG LC_*` accepts it, and
+    libc ignores locale names it does not know — the mechanism iTerm2 ships
+    `LC_TERMINAL` on. Tried BEFORE `.remoteSSHConnection`, because it is the
+    one that works through the two things that defeat a TCP-level match, and
+    both were MEASURED on a live OpenSSH pair (2026-09-06): the value arrives
+    unchanged through a `ProxyCommand`/`-W` jump — where the connection
+    binding has no chain it can follow at all, see the ProxyJump paragraph
+    above — and two sessions multiplexed over ONE ControlMaster connection
+    each receive their OWN value, because ssh carries environment per SESSION
+    CHANNEL rather than per connection. The Mac-side setup is one rc line
+    plus a `SendEnv` in the enrollment-written `Host` block (most ssh_configs
+    already send `LC_*`; the line is what makes it true on the rest).
+
+    Requirements: the focused surface's tty, read through the terminal's own
+    scripting interface — never anything the remote host said; exactly one
+    foreground ssh on that surface whose destination resolves to exactly one
+    enrolled host (ProxyJump does not change the destination OPERAND, so a
+    jumped connection resolves like any other); the candidate registered by a
+    hook AUTHENTICATED FROM THAT HOST; the candidate a plain ssh shell
+    (`$SSH_TTY`, and none of `multiplexerLabels` — a multiplexer server keeps
+    the FIRST client's environment, so a pane's `$LC_LVX_TTY` names whichever
+    window started the server, the same inheritance the connection arm
+    refuses); its reported tty well-formed
+    (`ClaudeRemoteLocalTTYPath.isAcceptable` — under `/dev`, no traversal,
+    bounded) and EQUAL to the surface's; and exactly one live session claiming
+    it. The surface ssh's SOCKET is deliberately not consulted — the socket is
+    precisely what ProxyJump and ControlMaster take away.
+
+    **Trust.** The value is chosen by the user's own shell on this Mac and
+    carried by the SSH session itself; the remote host receives it rather than
+    inventing it. A COMPROMISED enrolled host can of course claim any tty name
+    — it can write whatever it likes into that header — but the origin-host
+    check bounds it to windows whose ssh actually goes to IT, so it can only
+    choose among its own windows. That is the same bound the window-title
+    marker had, and the marker additionally depended on a channel Claude Code
+    clobbered 98.7 % of the time; this one does not. What it does NOT prove is
+    which PROGRAM is drawing in that window — same as every other arm — and it
+    authorizes no screen read for that reason
+    (`TerminalScreenClaudeJoinAuthorizer`).
+
+    A stale local export is not a hazard worth guarding: a shell's controlling
+    tty is fixed for its lifetime, so `LC_LVX_TTY` cannot go stale within the
+    shell that set it. The one real footgun is the opposite direction — the
+    same rc line running on the REMOTE host re-exports the REMOTE pts and
+    hides the Mac's value — which is why the documented line only exports when
+    `$SSH_TTY` is unset and the variable is not already set. Getting that
+    wrong costs a non-join with a named cause (`no live session reports this
+    terminal's tty`), never a mis-join.
+
+    The setup step is IN THE APP. Its sheet names the rc file in one consent
+    sentence and links to the exact text in the docs; no command or file
+    contents render in Settings. It writes only on explicit consent, is
+    idempotent by marker (`ClaudeShellRCSetup`), removable, and never silent. Three
+    login shells get a block written for them — zsh, bash, fish — chosen by
+    `dscl`'s `UserShell` with `$SHELL` as a FALLBACK only (a GUI launch
+    inherits `$SHELL` from launchd, which is stale after a `chsh`); anything
+    else is directed to the docs, because guessing at a shell's syntax is how a
+    setup step corrupts a startup file. The writer REFUSES a symlinked rc file — the
+    case a dotfiles user actually hits, since an atomic rename replaces the
+    link with a regular file and silently detaches their repo. It preserves an
+    existing file's mode and creates a new one at 0600. The `SendEnv` half
+    rides the enrollment block, and reaches an ALREADY-enrolled host through
+    the plugin-update path, which regenerates that block.
+
+    The Settings row reports TWO facts because they fail for different reasons
+    and only the user can fix the first: the block is in the rc file (read
+    from disk), and a session has actually arrived carrying the value
+    (`remoteLocalTTY` on a live remote session). A block written five seconds
+    ago proves nothing until a NEW ssh session starts, and the second sentence
+    is what says so.
+
+    **What IS a hazard, and the reason rules 6 and 7 exist: the tty NAME is
+    recycled and the registry entry is not.** macOS hands out pty minors
+    first-free (XNU `bsd/kern/tty_ptmx.c`: `ptmx_clone` scans for the first
+    free slot, `ptmx_free_ioctl` returns the minor on last close), so closing
+    a window gives its `/dev/ttysNNN` to the next window opened — while a
+    REMOTE session's registry entry survives for the full session TTL with no
+    liveness check available (its pid is another machine's). Without a gate:
+    close a Claude-over-ssh window, open a new one to the same host, dictate,
+    and the dead session's repository and prior prompt attach to it. That is
+    the cardinal failure, and it was found by review (2026-09-06) rather than
+    in the field. The connection arm was immune by accident — a new window's
+    ssh has a new ephemeral port.
+
+    The gate is kernel truth on both sides: an ssh that STARTED after a
+    session was first seen cannot be the ssh that session was created in, so
+    the candidate must satisfy `firstSeen >= surfaceProcessStartTime`
+    (`p_starttime`, from the same `KERN_PROC` scan). An unreadable start time
+    refuses rather than skipping the check. Where the surface's ssh DOES hold
+    sockets — the direct shape, where this arm and the connection arm overlap
+    — the candidate's `$SSH_CONNECTION` must additionally match one of them; a
+    pure negative check that makes this arm strictly stronger than the
+    connection arm wherever both can run, and that has nothing to say in the
+    ProxyJump/ControlMaster shapes this arm exists for. Which is exactly why
+    the start-time gate is not optional.
+
+    Residual, shared with the connection arm and unchanged by this: a session
+    that DIED without a `SessionEnd` in a window whose ssh is still alive is
+    still joinable until its TTL. And a terminal multiplexer that publishes no
+    label the shim carries — `abduco` and `dtach` are the known ones — keeps
+    the first client's environment exactly as tmux does, and neither arm can
+    see it. `multiplexerLabels` covers what is on the wire; adding a
+    multiplexer means adding its label.
+
+  - **The plain-ssh arm (`.remoteSSHConnection`, 2026-09-05).** A Claude Code
+    session in `ssh host` on an ENROLLED host, with no multiplexer and no
+    browser, joins on the TCP CONNECTION its surface holds. sshd sets
+    `$SSH_CONNECTION` in every session it spawns
+    (`"<client-ip> <client-port> <server-ip> <server-port>"`); the remote shim
+    publishes it as `X-Lvx-Env-Ssh-Connection`, with the four fields re-joined
+    by COMMAS because space is outside the env-header charset and that charset
+    is the whole header-injection defence — widening it for one field was
+    refused. `ClaudeRemoteSSHConnectionReport.parse` validates the shape on
+    arrival (exactly four fields, canonical decimal ports in 1…65535, addresses
+    in `[0-9a-fA-F.:]` within 45 bytes) and trusts nothing beyond it.
+
+    The confirmation set, ALL of it required: (1) the focused surface's tty
+    hosts exactly one foreground ssh with a verified OpenSSH executable and an
+    argv the parser accepts (`SSHDestinationTTYProbe`, unchanged); (2) that
+    argv carries no `-J`; (3) its destination resolves to exactly one enrolled
+    host (exact alias, then `ssh -G`); (4) no OTHER same-uid ssh to that
+    destination is socketless (the ControlMaster mux-client shape — see the
+    residuals); (5) the candidate was registered by a hook AUTHENTICATED FROM
+    THAT HOST (`liveRemoteSessions(hostID:)` is scoped to its channel); (6) the
+    candidate reports `$SSH_TTY` and NO multiplexer label
+    (`ClaudeSessionJoinResolver.multiplexerLabels` — herdr, cmux, tmux, screen
+    and zellij, walked over the wire allowlist so a label added there and
+    forgotten here is a visible omission); (7) exactly one established TCP
+    socket of that ssh PROCESS — read
+    from this Mac's own kernel via `proc_pidfdinfo(PROC_PIDFDSOCKETINFO)`,
+    same-uid, no privileges — has `localPort == client_port`,
+    `peerPort == server_port` and a peer address equal to `server_ip`
+    (compared as BYTES through `inet_pton`, since a dual-stack socket says
+    `::ffff:a.b.c.d` where sshd says `a.b.c.d`); and (8) exactly one live
+    session matches at all.
+
+    **The trust argument, and what it does not cover.** The marker was a value
+    we minted and handed back through a channel the remote host fully
+    controlled and Claude Code clobbered — measured present 1.26 % of the time
+    (above). This asks the remote host to name a 16-bit ephemeral port that
+    only the two kernels on the ends of ONE connection know, for a connection
+    whose local end this process reads out of its own kernel, and pins the
+    answer to the host the hook authenticated from. A compromised enrolled host
+    can still mis-describe its OWN connection — publish a second session under
+    the ports of the connection the user is really looking at, and join that
+    surface. It cannot claim a surface connected to a DIFFERENT host: it does
+    not know that connection's client port, and the origin-host filter rejects
+    it before the ports are ever compared. That is strictly more than the
+    marker had, which was no boundary at all against a host that had already
+    been compromised.
+
+    UNPROVED, say it plainly: this proves which CONNECTION the focused surface
+    holds, never what the remote program drew into it. A second Mac enrolled
+    on the same host, dictating into its own ssh to that host, is a different
+    connection with different ports and is not confused with this one — but two
+    agents inside ONE ssh session share its `$SSH_CONNECTION` and are refused
+    as ambiguous rather than told apart. Nothing here reads or authorizes a
+    screen: `TerminalScreenClaudeJoinAuthorizer` refuses raw AX attachment for
+    this mechanism (a plain ssh shell's grid is the user's whole remote
+    session), `SocketPaneScreenContext` has no route for it, and a remote
+    origin can never carry a `LocalWorkspacePath`. The join buys the session
+    block and repo context — exactly what the marker join bought.
+
+    RESIDUALS, none of them silent — every one has its own abstention cause:
+    ProxyJump (see the next paragraph — it has three causes of its own); a host
+    whose remote plugin predates 1.6.0 (it publishes no connection at all, and
+    the cause names exactly that); and an unreadable fd table, which is
+    UNREADABLE rather than "no sockets" —
+    `SSHSurfaceConnection.sockets` is optional for that one reason.
+
+    **ProxyJump cannot be supported by transport matching, and the reason is a
+    property of unprivileged Unix rather than a gap in this code. Do not
+    re-attempt the design below without reading this paragraph.**
+    `ProxyJump` lives in `~/.ssh/config`, is invisible in argv, and OpenSSH
+    carries it with an `ssh -W` CHILD: the surface's own ssh holds NO TCP
+    socket, the child holds `mac:P1 -> J:22`, and the destination's sshd sees
+    `J:P2`. Nothing on the Mac relates P1 to P2 — only the jump host J does,
+    and the linkage lives in which of J's processes owns both sockets.
+    MEASURED on a live Linux host, 2026-09-06: that linkage is unreachable to
+    an unprivileged user. `sshd` drops to the user after auth, which makes the
+    session process NON-DUMPABLE, so `/proc/<pid>/fd` is root-owned even for
+    the user who owns the process (`ls /proc/<sshd-session pid>/fd` →
+    `Permission denied` for 3 of 3 tried, with 6 such processes owned by that
+    very user; independently replicated at 7 of 7 on OpenSSH 10.0p2 by an
+    adversarial review), and `ss -tnpH state established` therefore attributes
+    ZERO sshd sockets to a pid.
+
+    The cgroup escape fails for a subtler reason than "cgroups do not work",
+    and the distinction matters to anyone re-attempting this: `ss --cgroup`
+    DOES attribute OUTBOUND sockets to a per-session scope
+    (`/user.slice/user-N.slice/session-cNN.scope`), tty-less sshd sessions
+    included. What cannot be tied to a session is the INBOUND half: an
+    accepted socket carries the LISTENER's cgroup (`/init.scope`), and
+    `loginctl show-session` exposes `RemoteHost` but no remote PORT — so
+    `(mac, P1)`, the only handle the Mac has, reaches no session scope, and
+    two windows from one Mac stay indistinguishable.
+
+    One conditional escape exists and is deliberately not built on: on a host
+    whose auth journal is user-readable, sshd logs the peer PORT together with
+    the session pid (`sshd-session[NNN]: Disconnected from user dev
+    192.168.1.101 port 43286`), and an auth-time `Accepted … port P1` line
+    would tie `(mac, P1)` → pid → logind Leader → session scope → the
+    outbound socket's local port. It is not a foundation for a trust
+    boundary: journald readability and retention are per-host accidents, and
+    on the very host where the review confirmed the disconnect-time lines the
+    auth-time lines needed for a LIVE pairing were absent from a 496 MB,
+    7-day journal.
+
+    Without pid or cgroup linkage the only remaining rule is "J holds exactly
+    one connection to the destination", which abstains for precisely the user
+    who has several terminals open — the case this would exist to serve. It
+    would also be sound only under conditions worth writing down before
+    anyone reaches for it: scoped by UID (`/proc/net/tcp`'s uid column —
+    inbound accepted sockets read uid 0, outbound read the session uid) and
+    counted across EVERY address J may resolve the destination to, since a
+    dual-stack or multi-A-record destination with one connection per address
+    leaves each per-address count at one and lets the rule pick another
+    terminal's socket. Single hop only, too: for a chain, the last hop's
+    inventory is behind the same non-dumpable wall.
+    So the arm NAMES the shape and declines: `ssh -G` (already cached for the
+    enrolled-host fallback, and consulted ONLY on the branch that is about to
+    abstain, so a joining dictation spawns nothing extra) yields
+    `SSHProxyJumpShape`, and the causes are `this connection goes through a
+    jump host (ProxyJump)` and `this connection goes through a chain of jump
+    hosts`. The shape is a SHAPE and never the jump host's name — it reaches
+    the log. `ssh -G` evaluates the user's `Match exec` blocks, so this can
+    run a user-configured command, once per operand per TTL and bounded by the
+    same 2 s timeout as the identity lookup — the price of asking ssh what ssh
+    would do instead of reimplementing its config resolution. What would
+    change the verdict: root (or a privileged helper) on the jump host, or a
+    dependable auth journal there — both deployment decisions, and not
+    something this app may assume.
+
+    Two more, and both are MIS-joins rather than missed ones, which is why
+    each has a positive check rather than a note:
+
+    * **Multiplexers.** A multiplexer SERVER outlives the connection that
+      started it and its panes keep that FIRST connection's `$SSH_CONNECTION`.
+      MEASURED on the dev box 2026-09-05, tmux 3.x: connection A (client port
+      36878) created the session, connection B (36886) attached, and a process
+      inside the pane still read `SSH_CONNECTION=127.0.0.1 36878 …`, so a
+      later attach would otherwise mis-join onto A's surface. The refusal is a
+      property of the ARCHITECTURE, not of tmux: `screen` (`$STY`, screen(1)
+      ENVIRONMENT) and `zellij` (`$ZELLIJ`) are servers in exactly the same
+      shape. The first version of this arm checked herdr/cmux/tmux only and
+      screen was not on the wire at all — a silent mis-join, found by review
+      (2026-09-05) and closed by publishing both labels in plugin 1.6.0.
+      Anything that multiplexes a terminal and does NOT publish a label the
+      shim carries is still a hole; adding a multiplexer means adding its
+      label, and `PlainSSHConnectionJoinTests` fails if the list and the wire
+      disagree.
+    * **OpenSSH ControlMaster.** `ControlMaster auto` in `~/.ssh/config` is
+      invisible in argv (the probe refuses `-M`/`-S` but does not read
+      config). Terminal A's ssh owns the TCP connection; terminal B's
+      `ssh host` is a mux CLIENT over an AF_UNIX control path with no TCP
+      socket. sshd derives `$SSH_CONNECTION` from the underlying CONNECTION,
+      so B's Claude session truthfully reports A's ports — and a dictation
+      into A, a plain shell with no agent in it, would join B's session. The
+      check is `SSHSiblingSurvey`, carried on `SSHSurfaceConnection.siblings`:
+      the other same-uid ssh CONNECTIONS to the same destination are counted
+      by what the kernel could say about each, and any that is
+      readable-and-socketless, or unreadable at all, abstains the arm. It
+      costs the ordinary two-terminals-two-connections case nothing — those
+      each hold a socket and are told apart by their ports. Found by review
+      (2026-09-05).
+
+      The survey is COUNTED rather than a boolean because the first field run
+      of this arm (2026-09-06) abstained on it and the abstention could not
+      say why: "a real ControlMaster client is open in another window" and
+      "some ssh's fd table could not be read" are the same non-join and
+      opposite fixes. They are now separate causes carrying `n of m`. ONE
+      process is excluded from the survey and only one, so the abstention
+      cannot be manufactured against the app itself: an ssh whose kernel
+      PARENT is this app (its `RemoteForward` supervisor, its herdr `ssh -L`
+      — ours, and never somebody's terminal).
+
+      A second exclusion, for ssh processes with no controlling terminal, was
+      added and REMOVED by review (2026-09-06) because it reopened the very
+      mis-join the survey exists to block. `ssh -tt D claude -p …` launched by
+      launchd, cron or an orchestrator has no LOCAL tty and a REMOTE pty, so
+      the session it starts reports `$SSH_TTY`, carries no multiplexer label,
+      and is a joinable candidate — under ControlMaster it is socketless and
+      reports the master's `$SSH_CONNECTION`, so skipping it let a dictation
+      into the master's window join it. The parent check already covered
+      everything that exclusion was written for.
+
+      The surface's OWN two refusals are named the same way and for the same
+      reason: `this ssh holds no connection of its own (a ControlMaster client
+      or a ProxyCommand)` is the readable-and-empty case — which the field
+      also hit — and `this ssh's socket table is unreadable` means a syscall
+      failed, which
+      `SSHProcessSocketReaderCrossProcessTests` says should not happen for a
+      same-user process. That test exists because the original reader tests
+      only ever read `getpid()`: a reader that works on its own process alone
+      passes all of them and then sees nothing for every real `ssh` on the
+      machine. MEASURED on the build host 2026-09-06:
+      `proc_pidinfo(PROC_PIDLISTFDS)` + `proc_pidfdinfo(PROC_PIDFDSOCKETINFO)`
+      answer for a same-uid process this one did NOT spawn (`rc=792`,
+      `kind=SOCKINFO_TCP`, `state=TSI_S_ESTABLISHED`), so the API is not the
+      constraint and the app needs no entitlement for it.
+
   - A Claude Code "Remote Control" session (the agent runs on a machine of the
     user's, `claude.ai/code` in a browser is the UI) has no pane, no TTY, and no
     title, so it joins from the FOCUSED BROWSER TAB: the tab's
@@ -358,8 +2244,9 @@ there is not.
     strictly (`ClaudeBridgeSessionURL`: https only, host exactly `claude.ai`,
     no userinfo/port, `session_[A-Za-z0-9_-]+` on the percent-ENCODED path) and
     matched by exact equality against the `CLAUDE_CODE_BRIDGE_SESSION_ID` the
-    session's own hooks publish (Claude Code ≥ 2.1.199). This is the ONE arm
-    that spans local and remote sessions, because the id is bridge-allocated and
+    session's own hooks publish (Claude Code ≥ 2.1.199). This arm and the
+    Claude Desktop arm below are the two that span local and remote sessions,
+    because the id is bridge-allocated and
     globally unique — unlike a tty/pane id/pid, which another machine can mirror;
     `ClaudeSessionSnapshot.bridgeSessionID` still routes the read by origin.
     A `.browserTab` join authorizes NO screen capture of any kind (the
@@ -379,10 +2266,310 @@ there is not.
     browser), and each browser needs its own TCC Automation grant — pre-warmed
     by its own `TerminalAutomationConsentPrewarmSettingsObserver` under that
     same setting, since the consent sheet dies with the 1 s read that raised it.
-  - Lookups abstain rather than guess: no marker, unknown, stale, or ambiguous
+  - A Claude Code session in **Claude Desktop's Code tab** (on this Mac, or on
+    an ssh host the desktop app runs it on) joins from the FOCUSED WEB VIEW of
+    the desktop app (`ClaudeDesktopAllowlist`, exactly
+    `com.anthropic.claudefordesktop`, a third list disjoint from the terminal
+    and browser ones). MEASURED on Claude Desktop 2.2553.1 (2026-09-18) and
+    again on 2.9939.2 (2026-09-26): the session web view's `AXURL` is
+    `https://claude.ai/epitaxy/local_<uuid>`, and the desktop app exports the
+    same `local_<uuid>` as `CLAUDE_CODE_HOST_SESSION_ID` into the session's
+    Claude Code process, so every hook carries it — local publisher field
+    `desktop_session_id`, remote header `X-Lvx-Env-Desktop-Session-Id`
+    (remote plugin ≥ 1.11.0). On 2.9939.2 the whole window is ONE such web
+    area: the sidebar and every pane of a split view sit inside it, and its
+    address always names the session in the pane classed
+    `dframe-pane-primary`, whichever pane holds focus (after real clicks in
+    either pane and after "Move split view left" alike); no attribute names
+    the other pane's session. So `AXClaudeDesktopSessionURLReader` walks UP
+    from the app's focused element to the NEAREST `AXWebArea` and reads its
+    address ONLY when the walk passed an `epitaxy-chat-panel` element and
+    then a first `dframe-pane` element that is also `dframe-pane-primary`
+    (exact class tokens). A single-session window is one such primary pane;
+    the rule assumes panes are siblings, never nested, which is what a
+    desktop update must re-check. Focus in the secondary pane would
+    otherwise join the primary pane's session; focus in a terminal, files or
+    changes panel, or in the sidebar, is no join because the dictation is
+    not going to a session. Each refusal logs its reason. One exception: a
+    Claude project's page (`https://claude.ai/epitaxy/project/chan_…`, a
+    thread open or not; MEASURED on 2.16120.0 for the project chat, #1194) has no chat panel
+    element, so its address is read from anywhere in the primary pane. It
+    names no session and joins nothing; it only gives the dictation the agent
+    polish profile (`ClaudeJoinResolution.focusedClaudeProject`). `ClaudeDesktopSessionURL` parses
+    the address through the same strict checks as the bridge URL
+    (`ClaudeSessionPageURL`), path exactly `/epitaxy/local_[A-Za-z0-9_-]+`;
+    the registry match is exact equality with one fresh reporter
+    (`resolve(desktopSessionID:)`, shared rules with the bridge lookup).
+    A Remote Control session opened in Desktop joins through this arm, not
+    the browser one. MEASURED on 2.19675.0 (2026-10-05, #1065): 547 of
+    Desktop's 549 Code sessions carried a Remote Control id
+    (`bridgeSessionIds`), each had a `local_<uuid>` view, and no
+    `/code/session_…` address appeared in any web area, Desktop's storage
+    or its bundle. The focused view's address then carried
+    `?artifact=<uuid>` (an artifact open beside the chat); the query is
+    ignored, and the watched check reads the same address
+    (`testARemoteControlSessionShownInDesktopCountsAsShown`).
+    Everything else follows the browser arm: both origins join (the id is
+    desktop-allocated and names the view the user is looking at), a
+    `.desktopSession` join authorizes NO screen read and carries no window
+    identity, commit-time liveness re-resolves the bound id (the id never disappears while the session runs, so it adds no
+    disconnect signal of its own), and the read happens ONLY under
+    `claudeRepoContextEnabled`. It is an Accessibility read, not an Apple
+    event: no Automation consent, and nothing to pre-warm. It sets Electron's
+    `AXManualAccessibility` on the desktop app before each read (Chromium
+    builds its web accessibility tree only for a client that asks — the switch
+    VoiceOver flips), and when the walk finds no web area at all it waits
+    250 ms once and reads again, so the first dictation after the desktop app
+    launches can still join. The address, the id and the three classes are
+    UNDOCUMENTED: a desktop update that renames any of them stops the arm
+    joining; only a new layout that keeps the classes but moves the address
+    to another pane's session could make it join the wrong one, which is why
+    a desktop update gets this measurement again. `--probe-surface` reads it
+    only under `--desktop`.
+    **A Desktop session must stay in the registry while its window is open,
+    and exactly one process may report its id** (#657). Four things lost it,
+    each measured on an ssh host with 18 Desktop sessions live at once, and
+    each cost an abstention:
+    (1) Freshness. Only hooks refresh activity, and the next hook of a
+    session left idle is the UserPromptSubmit of the prompt being dictated,
+    so past the 4 h TTL the first dictation back always missed. A record
+    that reports a desktop id is fresh for `desktopSessionTTL` (7 days)
+    instead. That cannot widen a join: the key names the view the user is
+    looking at and matches only by exact equality. A local record still needs
+    its pid alive, and a pidless local one keeps the 5-minute bound.
+    (2) The cap. Once a second origin is present, each keeps
+    `maxSessionsPerOrigin` (8) records without a desktop id and, counted
+    apart, `maxDesktopSessionsPerOrigin` (24) records with one (#672), so a
+    host's Desktop sessions never compete with its terminal ones. Over the
+    global cap (`maxSessions`, 48) the origin holding the most records loses
+    one: a desktop id is whatever an enrolled host sends, so it buys room only
+    inside that host's own quota, and a flood of them evicts only the flooding
+    host's records. Within an origin, eviction takes records without a desktop
+    id first, least recently active within each group, and logs a count per
+    quota. The record that triggered the eviction is never its victim, so a
+    new terminal session still registers when the cap is full of Desktop
+    records. A host running more than 24 Desktop sessions still loses the
+    least recently active ones.
+    (3) Children. Every process in a Desktop session inherits
+    `CLAUDE_CODE_HOST_SESSION_ID`, so a `claude -p` started from it reported
+    the id under its own session id: two reporters, ambiguous at start, dead
+    at commit, and on a remote record, with no pid liveness, for the whole
+    TTL if the child died without SessionEnd. The remote shim (1.14.0) sends
+    the id only when the hook's Claude process is a direct child of Desktop's
+    daemon. MEASURED on Linux (Claude Desktop's ssh daemon at
+    `~/.claude/remote/srv/<hash>/server`, parent pid 1; each session a direct
+    child running `~/.claude/remote/ccd-cli/<ver>`; Claude Code 2.1.283 runs
+    a hook through `sh -c`, so `$PPID` is that shell): the shim skips at most
+    three shells from `$PPID`, takes the first non-shell ancestor as Claude,
+    and requires its parent's `/proc/<pid>/exe` under that directory. Unreadable
+    drops the id. A host without `/proc` sends it as before: Desktop's layout
+    there is unmeasured, and dropping it would cost the join. The LOCAL
+    publisher has no equivalent check yet; a local child's record goes stale
+    when its pid dies, which bounds it. The listener and the publisher still
+    strip the id from every non-Claude agent.
+    (4) The shared backoff. `post.sh` keeps one backoff stamp per user, so a
+    transport failure in any session muted SessionStart and SessionEnd for
+    every session on the host for 300 s. Both now always dial: they fire once
+    per session and cannot storm the ssh client's terminal.
+    An ambiguous desktop or bridge lookup logs how many live sessions report
+    the id, local and remote counted apart, and never the id.
+    RESIDUALS. Exact equality stays the only match; there is no newest-wins
+    relaxation (owner's call). So a remote session that dies without
+    SessionEnd next to a live reporter of the same id (a Desktop restart
+    without SessionEnd that leaves two reporters, or a child on a host whose
+    plugin predates 1.14.0) keeps the view ambiguous for up to 7 days rather
+    than 4 h. Ambiguity abstains; it never joins the wrong
+    session.
+  - The overlay's join badge (`OverlayClaudeJoinBadge`) DESCRIBES the resolved
+    join; it never resolves one. It reads `claudeSessionJoin` after the single
+    start-time resolution and nothing else — a badge that asked again could name
+    a different session than the context actually attached, which is the exact
+    failure the once-per-dictation rule exists to prevent. Its one extra read is
+    `registry.hasLiveSessions()`, which touches no title, TTY, socket, or process
+    table and only chooses between "nothing attached" and showing nothing at all.
+    Two exceptions to "nothing attached" (#658), both taken from the same
+    start-time resolution. A gate that means nothing on this surface could
+    use a join (no polishing endpoint, both context settings off, or a browser
+    or Claude Desktop target without session context, which the screen
+    setting alone never reads) hides the badge whatever the registry holds:
+    "No Claude session" there blames a session for a setting. And focus
+    inside a Claude Desktop session view whose id resolved to no single live
+    session (`ClaudeJoinResolution.focusedSessionUnmatched`) shows it even
+    with an EMPTY registry, because an empty registry is what a dead hook
+    tunnel looks like.
+    What it renders is a length-capped workspace `displayName` with control
+    characters neutralized: a LOCAL name is the last component of a real
+    directory, where a newline is legal and the panel is measured from the body
+    text alone. Cc (newline, tab) becomes a space — deleting it would glue two
+    runs into a directory name the user does not have — while Cf (bidi
+    overrides, zero-width joiners) is dropped, being zero-width already.
+    It names the joined workspace rather than showing a checkmark because a
+    mis-join — the residuals documented on the cmux and remote-herdr arms — is
+    invisible to a boolean and obvious next to the wrong repo's name.
+    The badge travels as a PARAMETER of `startSession`, never a later setter:
+    starting a session resets the panel, so a badge pushed before it was wiped
+    and one pushed after depended on an order nothing enforced. It is always
+    already known there — the join resolves before the realtime socket connects,
+    and the panel opens after it.
+  - Every dictation writes ONE persisted line saying how its join ended
+    (`SessionContextResolver.noteJoinOutcome`, `Log.claudeContext` at
+    `.notice`, `Claude join outcome: arm=… origin=… causes=…`): the arm that
+    joined, or the gate that stopped it before the resolver ran, or the
+    abstention chain the resolver noted. The arms keep logging at `.info`,
+    which the unified log does not persist, so without this line a join
+    could not be questioned after the fact (field, 2026-09-26: three hours of
+    Claude Desktop dictations left only target verdicts). The line is
+    `ClaudeSessionJoinSummary.noticeText`: categories, an origin class and
+    counts only, never an id, path, host or address, because
+    `mac-crashlog.yml` publishes what it reads.
+  - Lookups abstain rather than guess: no match, unknown, stale, or ambiguous
     means no context. There is deliberately no sole-session or cwd heuristic —
     it is wrong precisely when it matters.
-  - Transcripts are never scraped (the publisher drops `transcript_path`), and a
+  - **One session log is read, for one field.** Mistral Vibe (2.25) has three
+    hook types — `pre_tool`, `post_tool`, `post_agent` — and none carries the
+    user's prompt, so the Vibe mode of the publisher reads the LAST user
+    message from the `messages.jsonl` its hook payload names
+    (`VibeTranscriptPrompt`, owner decision 2026-09-20). It is the same datum
+    Claude Code hands over in `UserPromptSubmit`, and the read is bounded to
+    it: a regular file named `messages.jsonl` owned by this user, opened
+    `O_NOFOLLOW`; the last 512 KiB only, abandoned after 250 ms so a stalled
+    volume cannot run into Vibe's hook timeout; a line is used only when its
+    `role` is `user`, its `injected` field is PRESENT and `false`, and its
+    `content` is a string, truncated to the wire's prompt limit. A line that
+    does not contain Vibe's user-role marker is never parsed, nothing but the
+    chosen `content` string and that line's `message_id` is kept, and the path
+    never crosses the socket
+    (`testRecordsPutThePromptFirstAndNeverCarryTheTranscriptPath`). Schema
+    drift in the log therefore costs the prompt and nothing else.
+    Every hook re-reads the newest prompt, and Vibe 2.25.4 saves the log after
+    each model step, so one message arrives once per hook and a turn's first
+    tool still reads the turn before's. The `message_id` rides as the
+    record's `prompt_id`, and the registry counts a Vibe submit once per id
+    (`ClaudeSessionReducer.isRepeatedSubmit`,
+    `testEachVibeMessageIsSubmittedOnceHoweverManyHooksReadIt`, #1285):
+    correction learning took each replay for the user's fix. Text cannot
+    stand in for the id, because a prompt sent again on purpose has the same
+    text; a log without ids counts every submit, as before.
+    Do not widen this read to another field or another agent: an agent whose
+    hooks carry the prompt has no reason to be read this way.
+    Vibe has TWO hook runners, chosen per account by a server-side rollout
+    (`vibe_cli_unified_harness_rollout`, cached in
+    `~/.vibe/experiment_eval_cache.json`), and the Unified Harness one sends
+    `cwd` and `hook_event_name` only: no session id, no parent, no log path,
+    and group-qualified tool names (`file_system.read_file`). Field failure
+    2026-09-21: the parser required `session_id`, so every hook of an owner on
+    the unified rollout was dropped with no log line and no Vibe session ever
+    joined, while the dev box that verified the stack was on the legacy
+    runner. Such a payload is published under an id made from the Vibe
+    process (`vibeProcessSessionID`: pid and start time, none without a start
+    time), because one interactive Vibe process shows one session in one pane
+    and the pane is what a join names. It costs the prompt, since no log is
+    named and the publisher does not search for one, and the subagent
+    filter, since nothing marks one: a subagent's file touches count toward
+    the session of the pane it runs in. A payload with a session id and WITHOUT
+    `parent_session_id` is neither shape and is still dropped. The remote shim
+    (`compact.py`) applies the same rules.
+    What the missing events cost: a Vibe session exists for us only from its
+    first file-tool call or the end of its first turn, so the first dictation
+    into a fresh session has no join; and with no session-end event a session
+    ends by liveness and TTL. Pid liveness alone is not enough for that: a
+    Vibe that exited leaves its shell on the same tty, and once any process
+    reused its pid the dead session would join that shell (Codex review,
+    2026-09-20). Vibe records therefore carry the process START TIME
+    (`agent_start_us`), and `ClaudeSessionRegistry.isFresh` requires the pid's
+    current start time to equal it, unreadable counting as a mismatch
+    (`testAReusedPidDoesNotKeepADeadVibeSessionJoinable`). Records without the
+    field, Claude Code's and opencode's today, keep pid-only liveness. Vibe starts hooks in a new session with no
+    controlling terminal, so the published pid and tty come from an ancestor
+    walk (`ClaudeHookPublisher.vibeAncestorPID`), and the two Claude-allocated
+    session handles are withheld from Vibe records — a Vibe started inside a
+    Claude Code session inherits them and would otherwise join that Claude
+    view.
+  - **Codex CLI joins through a plugin, and trust is Codex's to give.**
+    Codex runs a non-managed hook only after the user trusts it, silently
+    skips it otherwise, and keys that trust by source and position with a
+    hash of the handler AS DECLARED: event, matcher, command string before
+    `$PLUGIN_ROOT` expands, timeout (0.156.0, measured on this repo's
+    probe, #716). Two rules follow. The hooks ship as a Codex plugin
+    (`integrations/codex`, installed by `codex plugin add`), never as an
+    entry in `~/.codex/hooks.json`: a `hooks.json` entry's key includes its
+    index in that file, which herdr also writes, so an edit above ours would
+    untrust it without a word, while a plugin's key names the plugin. And
+    `hooks/hooks.json` stays byte-stable: every hook runs the same fixed
+    command, pinned by `testTheHookCommandIsTheOneUsersTrusted`, because a
+    changed handler asks every user to trust it again. The shim it runs may
+    change freely; Codex hashes the command, not the script (measured: a new
+    plugin version with a changed shim stayed trusted). For the same reason
+    the Integrations dot turns green only after a Codex record reached the
+    registry (`ClaudeSessionRegistry.hasHeard(localAgent:)`, carried across
+    launches by `CodexHookHeardMemory` and reset by every install or
+    removal): an installed, untrusted plugin looks exactly like a working
+    one from outside Codex. The app never writes Codex's trust records
+    itself, though they are plain TOML: trusting a hook is the user's
+    decision, made at Codex's own "Hooks need review" prompt.
+    The payload is a near clone of Claude Code's and is parsed as an
+    allowlist (`CodexHookInputParser`): `transcript_path`, `model`,
+    `tool_response`, `last_assistant_message` and the patch body are
+    dropped. Codex has no read tool (it reads through `Bash`), so files come
+    only from `apply_patch`'s patch headers. A subagent's events carry the
+    parent's `session_id` plus an `agent_id`; its edits count for the
+    session, but a prompt it submits is dropped, because the prompt block and
+    correction learning read that prompt as the user's. Codex spawns hooks
+    like Vibe does (`$SHELL -lc`, a new session, no terminal), so the pid and
+    tty come from the same ancestor walk, the start time rides along
+    (`SessionEnd` has a 3 s ceiling and can be missed), and the Claude
+    session handles are withheld. Ids are scoped under `codex:`.
+  - **A wait crosses as its type, never its text** (#717). Claude Code's
+    `Notification`, Codex's `PermissionRequest` and opencode's
+    `permission.asked` and `question.asked` all publish one wire event,
+    `Notification`, whose only payload is `notification_type` from a closed
+    set (`ClaudeNotificationType`): the waits a user answers in the pane.
+    Claude Code's `message` and `title` quote tool names and command text, so
+    the local parser drops them and the remote shim rebuilds the body from
+    the checked session id and type rather than posting it as-is; a type
+    outside the set publishes nothing, and a record without one is dropped
+    at decode. The reply text (`last_assistant_message`) stays out of the
+    app too (owner ruling on #717, 2026-09-26): nothing reads it aloud, and
+    the answer hotkey brings the pane forward to read it there. It stays on
+    the remote host as well (#818): the shim rebuilds a `Stop` from the
+    checked session id and the cwd, copied only when its JSON string token
+    passes a strict grammar check, since the shim has no JSON tool to
+    re-escape it.
+  - **A Claude Desktop session comes forward through Desktop's own link,
+    and counts as forward only when the join reads it back** (#834). A
+    session that reports a Desktop view id, local or from an ssh host, is
+    brought forward by opening `claude://code/continue?session=local_<uuid>`
+    in the running Desktop (never the default `claude://` handler, and never
+    when Desktop is not running: the link would launch it). Read from
+    Desktop 2.9939.2's handler (2026-09-27): it takes the id only when it
+    matches `^local_[A-Za-z0-9-]{1,64}$` and routes to the session's
+    `/epitaxy/` view. MEASURED the same day, from Finder and from Desktop
+    showing another session: an ssh-host session came forward and the join's
+    Desktop reader read it back from its prompt 0.2 s after the open. The
+    sidebar exposes no session id to Accessibility (rows are titles), so
+    clicking a row cannot be tied to a session. `.focused` requires Desktop
+    frontmost before and after the read, and `sessionShown` to resolve the focused view to this
+    registry session: focus in the primary pane's prompt, and the id
+    reported by this session alone. An ambiguous id, focus left in the
+    sidebar or a second pane, or no answer within 2 s is `.unverified`, and
+    the answer shortcut starts no dictation. "Send that to" types and
+    presses Return in Desktop only after this `.focused`, and again only if
+    a second read-back still shows the session (#1825). The link
+    and the id are UNDOCUMENTED; a Desktop update that drops them leaves the
+    read-back failing, never a dictation in the wrong session.
+  - **"Were you looking at it" asks only local questions** (#717). A turn's
+    end queues a finished entry only when the user was not looking at the
+    session's pane (`AgentAttentionTracker`), and that is answered by
+    `ClaudeSessionJoinResolver.sessionShown(target:)`: the focused TTY, a
+    local herdr's focused pane, Claude Desktop's focused session view. It
+    runs on every turn's end with no dictation behind it, so it never opens
+    a forward, stamps a herdr panel, dials cmux or reads a screen; an answer
+    it cannot give (an ssh session, cmux) counts as not looking, which costs
+    an extra cue and never a missed one. A turn's end that finds the
+    session's next event already applied (a new prompt, a wait, the user
+    reaching it) while the pane was being checked changes nothing.
+  - Apart from that, transcripts are never scraped (the Claude Code parser
+    drops `transcript_path`), and a
     LOCAL session never attaches hook-quoted tool excerpts: its files are
     readable directly and are the better source. A REMOTE session's bounded,
     sanitized excerpts DO attach (`ClaudeSessionContextText`, gated on the
@@ -393,6 +2580,30 @@ there is not.
     budget.
   These paths are in `scripts/ci/llm-lane-filter.sh`: they change what reaches
   the model, so the LLM lanes run on them.
+- **A rejection's remedy is earned by its wire shape, and only one shape earns
+  the plugin remedy.** `ClaudeRemoteRejectionCategory` exists because one
+  undifferentiated "rejected unauthenticated connection" line cost a dispatched
+  log-collection workflow to diagnose (field report, 2026-07-26). Two of its
+  cases turn on a distinction that looks cosmetic and is not: a header that
+  ARRIVED carrying no credential (`Bearer `, from a `${…}` Claude Code never
+  expanded into an http hook) is the pre-1.1.0 plugin's exact signature and
+  keeps the full "update the plugin on the host" clause; NO `Authorization`
+  header at all cannot come from any plugin generation — the pre-1.1.0 manifest
+  declared the header statically, and the command shim that replaced it writes
+  the header before it dials and fails open without dialing when the token is
+  unset — so it is an unauthenticated caller, gets its own line with no host
+  remedy, logs at `.notice` rather than `.error`, and is excluded from
+  `Snapshot.isEmpty` so it raises no Settings hint. That last part is not
+  tidiness: the enrollment verify probe posts here WITHOUT a credential on
+  purpose and reads the 401 as its success signal, so collapsing the two shapes
+  made every setup check write a line accusing a healthy host — a phantom for
+  the next person reading this log, in the one subsystem whose documented
+  diagnostic route is reading the log later. Do not re-collapse them, and do not
+  soften the `.emptyCredential` clause into vagueness to cover both: losing the
+  pre-1.1.0 diagnosis is the worse failure of the two, which is why the split is
+  decided by the request's own bytes rather than by any state this app keeps —
+  there is no window to be outside of and nothing a caller can assert to land in
+  the quieter category that it could not already assert to land in another.
 - **Remote Claude context is opaque by construction.** The remote listener tags
   every accepted session `.remote` regardless of its payload; a local process
   connecting to that listener can only downgrade itself. Remote cwd values are
@@ -412,23 +2623,260 @@ there is not.
   client actually dials is the LOCAL end our own child created. And
   `hookParentPID` is a String on purpose: a pid in another host's namespace is
   not a number this process may probe, only a label to compare against another
-  label.
-- **Remote enrollment execution is opt-in, preview-first, and keeps the token
-  out of process arguments.** `ClaudeRemoteEnrollmentService` generates a
-  copyable plan (idempotent ssh config block, `claude plugin` commands,
-  verify/uninstall steps, caveats), and the Copy buttons remain available.
-  One-click actions require a separate confirmation that repeats the exact
-  ssh-config block or redacted command list. Local insertion replaces only the
+  label. `X-Lvx-Env-Project` (#652) is the host's basename for the session's
+  repository; it replaces the cwd label only as the learned-terms key
+  (`ClaudeSessionSnapshot.learnedTermWorkspace`), and only when it is already
+  a label under `ClaudeWorkspaceReference.opaqueLabel`'s rule: a value that
+  would need reshaping is refused, never reshaped. Without the header, the
+  directory above a cwd's `.claude/worktrees/<name>` stands in for it
+  (`claudeWorktreeRepository`), under the same rule; it is read off the cwd
+  as it arrives and kept as a label, like the cwd's own.
+  `X-Lvx-Env-Repository` (#926) is the host's `origin` on github.com as
+  `owner/name`, from `capture.sh repository`. It is kept on the project only
+  beside `X-Lvx-Env-Project` and only when `QuickCaptureInbox.isRepository`
+  accepts it (no `.` or `..` part), and it is used only as `gh issue create
+  --repo`, after the Inbox shows it, and as `gh api repos/<owner>/<name>`,
+  which only reads. A squatter on the port cannot send it: it rides on the
+  host's authenticated hook.
+  `X-Lvx-Env-Branch` (#1020) is the branch checked out in the session's
+  cwd, from `git symbolic-ref --short HEAD` on the host (none on a
+  detached HEAD). It is read only as `SessionDefaultNames.branch`, a name
+  for a remote linked worktree, exactly as a local session's branch is; it
+  never reaches git, a path or a join, and the registry file does not keep
+  it.
+- **A remote request names its agent in a header, and the header buys nothing
+  but a namespace.** A remote host runs no publisher of ours, so the agent
+  cannot ride inside the record the way it does locally: the Vibe shim
+  (`integrations/vibe/remote/`) sends `X-Lvx-Agent: vibe` beside a body in
+  Claude Code's hook shape. `ClaudeRemoteAgentCodec` reads absent as Claude
+  Code (every plugin shipped before the header is one) and REFUSES a value it
+  does not know, opencode included, rather than filing a newer shim's agent
+  under Claude Code's join rules. The header is a claim by an authenticated
+  host about its own sessions: the origin stays `.remote` and the id stays
+  scoped under the host whose token authenticated the request, with the agent
+  prefix in front (`vibe:remote:<host>:<id>`) only so two agents on one host
+  cannot share a key. For any agent but Claude Code the listener drops the two
+  Claude-allocated handles (`bridgeSessionID`, `desktopSessionID`) on arrival,
+  whatever the shim sent, for the reason the local publisher withholds them.
+  On the host, Vibe's payload never crosses the tunnel as Vibe wrote it: a
+  `post_tool` payload embeds whole files, so `compact.py` (standard-library
+  Python, run on the interpreter Vibe itself uses, owner decision 2026-09-20)
+  reduces it to the fields the Mac keeps plus the same short excerpts a remote
+  Claude Code session sends, and reads the prior prompt under the same rules as
+  `VibeTranscriptPrompt`. The two implementations are a pair: change one,
+  change the other. The token lives in a 0600 file under
+  `~/.vibe/localvoxtral/remote/` (owner decision, same exposure as the Claude
+  plugin's token in `~/.claude`: any process running as that user can read
+  it), is read into a shell variable, reaches curl through a header file, and
+  is never exported, so `compact.py` cannot see it: the shim runs `set +a` and
+  `unset TOKEN` before the first assignment, because a shell exports a
+  variable it imported from its environment (Codex review, 2026-09-20). The
+  shim prints nothing on any path, because Vibe reports hook output as a
+  failure; there is no stdout gate because there is no stdout. The interpreter
+  is the one RUNNING Vibe (`/proc/<pid>/exe`, or `ps -o comm=` on macOS, of the
+  hook's parent or grandparent), accepted only as an absolute path whose name
+  is exactly a Python, and run with `-I`; the `vibe` launcher's shebang and
+  `python3` are fallbacks under the same check.
+  **A remote Vibe session ends because the host says so.** Vibe has no
+  session-end hook and a remote pid cannot be probed, so without help a
+  finished session would stay joinable for the four-hour TTL on the very
+  terminal the next one starts in — the normal exit path, not the abnormal one
+  the Claude Code residual describes (Codex review, 2026-09-20). The first hook
+  of a session that reaches the Mac therefore leaves one background shell on
+  the host (`post.sh`, "Exit watcher"): one per session by an atomic `mkdir`
+  lock, holding none of the hook's descriptors (Vibe waits for them to close),
+  comparing the Vibe process's start time as well as its pid, re-reading the
+  token when it fires, posting `SessionEnd`, and giving up after five tries a
+  minute apart. `LOCALVOXTRAL_VIBE_WATCHER=off` disables it. Three shapes it
+  handles on purpose (GLM review, 2026-09-20): a Vibe that is ALREADY gone when
+  the hook looks (Ctrl-C at the end of the turn) gets its `SessionEnd` at once
+  instead of no watcher; a session id reused by a new process (a resume)
+  replaces the old watcher, whose `SessionEnd` would otherwise evict the live
+  session; and when the host's `ps` gives `compact.py` no process table, no pid
+  is published and no watcher starts, because the only pid left is the `sh -c`
+  wrapper and watching it would end a LIVE session two seconds later.
+  There is deliberately NO Mac-side eviction of an older remote Vibe session by
+  a newer one on the same surface. It was built and removed the same day:
+  suspend Vibe A, start B in that pane, bring A back, and a dictation into A
+  joins B until A's next hook. Two live candidates on one surface make the
+  join abstain, and abstaining is the failure this file prefers everywhere.
+  RESIDUAL, stated plainly: when the watcher's `SessionEnd` never arrives (the
+  tunnel was down for all five tries, the host rebooted, the watcher is off),
+  the dead session stays the surface's candidate until its TTL: alone, it still
+  joins; beside a new session, the surface abstains. Nothing on the Mac can
+  tell a finished remote process from an idle one.
+- **A host may hold one extra credential per purpose, and it buys no extra
+  trust.** The app keeps only a HASH of a host's token; the plaintext went into
+  the Claude Code plugin's config at enrollment and is gone. The Vibe hooks on
+  that host therefore get their own (`ClaudeRemoteCredentialPurpose.vibe`,
+  owner decision 2026-09-20, chosen over rotating the one token because a
+  rotation cuts off the host's running Claude Code sessions). It authenticates
+  AS THE HOST: same id, same session namespace, same origin channel. The
+  purpose is a label for the row and for replacing the right one, never a
+  permission, because both tokens sit under one user on one machine and there
+  is no boundary between them to enforce. Every stored hash is still compared
+  on every request with no short-circuit, `rotateToken` and `revoke` clear the
+  extras (both answer a suspected leak, and the extras sat next to the leaked
+  one), and a revoked host is refused a new one. A credential is two-phase
+  (`prepareCredential`, then `commitCredential`), and three rules ride on that
+  (Codex review, 2026-09-20). A pending credential is BOUND to the host's own
+  token as it was at prepare time, and the commit refuses when it changed: a
+  Rotate token pressed while ssh runs must not be undone by a credential that
+  was already on its way to the host. The commit trusts the new token IN
+  ADDITION to the purpose's current one, at most two, until
+  `retireOtherCredentials`: the token file is the LAST thing setup writes, and
+  a connection that dies there leaves the app unable to know whether it
+  landed, so both must authenticate until it does know.
+  There is no per-harness control on a host row (owner ruling 2026-09-21: every
+  harness gets its own line or none does, and none is the choice). Vibe is the
+  `remoteVibe` step of the host's one setup run: it installs when the probe
+  finds `vibe`, reports `vibeNotFound` as a skipped step otherwise, and a
+  failure fails the run. Claude Code is optional the same way
+  (`claudeNotFound`, decided on exit 127 AND our PATH resolver's own sentence,
+  never a bare 127): the plugin step is skipped and the final check drops its
+  plugin half. A host with neither agent fails the run. A finished update
+  closes its panel, so a step the run left to the user is NAMED by the
+  row's one sentence. The step is skipped as already current when the host is
+  set up and has reported this build's hooks version: running it anyway would
+  replace a working token under live Vibe sessions and let a refusal about
+  `~/.vibe` fail an update started for the plugin (GLM review, 2026-09-21). A
+  run that failed for want of any agent does not settle the row. The row offers the run while the plugin OR the Vibe
+  hooks are outdated or unheard from. "This host has no Vibe" is remembered
+  for the app session only, like the plugin version report, which is also how
+  a Vibe installed later gets its hooks: the run is offered again after a
+  relaunch. Removing a host contacts nothing, so the hook files stay there
+  with a token that no longer authenticates, as the plugin does.
+  Host setup (`setUpRemoteVibeHooks`) follows the enrollment rules — BatchMode
+  ssh, script on stdin, token in no argv on this Mac, fixed error strings — with
+  one difference worth knowing: it EDITS A USER FILE on the host,
+  `~/.vibe/hooks.toml`. The edit is computed on the Mac by
+  `VibeHooksBlockEditor`, the same rules as the local install, not
+  reimplemented in awk. So the probe reads the file back (base64, 256 KiB cap)
+  and its `cksum`, and the write happens only if the `cksum` still matches.
+  Those bytes are text to splice and nothing else: they never reach a log, an
+  alert, or a verdict string (the read-back failure names the version this
+  build EXPECTED, never the one the host claimed), and the checksum is held to
+  `[0-9:]` before it is spliced into a script. These runs move files, so they
+  ask the ssh runner for a larger `Invocation.Budget` by name; past the pipe
+  buffer the runner feeds stdin from a writer thread after launch (raw
+  `write(2)`, `F_SETNOSIGPIPE`), because a preload that size would block with
+  no child to drain it. Every other enrollment script keeps the standard
+  budget and the preload. Each file is written through a quoted
+  here-document whose delimiter is checked against every line of the content.
+- **A refused `RemoteForward` bind is not a diagnosis, and only a nonce
+  round-trip may upgrade it to one.** OpenSSH's `remote port forwarding failed`
+  says a port is held, never by whom, and the two holders want opposite things
+  from the user: a stranger is a failure they must clear, while their own ssh
+  session carrying the enrollment block's `RemoteForward` IS the working
+  channel — the normal state for anyone who ssh's to the host they enrolled.
+  Reporting the second as contention told them to close the session providing
+  the tunnel (field report, 2026-08-29). `ClaudeRemoteForwardOwnershipCheck`
+  separates them, and the rule about HOW is load-bearing:
+  - **The remote host's answer is never the evidence.** Our 401 (and the 411 an
+    empty POST gets) is public in this repository, so any process that binds
+    that port can reproduce it byte for byte; and a SECOND Mac enrolled against
+    the same host returns a genuine 401 of its own, which is exactly the
+    contention `ClaudeRemoteForwardPort` exists to surface. A status-code probe
+    would adopt both.
+  - **The evidence is arrival.** The probe posts a fresh 128-bit nonce into the
+    disputed port FROM the remote host (`ssh -o BatchMode=yes -o
+    ClearAllForwardings=yes`, bounded timeout, the script on stdin so the nonce
+    is never in the ssh argv on THIS Mac — which is also the CI runner — and no
+    token, since the request is expected to be refused), and the verdict is
+    whether THIS process's own listener saw that nonce
+    (`ClaudeRemoteForwardProbeWitness`). A stranger receives the nonce and can
+    do nothing with it: the listener binds `127.0.0.1` on the Mac and the only
+    route to it from that host is a `RemoteForward` terminating here — and the
+    disputed one is the forward the stranger is the reason we do not have.
+    Another Mac's listener has never heard of it. The probe's exit status is
+    deliberately not consulted in either direction.
+  - **Two residuals, stated because the next reader will otherwise assume they
+    are not there.** (1) Arrival identifies the LISTENER, not the port that
+    carried the nonce: every supervised `-R` ends at the same local listener, so
+    where a host has a SECOND live forward to this Mac (a legacy
+    `RemoteForward 8473` left in the user's own config block and carried by an
+    interactive session), a hostile holder of the disputed port can replay our
+    request down that other forward and forge a match. (2) The nonce is out of
+    the ssh argv but is in `curl`'s argv on the REMOTE host for the `--max-time`
+    window; `--header @file` would fix that and is not used because it needs
+    curl >= 7.55 on an arbitrary host and would fail silently below it. Both
+    residuals require code execution on the enrolled host, which already implies
+    possession of the plugin's bearer token — so `.ourListener` is a DIAGNOSIS
+    and never an authorization. Do not restate either claim absolutely.
+  - **Every other outcome is `portUnavailable`.** No probe wired in, no `curl`
+    on the host, ssh refused, a timeout, an unparseable anything — all
+    `.unproved`, which is also the default when the seam is nil. Fail closed is
+    not a branch here, it is the absence of one, because the alternative is
+    telling the user everything is fine while a stranger collects the remote
+    plugin's bearer token from every hook.
+  - **The listener's one pre-auth look is not an oracle.** The nonce check runs
+    before the token because a self-probe must not land in the rejection tally
+    the user reads for "which of three fixes do I need". It compares only a
+    value this process minted and is still waiting for, it returns the same 401
+    with the same headers and the same empty body either way, and a match
+    short-circuits — so a matching nonce cannot carry a payload past
+    authentication even when a valid token rides with it.
+  - **A proved channel is a claim with an expiry.** `externallyForwarded` is
+    held by a session the app does not own and cannot be notified about, so the
+    supervisor re-attempts its own `-R` on a long injected-clock park
+    (5 minutes): the session ending means the bind now succeeds and the app
+    takes the tunnel over, and a holder that stops proving ownership drops back
+    to `portUnavailable`. A state that claims a channel must be able to stop
+    claiming it.
+  - **An unproved refusal is a state, not an end (#659).** `portUnavailable`
+    parks on the same 5-minute interval and dials again. It used to be
+    terminal, and after a network change the holder it blamed was usually this
+    Mac's own dead connection, still bound on the host until its sshd dropped
+    it. The fail-closed part is unchanged: the pane says the port is held, and
+    nothing is treated as ours without the nonce. The park is what keeps this
+    from being a retry storm; a refusal never enters the restart backoff. Wake
+    and network-path changes (`recover()`) restart failed and parked
+    supervisors at once, and leave live ones to ssh's keepalive.
+  - **Only a refusal of OUR port counts.** The supervised ssh inherits every
+    `RemoteForward` the alias declares, so it runs `ExitOnForwardFailure=no`
+    and ends itself (SIGTERM to its own child, then the usual escalation) only
+    when the refusal names this Mac's port. A refusal of another port is
+    logged and ignored. The residual: when such a foreign forward is free, this
+    connection binds it too, as any ssh with that config would.
+
+- **Remote enrollment execution is opt-in, consent-first, and keeps the token
+  out of process arguments.** `ClaudeRemoteEnrollmentService` generates the
+  idempotent ssh config block and remote scripts, but Settings never renders or
+  copies their text. Enrollment and host update expose only the seven-step
+  `RemoteHostSetupRun`, one consent sentence naming the local files and SSH
+  alias, and a Details link to `docs/remote-claude-context.md`, where every
+  command is listed. Local insertion replaces only the
   matching host's marked block, preserves an existing config's permissions, and
   atomically renames a same-directory temporary file; a missing `~/.ssh` and
-  config are created as 0700/0600. It refuses (with the copy path as the
-  documented out) when `~/.ssh/config` or `~/.ssh` is a symlink — a rename
+  config are created as 0700/0600. It refuses and directs the user to the docs
+  when `~/.ssh/config` or `~/.ssh` is a symlink — a rename
   would replace the link and desync a dotfiles setup — or when `~/.ssh` is not
   owned by the user or is group/world-writable. Remote execution spawns only `ssh -o
   BatchMode=yes <alias> /bin/sh -s` and sends the generated token-bearing script
-  through stdin — the token must never enter an argv. The whole action has a
+  through stdin — the token must never enter an argv on this Mac or on the
+  host. On the host it reaches `claude plugin configure --values-stdin` in a
+  here-document, never `install --config 'token=…'`, whose argv every account
+  there could read (#1621); it is in `~/.claude` after, as documented in
+  `docs/remote-claude-context.md`. The read-only
+  verification probes (`executeVerification`) are the OTHER ssh-bearing path and
+  obey the same rules: `BatchMode=yes` plus `--` before the alias on all,
+  `ClearAllForwardings=yes` on the plugin probe and on the FIRST tunnel probe.
+  That first tunnel probe must not be able to open the tunnel it checks: the
+  earlier single probe carried the alias's `RemoteForward`, curled through the
+  forward it had just bound, and passed on hosts where nothing else ever holds
+  the tunnel, which is every host reached only by Claude Desktop, whose ssh
+  clears forwardings (#656). Only when nothing answered does a SECOND tunnel
+  probe run without the option, and its 401 is reported as "the config opens
+  the tunnel, but nothing keeps it open", never as a pass; a squatter verdict
+  from it is `decidedBy: .remote`, so `reconciled` cannot upgrade a tunnel
+  that closed with the probe. The Claude Desktop probe (`~/.claude/remote/srv`)
+  runs only while Keep the tunnel open is off and only turns it ON, inside the
+  host setup run the user clicked. They carry no token at all, and no byte of their
+  output reaches a verdict, an alert, or the log. The whole action has a
   finite timeout, and every captured result, thrown error, alert, and log string
-  is token-redacted before it leaves the service. Keep the filesystem and
+  is token-redacted before it leaves the service. A plugin version the host's
+  listing reports reaches an error only as dot-separated numbers; anything
+  else reads as unreadable (#1817). Keep the filesystem and
   process runners injected; the no-runner service must continue to throw
   `.executionNotConfigured`.
   `ClaudeIntegrationSettingsModel` (`@MainActor @Observable`, all seams
@@ -441,9 +2889,295 @@ there is not.
   squatter on 8473 receives the remote's bearer token before anything rejects
   it, so the user must learn it is there. What the squatter does NOT get is a
   path into the prompt: the remote shim's stdout gate (post.sh) rejects any
-  200 body that is not exactly the listener's allowlisted control JSON, and a
-  forged well-formed marker is inert because markers are broker-allocated —
-  an unknown one joins nothing. Note also what is NOT defensible: a
+  200 body that is not exactly the listener's one control JSON body — which
+  since 2026-09-05 is a CONSTANT (`{"suppressOutput":true}`) carrying no field
+  that could put a byte on a terminal, so there is no variable part left for a
+  squatter to aim at. The fixed `X-Lvx-Session: joined|unknown` response header
+  only selects a private per-session status stamp and never reaches stdout.
+  Both copies still read one host file, and each answers a hook from the
+  file as it is now (#1046): `authenticate`, the alias match the remote
+  join starts from and the host queries `lstat` the file first and reload
+  it when another copy replaced it, so a host one copy revokes or rotates
+  is refused by the other on its next request. A file that changed and
+  cannot be read back (damaged, a newer build's format) may hold a
+  revocation, so until it reads again it authenticates nothing and every
+  caller that selects a host gets none (`activeHostsIfReadable`): the
+  alias match, the `ssh -G` fallback, the app-held forwards and quick
+  capture's routing. Only Settings and the doctor still list hosts from
+  memory. A read or write that takes in a host the other copy revoked,
+  removed or rotated also calls the registry's hosts-dropped handler
+  (#1125): the Settings model hops to the main actor and runs what an
+  in-app revoke runs, so this copy's app-held forward, herdr forwards and,
+  after the last host, its listener come down without a relaunch. No timer
+  polls the file; the next hook or query is what notices.
+  Copies starting together cannot both take the broker socket: its probe,
+  stale-file unlink and bind run under a lock every copy shares, and a
+  broker's stop unlinks the path only while it still names the socket that
+  broker bound (#1603).
+  A second copy of the app (a `try-pr.sh` build) loses this port and the
+  broker socket to the running copy, and then waits:
+  `ClaudeHookSocketTakeover` retries only the binds it lost, each time
+  another process with the app's bundle id exits (a kqueue exit watch). The
+  broker never retries on a timer, because its liveness check connects to
+  the holder's socket; the listener's port also retries every ten seconds,
+  since a failed bind touches no one and the holder may be no copy of the
+  app (#892). A retry that still finds the socket held waits. MEASURED
+  2026-09-27 (#655): without it, the survivor of two copies kept dictating
+  with no hook reaching it, and every Claude Desktop join abstained until a
+  relaunch.
+  The CI launch smoke never binds either socket nor starts or reaps a
+  forward (`StartupPermissionSuppression.leavesHookSocketsAlone`), and the
+  forward orphan reaper kills a forward only when the copy that spawned it
+  (`ClaudeRemoteForwardOwner`, recorded in the pid ledger) is dead and ran
+  from this copy's executable. Holding the listener is not proof of being
+  the only copy: a copy that lost the port keeps running without it.
+  MEASURED 2026-09-27 (#892): three launch smokes on the owner's Mac bound
+  the port his copy had lost, each SIGTERMed the forward the shared ledger
+  named, dialed his dev box with a forward of its own, and left it behind
+  when the smoke killed the app two seconds later.
+  The shim's request-side `X-Lvx-Plugin-Version` header (its own version, a
+  constant in `post.sh`) is the same shape of rule: validated to a strict
+  numeric shape on arrival (`ClaudeRemotePluginVersionCodec`), recorded on the
+  host only where the request is finally ACCEPTED — the same points
+  `lastSeenAt` is noted, never on first authentication alone, so a request
+  the revocation re-check refuses cannot mutate a report that rotation would
+  then preserve — never logged, and used only to
+  select the fixed "Update available" string in Settings. The
+  recorded value is the HIGHEST any of that host's hooks reported this app
+  session and is never lowered, because Claude Code applies a plugin update
+  only on session restart — after "Update Plugin…" the host's already-running
+  sessions keep sending header-less hooks from the old shim, and a
+  last-writer-wins record would flip a verified host back to "update
+  available" over an install the read-back had just proven current.
+  Note also what is NOT defensible: a
   malicious process running as the user on the REMOTE host can still read
   `~/.claude/` and therefore the plugin's token no matter what we do. Say so
   rather than implying the token bounds it.
+- **A host installs the remote plugin from the app's own copy, never from
+  GitHub** (#836). The setup writes the bundled marketplace to
+  `~/.local/share/localvoxtral/claude-marketplace` on the host and registers
+  that directory, then demands the read-back equal the version this build
+  ships. A GitHub marketplace tracks main, so every shipped app failed that
+  read-back (exit 43) on every host the day main bumped the plugin. Don't
+  relax the read-back instead: the shim's wire contract is versioned. Don't
+  `claude plugin marketplace remove` to switch sources either: it uninstalls
+  the plugin and deletes the token, which the update path cannot resend;
+  `marketplace add` on the existing name replaces the source and keeps both
+  (Claude Code 2.1.283).
+- **The Mac asks a host to spend, and the host's answer is a label source**
+  (#641). A remote project's terms come from a run on the host, because the
+  Mac holds only a label for the repository and a label never becomes a path,
+  a cwd or an ssh argument. The ask is one fixed reply header,
+  `X-Lvx-Terms: wanted`, of the same kind as `X-Lvx-Session`: it never
+  reaches the shim's stdout, and the body stays the constant. It goes only to
+  a session a dictation joined, once per mark (`RemoteProjectTermRequests`,
+  10 minutes), only when THIS request's shim version reads it, and a mark is
+  made only for a host that reported such a version and a project with no
+  stamp. A squatter on the port can send it too; the host's per-project stamp
+  (atomic `mkdir`, attempt time, `done` after a 200) bounds that to one run per
+  project per 24 hours, under the #609 caps. The shim starts `terms.sh`
+  detached under `env -i HOME PATH LANG USER LOGNAME` (macOS finds a Claude
+  Code keychain login only with `USER`) with every descriptor on `/dev/null`:
+  a run started from a hook inherits the session's `CLAUDE_CODE_*` ids and the
+  plugin's `CLAUDE_PLUGIN_OPTION_TOKEN`, and the token reaches the runner only
+  on stdin, then a header file for curl, never an argv or an environment.
+  `POST /v1/terms` authenticates like a hook, scopes the session id under
+  the host that authenticated it, and accepts one answer per ask, for a live
+  session of the asked agent; the project key is the one the Mac recorded at
+  the ask, never anything the host sends. The body is untrusted text that repo
+  contents can steer: 16 KiB at most, `{"terms": [...]}` or Claude Code's
+  result object, read for its answer and usage only (#854), through the #609
+  term filter, stored only as unconfirmed proposals. A refusal logs its reason,
+  never a byte of the body. What stays as it was: the stdout gate, the hook's
+  fail-open exit, the forward, and what is sent to herdr.
+- **Quick capture asks a host the way #641 does, and the capture goes only
+  to the session asked** (#745, `RemoteQuickCaptureRequests`). Two more fixed
+  reply headers: `X-Lvx-Readme: wanted` (a remote project the learned terms
+  hold, no summary or a week-old one, once per project per day this launch)
+  and `X-Lvx-Draft: <32 hex>` (the next accepted hook from a live session in
+  the routed project). Both go only to a request whose own shim reads them.
+  `/v1/readme`, `/v1/draft/prompt` and `/v1/draft` authenticate like a hook,
+  scope the session id under the authenticating host and the named agent, and
+  take one answer from exactly the session and agent asked; unlike
+  `/v1/terms` the session need not still be live, since the ask recorded all
+  three. The capture text leaves the Mac only in the prompt reply. The
+  README bytes are only summarized, the host's issue list only quoted into
+  the prompt (a related issue counts only if listed there), the output read
+  as a local draft. A shim from #918 on asks `/v1/draft/words` (the
+  capture's search words, which go only where the capture goes), posts its
+  context bundle to `/v1/draft/context` (96 KiB, parsed into
+  `QuickCaptureContext` and only quoted), and polls `/v1/draft/check` (202,
+  204, or the check's prompt); the host greps only words that start with a
+  letter or digit, after `-e`, so no word reads as an option. The first
+  draft runs on the Mac, off the listener's threads. A squatter on the port can send both headers and answer
+  the prompt request with a prompt of its own, so the host's run is the
+  Mac's drafting command with Claude Code's reads confined to the checkout
+  (`--permission-mode dontAsk --allowedTools Read(./**)`; without it Read
+  opens any file, measured 2026-09-27; Vibe's tools are workspace-bound) and
+  the shim allows one draft at a time and 20 a day. `capture.sh` never runs
+  `gh` for anything but `issue list`. A Vibe run's usage rides in
+  `X-Lvx-Usage` on `/v1/terms` and `/v1/draft` (#854): three decimal
+  counts, anything else read as none, used for the usage log alone. The
+  shims pull the numbers out of Vibe's session log with `sed` and never send
+  the file, which holds the prompt. Which remote projects the router sees
+  (#819): a hook adds a project only for a name its host sent as
+  `X-Lvx-Env-Project`, or the repository of a Claude Code worktree cwd; a
+  cwd label only stamps a project already held,
+  because each worktree has its own, and a label no hook has named since is
+  not listed, since no session will report it again. Nothing guesses which
+  repository an old label belonged to.
+- **The SendEnv probe uses a random value that is never logged and never
+  interpreted beyond equality.** `probeRemoteEnvironment` mints a fresh nonce
+  per call (a UUID by default, injected in tests), exports it into that one
+  ssh child's environment as `LC_LVX_TTY`, and compares the remote echo by
+  exact equality only. The echo travels framed (`LVX_TTY:`) and only the
+  first framed line is read, so banner or stderr noise sharing the capture
+  pipe cannot flip the verdict; the frame itself is never interpreted. The
+  value never appears in argv or stdin — where it would land in `ps`, the
+  log, or a build transcript — and never in a `Log` line, a
+  `VerificationCheck`, an alert, or an error. A mismatch reports only which
+  side refused, with its fixed remedy: no `sendenv` covering the host in
+  `ssh -G` means this Mac is not sending it; otherwise the remote sshd
+  refused it. Do not "improve" the diagnosis by quoting what came back: the
+  echo is remote output, and remote output never travels.
+- **The dogfood control socket is an accepted tradeoff, and the acceptance was
+  bounded.** A debug or e2e-harness build can expose a local AF_UNIX socket
+  that starts dictations and reports what the context pipeline resolved
+  (`DogfoodControlSocket`), because two things are unobservable from outside
+  the process: a dictation has no deterministic trigger, and
+  `ClaudeSessionRegistry` is per-process, so `--probe-surface` sees only the
+  sessions the app last saved to disk. What makes that acceptable is a set of
+  bounds, each of which is the whole argument for the one above it:
+  - **`#if DEBUG || LOCALVOXTRAL_E2E_HARNESS` and nothing else**, for the
+    socket and for the WAV file that stands in for the microphone
+    (`DogfoodAudioFileSource`). A release build compiles none of it: no
+    listener, no path, no code that could create one, and no setting or
+    argument that turns it on. Only the UI smoke workflow's package sets
+    `LOCALVOXTRAL_E2E_HARNESS=1`. `package_app.sh` searches every
+    bundle's binary for the harness types
+    (`scripts/packaging/check-harness-symbols.sh`): a release build fails if
+    one is there, a harness build fails if one is missing. Within a build that
+    has the socket there is a SECOND runtime gate,
+    `debug.dogfood_control_socket_enabled`, kept separate from the diagnostic
+    records switch: writing records and accepting commands are different
+    consents.
+  - **0700 directory, 0600 socket, and `getpeereid` before the first read.**
+    The permissions should already make another uid unable to reach the path.
+    The credential check is there because "should" is a claim about the
+    filesystem, not about this process.
+  - **Every value that crosses is a bool, a count, or a closed enum name.**
+    `ClaudeSessionJoinSummary` is reused rather than re-mapped (its third
+    consumer, after the diagnostic record and `--probe-surface`), abstention
+    causes are the resolver's own content-free categories, and `registry list`
+    reports session SHAPES — never a session id, marker, workspace, tty, pane
+    id, socket path or host. Replies pass through `DiagnosticRecordRedaction` as
+    a backstop, not as the strategy.
+  - **`session start` reaches `handleModifierOnlyTap`, the gesture's own
+    handler.** It is subject to the Secure Keyboard Entry refusal, the
+    Accessibility state, the microphone gate and backend readiness exactly as a
+    real trigger is; a refusal is REPORTED, never overridden. The only thing
+    added on top is another refusal (a start while dictating would toggle the
+    session off). It is also CAPPED — auto-stopped after a bounded window on an
+    injected clock — so a client that disconnects mid-dictation cannot leave
+    the app recording, and every exit path releases the cap.
+  - **Nothing can be injected.** No command carries a surface, a session, a tty
+    or a join. Every verb observes real resolution; a socket that could
+    fabricate one would answer questions about itself.
+  - Unlike `--probe-surface`, `surface probe` wires the app's FULL-capability
+    resolver. That is deliberate and is the reason the socket exists: the
+    withholding in the one-shot verb is about a process that is a bad owner for
+    a supervised `ssh -L` and a nonce lease, and the app is the good one. A
+    probe that withheld them would answer a different question from the one a
+    dictation asks.
+- **The `localvoxtral` command shares the hook socket, and its replies are the
+  one place that socket returns data** (#721). A line with a `cli` key is a
+  command request (`AgentCLIWire`); it is answered and the connection closes,
+  and it never reaches the registry. The trust is the hook path's, unchanged:
+  the 0700 directory, the 0600 socket and `getpeereid` before the first byte,
+  so only processes running as the user can ask, and each of them could read
+  `history.store` and `learned-terms.json` from disk already. That equivalence
+  is the whole argument, so it bounds what the command may do: no TCP
+  listener, ever (a loopback port is reachable by every local user and every
+  page a browser loads); no command that writes history or starts a
+  dictation; and replies carry what the stores hold and nothing more. History
+  keeps the clipboard placeholder, never the clipboard, and so does the
+  command. Under History's **Don't keep**, `history` answers an empty list
+  with `historyKept: false`, not an error: nothing is kept, so nothing is
+  found, and the flag says why. `terms propose` writes only unconfirmed proposals
+  (`LearnedTerms.recordCommandProposal`), under the same rules as #609's:
+  term-shaped only, never a term the user listed or refused, confirmed only
+  by three dictations or a pin. The caller's name (`agent:<name>`) is read
+  from the agent's own environment and is a label, not a credential: every
+  caller shares the uid. Unlike the headless run's answer, a command proposal
+  does not stamp the project, because it is a few names, not the project's
+  list. The hook receipt (`ClaudeBrokerResponse`) is untouched and still
+  carries nothing a hook could print.
+
+- **A quick capture never reaches the focused app, and only File and
+  Comment on #N reach GitHub** (#725, #965). A session started by the quick capture shortcut latches
+  `sessionIsQuickCapture` with its output mode (always Overlay Buffer), and
+  its stop takes `commitQuickCapture` before any polish, second pass, screen
+  or clipboard sample, or insertion: the History record is written first,
+  the overlay closes as a cancelled one does, and the words go to
+  `QuickCaptureInboxModel`, which writes them to its 0600 file before it
+  polishes them. The capture is polished once there (#970), before the
+  follow-up check and routing: one request to the polishing endpoint with
+  the standard profile's prompt and the user's terms, and no screen,
+  clipboard or session context. Its vocabulary is every routable project's
+  name, repository name and confirmed learned terms
+  (`QuickCapturePolishVocabulary`, capped per project and in total; no
+  proposals), matched against the words as a dictation's learned terms are.
+  The router, drafter and follow-ups read the polished words; History keeps
+  the raw ones and gets the polished text on the same record, which
+  Insights leaves out of its polish waits. A failed
+  polish, or none configured, routes the raw words. Polishes run side by
+  side, but captures join or route in the order they were made: an "also"
+  whose polish answers first waits for the capture before it. The router sends a low or tied answer to the catch-all, never a
+  guessed project: the guess is kept as the route's `suggestion`, and
+  nothing drafts until the user accepts it (#938). Jev and the chat model both need 0.9: on the replay
+  (#741, #744) every right project came at 0.95 or more, and nearly every
+  wrong one under 0.9. Drafting has two stages (#918). The first is one
+  request to the polishing model with the context the app gathers
+  (`QuickCaptureContext`: README and guide openings, `git grep` hits for the
+  capture's words, `gh` issue and PR lists), every field capped and only
+  quoted; it sorts the capture by kind, and only an issue can be filed
+  (`QuickCaptureItem.canFile`) or checked. The second, an issue's check, is
+  the drafting agent: read-only tools and no shell, so it cannot run `gh`;
+  the open issues reach it through the prompt, from the app's own `gh issue
+  list`. Both answers are untrusted text: a one-line capped title, a body
+  without control characters, a related issue only if it was listed, files
+  read only as relative paths that exist in the checkout. A check never
+  overwrites a draft the user edited, and never lands on a capture filed or
+  moved meanwhile. `QuickCaptureInboxModel.file`
+  is the one call to `gh issue create`, reached only from the Inbox's File
+  button and from a spoken "file it" (#927). That one works only in a review
+  dictation, whose overlay shows exactly one draft, and `applySpokenReview`
+  files only when the draft's title, body and repository still match what
+  the overlay showed (#1510): a move keeps the text but not where it files. `QuickCaptureInboxModel.comment` is the one call to `gh issue
+  comment` (#965), reached only from the Inbox's Comment on #N button, and
+  only for a draft whose `relation` is `extends`: the issue number comes from
+  the app's own open-issue list. A follow-up joins an open capture (not
+  filed, within the hour) only on its first words ("also", "for that idea")
+  or on a router pick past the same 0.9 and 0.15 bars; an unsure pick joins
+  nothing and suggests that capture's project. The join keeps the
+  follow-up's words apart for Split, and a draft run it supersedes is
+  dropped. The router's request changes only when there is an open capture
+  to offer; that capture's title or first words then go to the same
+  classifier as the new capture. A remote project is drafted on its host (#745, below): a remote
+  label never becomes a working directory here. A capture keeps the
+  checkout key it was routed to; when that checkout's repository gains a
+  checkout on the Mac, the Inbox moves it to the Mac's (#971), except while
+  a draft runs for it. Each route, draft, check and filing names the
+  running copy that owns it (#1288, #1507): a launch ends only those whose
+  copy is gone, and writes that at once, so a copy still holding one in
+  memory cannot write it back. A filing a quit interrupted never becomes
+  fileable by itself (#1509): File and Comment append an HTML comment
+  marker with the claim's id to what they send, and the relaunch, once
+  `gh` could no longer be sending, lists the repository's issues (or the
+  issue's comments) changed since the claim, read-only. The marker found,
+  the capture is filed with that URL; GitHub answering without it, the
+  capture can be filed again; anything else, or a claim from before the
+  marker, and nothing is sent until the user picks Check GitHub Again or
+  File Anyway. A `gh` that fails after it may have sent (a timeout, a kill, no URL,
+  any nonzero exit but 4, "not logged in") gets the same lookup in the
+  running copy (#1541): the capture stays claimed until GitHub answers.

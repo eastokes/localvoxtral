@@ -5,40 +5,34 @@ import XCTest
 #if DEBUG
 @MainActor
 final class SendNowViewModelTests: XCTestCase {
-    private static var retainedViewModels: [DictationViewModel] = []
 
     private func makeViewModel(
         selectedApps: Set<SendNowTargetApp> = [.ghostty]
-    ) -> (DictationViewModel, SendNowTestOverlayCoordinator, Insertions) {
-        let suiteName = "localvoxtral.SendNowViewModelTests.\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suiteName)!
-        defaults.removePersistentDomain(forName: suiteName)
-        addTeardownBlock {
-            defaults.removePersistentDomain(forName: suiteName)
+    ) -> (DictationViewModel, MockOverlayCoordinator, Insertions) {
+        let settings = makeSettings(outputMode: .liveAutoPaste)
+        settings.sendNowCommandEnabled = true
+        for app in SendNowTargetApp.allCases {
+            settings.setSendNowTargetApp(app, isSelected: selectedApps.contains(app))
         }
-
-        let settings = SettingsStore(defaults: defaults, environment: [:])
-        settings.dictationOutputMode = .liveAutoPaste
-        let coordinator = SendNowTestOverlayCoordinator()
+        let coordinator = MockOverlayCoordinator()
         coordinator.commitTargetAppPID = 123
         let viewModel = DictationViewModel(
             settings: settings,
             overlayBufferCoordinator: coordinator,
             startRuntimeServices: false
         )
-        Self.retainedViewModels.append(viewModel)
-
+        retainForTestProcessLifetime(viewModel)
         viewModel.isDictating = true
-        viewModel.sessionOutputMode = .liveAutoPaste
-        viewModel.sessionSendNowEnabled = true
-        viewModel.sessionSendNowTriggerPhrase = "send now"
-        viewModel.sessionSendNowTargetApps = selectedApps
-        viewModel.preCapturedSessionTargetVerdict = .init(
+        viewModel.session.sessionOutputMode = .liveAutoPaste
+        viewModel.dependencies.bundleIdentifier = { pid in
+            pid == 123 ? "com.mitchellh.ghostty" : "com.example.editor"
+        }
+        viewModel.session.preCapturedSessionTargetVerdict = .init(
             decision: .init(isTerminalLike: true, reason: .bundleMatch),
             secureKeyboardEntryEnabled: false
         )
-        viewModel.applyPreCapturedSessionTargetVerdict()
-        viewModel.debugResolveTargetAppBundleIDOverride = { "com.mitchellh.ghostty" }
+        viewModel.session.applyPreCapturedSessionTargetVerdict()
+        viewModel.textInsertion.debugSetAccessibilityTrusted(true)
         viewModel.textInsertion.beginLiveReplacementSession(
             dictionary: ReplacementDictionary(entries: []),
             preferredAppPID: 123,
@@ -49,53 +43,74 @@ final class SendNowViewModelTests: XCTestCase {
         viewModel.textInsertion.debugConfigureInsertionHooks(
             unicodePoster: { text in
                 insertions.text.append(text)
+                insertions.insertionPIDs.append(insertions.frontmostPID)
                 return true
             },
             modifierStateReader: { false },
-            accessibilityInserter: { text, pid in
-                insertions.text.append(text)
-                insertions.insertionPIDs.append(pid)
-                return true
-            },
+            accessibilityInserter: { _, _ in false },
             returnKeyPoster: { pid in
                 insertions.returnPIDs.append(pid)
                 return true
-            }
+            },
+            frontmostPIDReader: { insertions.frontmostPID }
         )
+        TerminalTargetDetector.debugSecureEventInputOverride = { false }
+        addTeardownBlock { @MainActor in
+            TerminalTargetDetector.debugSecureEventInputOverride = nil
+        }
         return (viewModel, coordinator, insertions)
     }
 
     func testSelectedTerminalWithholdsPartialsAndSubmitsFinalizedBodyOnce() {
         let (viewModel, _, insertions) = makeViewModel()
 
-        viewModel.handle(event: .partialTranscript("run the focused test send now"))
+        viewModel.session.handle(event: .partialTranscript("run the focused test send now"))
         XCTAssertEqual(insertions.text, [])
         XCTAssertEqual(insertions.returnPIDs, [])
 
-        viewModel.handle(event: .finalTranscript("run the focused test send now"))
+        viewModel.session.handle(event: .finalTranscript("run the focused test send now"))
         XCTAssertEqual(insertions.text.joined(), "run the focused test")
         XCTAssertEqual(insertions.insertionPIDs, [123])
         XCTAssertEqual(insertions.returnPIDs, [123])
 
-        viewModel.handle(event: .finalTranscript("run the focused test send now"))
+        viewModel.session.handle(event: .finalTranscript("run the focused test send now"))
         XCTAssertEqual(insertions.text.joined(), "run the focused test")
         XCTAssertEqual(insertions.returnPIDs, [123])
 
-        viewModel.handle(event: .partialTranscript("run the focused test send now"))
-        viewModel.handle(event: .finalTranscript("run the focused test send now"))
+        viewModel.session.handle(event: .partialTranscript("run the focused test send now"))
+        viewModel.session.handle(event: .finalTranscript("run the focused test send now"))
         XCTAssertEqual(
             insertions.text.joined(),
-            "run the focused testrun the focused test"
+            "run the focused test"
         )
-        XCTAssertEqual(insertions.insertionPIDs, [123, 123])
-        XCTAssertEqual(insertions.returnPIDs, [123, 123])
+        XCTAssertEqual(insertions.insertionPIDs, [123])
+        XCTAssertEqual(insertions.returnPIDs, [123])
+    }
+
+    func testCustomTriggerUsesTheStoredPhrase() {
+        let (viewModel, _, insertions) = makeViewModel()
+        viewModel.settings.sendNowTriggerPhrase = "ship it"
+        viewModel.session.handle(event: .finalTranscript("run tests ship it"))
+        XCTAssertEqual(insertions.text.joined(), "run tests")
+        XCTAssertEqual(insertions.returnPIDs, [123])
+    }
+
+    func testFocusChangeKeepsTheTriggerAndDoesNotSubmitOrReactivateGhostty() {
+        let (viewModel, _, insertions) = makeViewModel()
+        viewModel.session.handle(event: .partialTranscript("run tests send now"))
+        insertions.frontmostPID = 456
+        viewModel.session.handle(event: .finalTranscript("run tests send now"))
+        XCTAssertEqual(insertions.text.joined(), "run tests send now")
+        XCTAssertEqual(insertions.insertionPIDs, [456])
+        XCTAssertEqual(insertions.returnPIDs, [])
+        XCTAssertEqual(insertions.frontmostPID, 456)
     }
 
     func testNonSelectedTerminalTreatsTriggerAsLiteralText() {
         let (viewModel, _, insertions) = makeViewModel(selectedApps: [])
 
-        viewModel.handle(event: .partialTranscript("send now"))
-        viewModel.handle(event: .finalTranscript("send now"))
+        viewModel.session.handle(event: .partialTranscript("send now"))
+        viewModel.session.handle(event: .finalTranscript("send now"))
 
         XCTAssertEqual(insertions.text.joined(), "send now")
         XCTAssertEqual(insertions.returnPIDs, [])
@@ -104,7 +119,7 @@ final class SendNowViewModelTests: XCTestCase {
     func testTerminalHoldBackSanitizesNewlineBeforeReturn() {
         let (viewModel, _, insertions) = makeViewModel()
 
-        viewModel.handle(event: .finalTranscript("run tests\nthen report send now"))
+        viewModel.session.handle(event: .finalTranscript("run tests\nthen report send now"))
 
         XCTAssertEqual(insertions.text.joined(), "run tests then report")
         XCTAssertEqual(insertions.returnPIDs, [123])
@@ -112,30 +127,10 @@ final class SendNowViewModelTests: XCTestCase {
 }
 
 private final class Insertions {
+    var frontmostPID: pid_t? = 123
     var text: [String] = []
     var insertionPIDs: [pid_t?] = []
     var returnPIDs: [pid_t?] = []
 }
 
-@MainActor
-private final class SendNowTestOverlayCoordinator: OverlayBufferSessionCoordinating {
-    var commitTargetAppPID: pid_t?
-
-    func resolveAnchorNow() -> OverlayAnchor {
-        OverlayAnchor(
-            targetRect: CGRect(x: 0, y: 0, width: 100, height: 24),
-            source: .windowCenter
-        )
-    }
-    func startSession(preResolvedAnchor: OverlayAnchor?) {}
-    func beginFinalizing(displayBufferText: String, commitBufferText: String) {}
-    func refresh(displayBufferText: String, commitBufferText: String) {}
-    func commitIfNeeded(
-        using textCommitter: OverlayTextCommitting,
-        autoCopyEnabled: Bool
-    ) -> OverlayBufferCommitOutcome { .succeeded }
-    func dismissAfterHold(minimumVisibility: TimeInterval) {}
-    func reset() {}
-    func captureLiveCommitTargetAppPID() {}
-}
 #endif

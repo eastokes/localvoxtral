@@ -1,0 +1,611 @@
+import ClaudeContextWire
+import Foundation
+import localvoxtralTestSupport
+import Synchronization
+import XCTest
+@testable import localvoxtral
+
+#if DEBUG
+/// The second pass on stop (#317), in process: an Overlay Buffer dictation
+/// in Mistral API mode is sent whole to the batch endpoint, and its text
+/// replaces the realtime text only when it answers before the deadline. The
+/// batch endpoint is a fake; the deadline runs on a `ManualSessionClock`.
+@MainActor
+final class StopSecondPassPipelineTests: XCTestCase {
+    private static let realtimeText = "why is local vogue's codesign identity not picked up"
+    private static let batchText = "Why is localvoxtral codesign identity not picked up?"
+    /// One second of 16 kHz mono PCM16.
+    private static let pcm = Data((0..<32_000).map { UInt8(truncatingIfNeeded: $0) })
+
+    func testAnAnswerInTimeReplacesTheRealtimeTextBeforePolish() async {
+        let transcriber = FakeBatchTranscriber(.text(Self.batchText))
+        let polisher = FakePolishingService()
+        let harness = makeHarness(transcriber: transcriber, polisher: polisher)
+        let ledger = UsageLedger(fileURL: nil)
+        harness.viewModel.session.secondPassUsageRecorder = ledger
+
+        harness.stop()
+        XCTAssertEqual(harness.viewModel.statusText, DictationViewModel.StatusStrings.transcribingAgain)
+        await awaitStoppedSessionCommit(harness.viewModel)
+
+        XCTAssertEqual(transcriber.calls, [FakeBatchTranscriber.Call(
+            wav: DictationAudioRecording.wav(fromPCM16: Self.pcm),
+            language: nil,
+            contextBias: ["localvoxtral", "Claude_Code"],
+            apiKey: "session-key",
+            endpoint: URL(string: "https://api.mistral.ai/v1/audio/transcriptions")!
+        )])
+        let polished = await polisher.lastRequest
+        XCTAssertEqual(polished?.inputText, Self.batchText, "polish runs on the second pass's text")
+        XCTAssertEqual(harness.overlay.committedTexts, [Self.batchText])
+        XCTAssertEqual(harness.records.map(\.rawText), [Self.batchText])
+        XCTAssertEqual(harness.records.first?.commitSucceeded, true)
+        let usage = ledger.entries()
+        XCTAssertEqual(usage.map(\.feature), [.secondPass])
+        XCTAssertEqual(usage.first?.audioSeconds, 1)
+        XCTAssertEqual(usage.first?.costEUR ?? 0, 0.0026 / 60, accuracy: 1e-12)
+    }
+
+    /// #1649: the batch model left out a sentence the realtime stream had,
+    /// and replacing the text whole lost it from the overlay, the polish and
+    /// the commit.
+    func testASentenceOnlyTheRealtimeTextHasSurvivesTheReplace() async {
+        let realtime = "close the old issues tonight then archive every session because the cache goes cold start fresh tomorrow"
+        let batch = "Close the old issues tonight. Start fresh tomorrow."
+        let kept = "Close the old issues tonight. then archive every session because the cache goes cold Start fresh tomorrow."
+        let polisher = FakePolishingService()
+        let harness = makeHarness(
+            transcriber: FakeBatchTranscriber(.text(batch)), polisher: polisher, realtimeText: realtime)
+
+        harness.stop()
+        await awaitStoppedSessionCommit(harness.viewModel)
+
+        XCTAssertTrue(
+            harness.overlay.refreshCalls.contains { $0.displayText == kept }, "the overlay shows it before polish")
+        let polished = await polisher.lastRequest
+        XCTAssertEqual(polished?.inputText, kept, "polish gets it")
+        XCTAssertEqual(harness.overlay.committedTexts, [kept])
+        XCTAssertEqual(harness.records.map(\.rawText), [kept])
+    }
+
+    func testTheDeadlineKeepsTheRealtimeTextAndCancelsTheRequest() async {
+        let transcriber = FakeBatchTranscriber(.held)
+        let harness = makeHarness(transcriber: transcriber)
+
+        harness.stop()
+        let commit = harness.viewModel.session.polishAndCommitTask
+        _ = await transcriber.called.value(failAfter: 10)
+        await harness.clock.waitForSleepers(1)
+        XCTAssertTrue(harness.overlay.committedTexts.isEmpty, "nothing is committed while the pass runs")
+        harness.clock.advance(by: 3)
+        await commit?.value
+
+        XCTAssertEqual(transcriber.cancelledCount, 1)
+        XCTAssertEqual(harness.overlay.committedTexts, [Self.realtimeText])
+        XCTAssertEqual(harness.records.map(\.rawText), [Self.realtimeText])
+    }
+
+    func testAFailedPassKeepsTheRealtimeText() async {
+        struct Refused: Error {}
+        let harness = makeHarness(transcriber: FakeBatchTranscriber(.failure(Refused())))
+
+        harness.stop()
+        await awaitStoppedSessionCommit(harness.viewModel)
+
+        XCTAssertEqual(harness.overlay.committedTexts, [Self.realtimeText])
+        XCTAssertNil(harness.viewModel.lastError, "a failed second pass is only logged")
+    }
+
+    func testANewDictationDuringThePassSavesTheRealtimeTextAsNotInserted() async {
+        let transcriber = FakeBatchTranscriber(.held)
+        let harness = makeHarness(transcriber: transcriber)
+
+        harness.stop()
+        let commit = harness.viewModel.session.polishAndCommitTask
+        _ = await transcriber.called.value(failAfter: 10)
+        XCTAssertTrue(harness.viewModel.session.cancelPolishingForNewSessionIfNeeded())
+        await commit?.value
+
+        XCTAssertTrue(harness.overlay.committedTexts.isEmpty)
+        XCTAssertEqual(harness.records.map(\.rawText), [Self.realtimeText])
+        XCTAssertEqual(harness.records.first?.commitSucceeded, false)
+    }
+
+    /// A dictation joined to a Claude Code session in a terminal tab, with
+    /// polishing off: the user switched to another tab of the same terminal
+    /// while the second pass ran. The joined pane is read back before the
+    /// keys, so the other tab's prompt gets nothing, and the text is saved
+    /// not inserted and copied (#1712).
+    func testATabSwitchDuringTheSecondPassTypesNothing() async throws {
+        let transcriber = FakeBatchTranscriber(.held)
+        let harness = makeHarness(transcriber: transcriber)
+        let focuser = try joinTerminalTab(harness)
+        let copied = harness.viewModel.recordPasteboardWrites()
+
+        harness.stop()
+        let commit = harness.viewModel.session.polishAndCommitTask
+        _ = await transcriber.called.value(failAfter: 10)
+        await harness.clock.waitForSleepers(1)
+        // Same terminal, another tab, while the second pass runs.
+        focuser.paneStillShowsSession = false
+        harness.clock.advance(by: 3)
+        await commit?.value
+        await harness.viewModel.session.polishAndCommitTask?.value
+
+        XCTAssertEqual(focuser.readBackSessionIDs, ["s1"], "read back before the keys")
+        XCTAssertTrue(harness.overlay.committedTexts.isEmpty, "the other tab's session never gets the words")
+        XCTAssertEqual(harness.records.map(\.rawText), [Self.realtimeText])
+        XCTAssertEqual(harness.records.first?.commitSucceeded, false)
+        XCTAssertEqual(copied.values, [Self.realtimeText])
+    }
+
+    /// The same joined dictation whose pane is still in front after the
+    /// second pass is typed as before.
+    func testAJoinedDictationWhosePaneStaysInFrontIsTypedAfterTheSecondPass() async throws {
+        let harness = makeHarness(transcriber: FakeBatchTranscriber(.text(Self.batchText)))
+        let focuser = try joinTerminalTab(harness)
+
+        harness.stop()
+        await awaitStoppedSessionCommit(harness.viewModel)
+
+        XCTAssertEqual(focuser.readBackSessionIDs, ["s1"])
+        XCTAssertEqual(harness.overlay.committedTexts, [Self.batchText])
+        XCTAssertEqual(harness.records.first?.commitSucceeded, true)
+    }
+
+    func testASessionWithoutASecondPassCommitsAtOnce() {
+        let transcriber = FakeBatchTranscriber(.text(Self.batchText))
+        let harness = makeHarness(transcriber: transcriber, secondPass: false)
+
+        harness.stop()
+
+        XCTAssertTrue(transcriber.calls.isEmpty)
+        XCTAssertNil(harness.viewModel.session.polishAndCommitTask)
+        XCTAssertEqual(harness.overlay.committedTexts, [Self.realtimeText])
+    }
+
+    /// #1678: the switch in Settings, latched at start like a real session.
+    func testTheSettingsSwitchDecidesWhetherTheStopTranscribesAgain() async {
+        for enabled in [true, false] {
+            let transcriber = FakeBatchTranscriber(.text(Self.batchText))
+            let harness = makeHarness(transcriber: transcriber, secondPassSetting: enabled)
+
+            harness.stop()
+            await awaitStoppedSessionCommit(harness.viewModel)
+
+            XCTAssertEqual(transcriber.calls.count, enabled ? 1 : 0, "switch \(enabled)")
+            XCTAssertEqual(
+                harness.overlay.committedTexts, [enabled ? Self.batchText : Self.realtimeText],
+                "switch \(enabled)")
+        }
+    }
+
+    // MARK: - Context terms (#647)
+
+    private static let projectDirectory = "/nonexistent-647/quillmark"
+
+    /// The terms one dictation joined to a Claude Code session in a project
+    /// whose agent proposed `inkwell` sends, polished or not.
+    private func contextBias(trusted: Bool, polish: Bool) async -> [String]? {
+        let transcriber = FakeBatchTranscriber(.text("Ask Claude_Code about inkwell."))
+        let harness = makeHarness(
+            transcriber: transcriber, polisher: polish ? FakePolishingService() : nil)
+        let settings = harness.viewModel.settings
+        settings.polishContextTrustedEndpointEnabled = trusted
+        settings.repoVocabularyEnabled = true
+        harness.viewModel.learnedTermStore = storeProposing("inkwell", in: Self.projectDirectory)
+        harness.viewModel.dependencies.repoVocabularyGrounding = FakeRepoVocabularyGrounding(outcome: nil)
+        join(harness, cwd: Self.projectDirectory)
+
+        harness.stop()
+        await awaitStoppedSessionCommit(harness.viewModel)
+        XCTAssertEqual(
+            harness.records.first?.rawText, "Ask Claude Code about inkwell.",
+            "a phrase the model wrote as sent gets its space back")
+        return transcriber.calls.first?.contextBias
+    }
+
+    /// The join's terms reach the second pass polished or not: a repository
+    /// term leaves only with the trusted-endpoint opt-in, and the polish
+    /// capture does not drop the join on the way.
+    func testARepositoryTermLeavesOnlyWithTheTrustedEndpointOptInPolishedOrNot() async {
+        for polish in [false, true] {
+            let untrusted = await contextBias(trusted: false, polish: polish)
+            XCTAssertEqual(untrusted, ["localvoxtral", "Claude_Code"], "polish: \(polish)")
+            let trusted = await contextBias(trusted: true, polish: polish)
+            XCTAssertEqual(trusted, ["localvoxtral", "Claude_Code", "inkwell"], "polish: \(polish)")
+        }
+    }
+
+    /// A joined session in a subdirectory of a linked worktree (#705): the
+    /// proposals are filed under the main checkout (#652), which only the git
+    /// root names. The lookup starts from the session's own directory.
+    func testASessionInAWorktreeGetsTheMainCheckoutsProposals() async {
+        let transcriber = FakeBatchTranscriber(.text(Self.batchText))
+        let harness = makeHarness(transcriber: transcriber)
+        harness.viewModel.settings.polishContextTrustedEndpointEnabled = true
+        harness.viewModel.settings.repoVocabularyEnabled = true
+        harness.viewModel.learnedTermStore = storeProposing("inkwell", in: Self.projectDirectory)
+        let grounding = FakeRepoVocabularyGrounding(outcome: nil)
+        grounding.secondPassRoot = .root("/nonexistent-647/quillmark-wt", mainCheckout: Self.projectDirectory)
+        harness.viewModel.dependencies.repoVocabularyGrounding = grounding
+        join(harness, cwd: "/nonexistent-647/quillmark-wt/Sources/Quill")
+
+        harness.stop()
+        await awaitStoppedSessionCommit(harness.viewModel)
+
+        XCTAssertEqual(grounding.rootLookups, ["/nonexistent-647/quillmark-wt/Sources/Quill"])
+        XCTAssertEqual(transcriber.calls.first?.contextBias, ["localvoxtral", "Claude_Code", "inkwell"])
+    }
+
+    // MARK: - Project groups (#1005)
+
+    private static let workProject = "/nonexistent-1005/acme"
+    private static let personalProject = "/nonexistent-1005/garden"
+
+    /// A Work project that confirmed `Kubrix` and a Personal one that
+    /// confirmed `Florabel`.
+    private func groupedStore() -> LearnedTermStore {
+        let store = LearnedTermStore(fileURL: nil, now: { Date(timeIntervalSince1970: 0) })
+        for (key, term, group) in [
+            (Self.workProject, "Kubrix", ProjectGroup.work), (Self.personalProject, "Florabel", .personal),
+        ] {
+            store.recordCorrection(term, project: .init(key: key, name: (key as NSString).lastPathComponent))
+            store.setGroup(group, keys: [key])
+        }
+        store.waitForPendingWrites()
+        return store
+    }
+
+    /// What a dictation joined in `cwd` sends: the second pass's terms and
+    /// the polish's system prompt, which carries the project names.
+    /// With `root`, the start's lookup of the session's git root answers it.
+    private func groupedDictation(
+        joinedIn cwd: String?,
+        root: LearnedTermProjectResolver.RepositoryRoot = .unknown
+    ) async -> (bias: [String], systemPrompt: String) {
+        let transcriber = FakeBatchTranscriber(.text(Self.batchText))
+        let polisher = FakePolishingService()
+        let harness = makeHarness(transcriber: transcriber, polisher: polisher)
+        harness.viewModel.settings.polishContextTrustedEndpointEnabled = true
+        harness.viewModel.learnedTermStore = groupedStore()
+        let grounding = FakeRepoVocabularyGrounding(outcome: nil)
+        grounding.secondPassRoot = root
+        harness.viewModel.dependencies.repoVocabularyGrounding = grounding
+        if let cwd {
+            join(harness, cwd: cwd)
+            await harness.viewModel.session.lookUpJoinedRepositoryRoot()
+        }
+
+        harness.stop()
+        await awaitStoppedSessionCommit(harness.viewModel)
+        return (transcriber.calls.first?.contextBias ?? [], await polisher.lastRequest?.systemPrompt ?? "")
+    }
+
+    /// A dictation joined to a Work project sends no Personal project's
+    /// name or term, and the reverse; with no join it sends both.
+    func testAJoinedDictationSendsOnlyItsGroupsNamesAndTerms() async {
+        let work = await groupedDictation(joinedIn: Self.workProject + "/Sources")
+        XCTAssertTrue(work.bias.contains("Kubrix"))
+        XCTAssertFalse(work.bias.contains("Florabel"), "a Personal term reached the second pass")
+        XCTAssertTrue(work.systemPrompt.contains("acme"))
+        XCTAssertFalse(work.systemPrompt.contains("garden"), "a Personal project reached the polish")
+
+        let personal = await groupedDictation(joinedIn: Self.personalProject)
+        XCTAssertTrue(personal.bias.contains("Florabel"))
+        XCTAssertFalse(personal.bias.contains("Kubrix"), "a Work term reached the second pass")
+        XCTAssertTrue(personal.systemPrompt.contains("garden"))
+        XCTAssertFalse(personal.systemPrompt.contains("acme"), "a Work project reached the polish")
+
+        let unjoined = await groupedDictation(joinedIn: nil)
+        XCTAssertTrue(unjoined.bias.contains("Kubrix") && unjoined.bias.contains("Florabel"))
+        XCTAssertTrue(unjoined.systemPrompt.contains("acme") && unjoined.systemPrompt.contains("garden"))
+    }
+
+    /// A session in a `git worktree add` checkout outside its Work main
+    /// checkout: no recorded checkout holds its directory, so only the git
+    /// root the start looked up puts it in Work (#1155).
+    func testASessionInAWorktreeOutsideItsCheckoutGetsTheCheckoutsGroup() async {
+        let worktree = Self.workProject + "-feature"
+        let work = await groupedDictation(
+            joinedIn: worktree + "/Sources", root: .root(worktree, mainCheckout: Self.workProject))
+        XCTAssertTrue(work.bias.contains("Kubrix"))
+        XCTAssertFalse(work.bias.contains("Florabel"), "a Personal term reached the second pass")
+        XCTAssertTrue(work.systemPrompt.contains("acme"))
+        XCTAssertFalse(work.systemPrompt.contains("garden"), "a Personal project reached the polish")
+    }
+
+    // MARK: - Unjoined terminal (#705)
+
+    private nonisolated static let unjoinedRepository = "/nonexistent-705/quillmark"
+    private nonisolated static let repositoryEntry = ReplacementEntry(
+        replaceWith: "PageComposer.swift", matches: ["page composer dot swift"])
+
+    /// An unjoined terminal in a repository whose agent proposed `inkwell`,
+    /// through the production pipeline with only its detached bodies
+    /// replaced: the second pass's root lookup answers `lookup`, and the
+    /// polish's harvest offers `PageComposer.swift`.
+    private func unjoinedTerminal(
+        trusted: Bool,
+        lookup: @escaping @Sendable () async -> LearnedTermProjectResolver.RepositoryRoot
+    ) -> (Harness, FakeBatchTranscriber, FakePolishingService) {
+        let transcriber = FakeBatchTranscriber(.text("Ask Claude_Code about page composer dot swift."))
+        let polisher = FakePolishingService()
+        let harness = makeHarness(transcriber: transcriber, polisher: polisher)
+        let viewModel = harness.viewModel
+        viewModel.settings.polishContextTrustedEndpointEnabled = trusted
+        viewModel.settings.repoVocabularyEnabled = true
+        let template = LLMPromptTemplates(
+            systemContent: "system", userContent: "{{replacement_dictionary}}\n{{input_text}}")
+        viewModel.appConfigStore = MockAppConfigStore(
+            promptTemplates: template, agentPromptTemplates: template)
+        viewModel.learnedTermStore = storeProposing("inkwell", in: Self.unjoinedRepository)
+        let pipeline = viewModel.session.repoVocabularyPipeline
+        pipeline.rootLookup = lookup
+        pipeline.pipeline = { _ in
+            RepoVocabularyMatcher.GroundingOutcome(entries: [Self.repositoryEntry], isFallbackOnly: false)
+        }
+        return (harness, transcriber, polisher)
+    }
+
+    private func polishHadRepositoryVocabulary(_ polisher: FakePolishingService) async -> Bool {
+        let request = await polisher.lastRequest
+        return request?.userPrompts.contains {
+            $0.contains(RepoVocabularyMatcher.repositoryVocabularyHeader)
+        } ?? false
+    }
+
+    func testAnUnjoinedTerminalInARepositorySendsItsProposal() async {
+        let lookups = Mutex(0)
+        let (harness, transcriber, polisher) = unjoinedTerminal(trusted: true) {
+            lookups.withLock { $0 += 1 }
+            return .root(Self.unjoinedRepository)
+        }
+
+        harness.stop()
+        await awaitStoppedSessionCommit(harness.viewModel)
+
+        XCTAssertEqual(transcriber.calls.first?.contextBias, ["localvoxtral", "Claude_Code", "inkwell"])
+        XCTAssertEqual(lookups.withLock { $0 }, 1)
+        let polishHadVocabulary = await polishHadRepositoryVocabulary(polisher)
+        XCTAssertTrue(polishHadVocabulary, "the lookup left the polish's gate free")
+    }
+
+    func testWithoutTrustTheRootIsNotLookedUp() async {
+        let lookups = Mutex(0)
+        let (harness, transcriber, _) = unjoinedTerminal(trusted: false) {
+            lookups.withLock { $0 += 1 }
+            return .root(Self.unjoinedRepository)
+        }
+
+        harness.stop()
+        await awaitStoppedSessionCommit(harness.viewModel)
+
+        XCTAssertEqual(transcriber.calls.first?.contextBias, ["localvoxtral", "Claude_Code"])
+        XCTAssertEqual(lookups.withLock { $0 }, 0)
+    }
+
+    /// Consent withdrawn while the root lookup ran: the project's proposal
+    /// stayed in `context_bias`, sent under the consent latched at stop.
+    func testConsentWithdrawnDuringTheRootLookupKeepsTheProjectsTermsHome() async {
+        let withdrawals: [(String, (SettingsStore) -> Void)] = [
+            ("repository vocabulary off", { $0.repoVocabularyEnabled = false }),
+            ("trust revoked", { $0.polishContextTrustedEndpointEnabled = false }),
+        ]
+        for (name, withdraw) in withdrawals {
+            let started = BoundedWait()
+            let release = BoundedWait()
+            let (harness, transcriber, _) = unjoinedTerminal(trusted: true) {
+                started.resolve()
+                _ = await release.value(failAfter: 10)
+                return .root(Self.unjoinedRepository)
+            }
+
+            harness.stop()
+            let commit = harness.viewModel.session.polishAndCommitTask
+            _ = await started.value(failAfter: 10)
+            withdraw(harness.viewModel.settings)
+            release.resolve()
+            await commit?.value
+
+            XCTAssertEqual(transcriber.calls.first?.contextBias, ["localvoxtral", "Claude_Code"], name)
+        }
+    }
+
+    /// A lookup parked in a `stat` on a dead mount: the pass leaves without
+    /// the project's terms once the bound passes, and the polish, which has
+    /// its own gate, still gets its vocabulary.
+    func testAStuckRootLookupCostsTheBoundAndNotThePolishsVocabulary() async {
+        let started = BoundedWait()
+        let unstick = BoundedWait()
+        let (harness, transcriber, polisher) = unjoinedTerminal(trusted: true) {
+            started.resolve()
+            _ = await unstick.value(failAfter: 10)
+            return .root(Self.unjoinedRepository)
+        }
+        defer { unstick.resolve() }
+
+        harness.stop()
+        let commit = harness.viewModel.session.polishAndCommitTask
+        _ = await started.value(failAfter: 10)
+        await harness.clock.waitForSleepers(1)
+        XCTAssertTrue(transcriber.calls.isEmpty, "the pass waits for the root")
+        harness.clock.advance(by: 0.25)
+        await commit?.value
+
+        XCTAssertEqual(transcriber.calls.first?.contextBias, ["localvoxtral", "Claude_Code"])
+        let polishHadVocabulary = await polishHadRepositoryVocabulary(polisher)
+        XCTAssertTrue(polishHadVocabulary)
+        XCTAssertEqual(harness.overlay.committedTexts.count, 1)
+    }
+
+    // MARK: - Latch
+    // MARK: - Latch
+
+    func testOnlyAnOverlayDictationInMistralModeKeepsItsAudioForTheSecondPass() {
+        let settings = makeSettings(outputMode: .overlayBuffer)
+        settings.dictationAudioEnabled = false
+        let viewModel = DictationViewModel(
+            settings: settings,
+            overlayBufferCoordinator: MockOverlayCoordinator(),
+            startRuntimeServices: false
+        )
+        retainForTestProcessLifetime(viewModel)
+        let session = viewModel.session
+
+        settings.dictationBackendMode = .mistralAPI
+        session.latchSessionAudio(outputMode: .overlayBuffer)
+        XCTAssertTrue(session.sessionHasStopSecondPass)
+        XCTAssertFalse(session.sessionStoresAudio, "kept in memory, never for the audio store")
+        session.audio.sessionRecording.append(Self.pcm)
+        XCTAssertEqual(session.audio.sessionRecording.finish(), Self.pcm)
+
+        session.latchSessionAudio(outputMode: .liveAutoPaste)
+        XCTAssertFalse(session.sessionHasStopSecondPass, "Live Auto-Paste has typed its text already")
+        session.audio.sessionRecording.append(Self.pcm)
+        XCTAssertNil(session.audio.sessionRecording.finish())
+
+        settings.mistralStopSecondPassEnabled = false
+        session.latchSessionAudio(outputMode: .overlayBuffer)
+        XCTAssertFalse(session.sessionHasStopSecondPass, "turned off in Settings")
+        session.audio.sessionRecording.append(Self.pcm)
+        XCTAssertNil(session.audio.sessionRecording.finish(), "no audio kept for a pass that won't run")
+        settings.mistralStopSecondPassEnabled = true
+
+        settings.dictationBackendMode = .externalURL
+        session.latchSessionAudio(outputMode: .overlayBuffer)
+        XCTAssertFalse(session.sessionHasStopSecondPass)
+    }
+
+    // MARK: - Harness
+
+    private func storeProposing(_ term: String, in projectKey: String) -> LearnedTermStore {
+        let store = LearnedTermStore(fileURL: nil, now: { Date(timeIntervalSince1970: 0) })
+        let project = LearnedTermProjectIdentity(
+            key: projectKey, name: (projectKey as NSString).lastPathComponent)
+        store.recordProposal([term], agent: .claude, project: project, excluding: [])
+        store.waitForPendingWrites()
+        return store
+    }
+
+    /// Joins the dictation to a local Claude Code session running in `cwd`.
+    private func join(_ harness: Harness, cwd: String) {
+        let origin = ClaudeTransportOrigin.localAuthenticated(peerUID: 501)
+        var snapshot = ClaudeSessionSnapshot(
+            sessionID: "s1", origin: origin, agent: .claude, firstSeen: Date(timeIntervalSince1970: 0))
+        snapshot.workspace = ClaudeWorkspaceReference.make(rawCwd: cwd, origin: origin)
+        harness.viewModel.session.context.claudeSessionJoin = ClaudeSessionJoin(
+            target: TerminalScreenTarget(pid: 4242, bundleID: "com.apple.Terminal"),
+            snapshot: snapshot,
+            windowID: 101,
+            mechanism: .ttyDevice
+        )
+    }
+
+    /// Joins the dictation to Claude Code session `s1` in a Ghostty tab by
+    /// its tty, with a navigator that reads the pane back through the
+    /// returned focuser.
+    private func joinTerminalTab(_ harness: Harness) throws -> FakeSessionPaneFocuser {
+        let registry = ClaudeSessionRegistry(
+            now: { Date(timeIntervalSince1970: 3_000_000) }, isProcessAlive: { _ in true })
+        XCTAssertNotNil(registry.ingest(
+            ClaudeHookRecord(
+                event: .sessionStart, sessionID: "s1", timestamp: 0, rawCwd: "/repo", prompt: nil, files: [],
+                process: ClaudeHookProcessInfo(hookPID: 777, claudePID: 9001, tty: "/dev/ttys042")
+            ),
+            origin: .localAuthenticated(peerUID: 501)
+        ))
+        let snapshot = try XCTUnwrap(registry.liveSessions().first)
+        harness.viewModel.session.context.claudeSessionJoin = ClaudeSessionJoin(
+            target: TerminalScreenTarget(pid: 4242, bundleID: TerminalScreenAllowlist.ghosttyBundleID),
+            snapshot: snapshot,
+            windowID: 101,
+            mechanism: .ttyDevice
+        )
+        harness.overlay.commitTargetAppPID = 4242
+        let focuser = FakeSessionPaneFocuser()
+        harness.viewModel.session.sessionNavigator = SessionNavigator(
+            liveSessions: { registry.liveSessions() },
+            repositoryRoot: { _ in .unknown },
+            focuser: focuser,
+            sleep: ManualSessionClock().sleep,
+            ttyForegroundPIDs: { _ in [9001] }
+        )
+        return focuser
+    }
+
+    private struct Harness {
+        let viewModel: DictationViewModel
+        let overlay: MockOverlayCoordinator
+        let clock: ManualSessionClock
+        let recordLog: RecordLog
+        var records: [DictationSessionRecord] { recordLog.all }
+
+        @MainActor func stop() {
+            viewModel.isDictating = false
+            viewModel.isFinalizingStop = true
+            viewModel.session.finishStoppedSession(promotePendingSegment: false)
+        }
+    }
+
+    private func makeHarness(
+        transcriber: FakeBatchTranscriber,
+        polisher: FakePolishingService? = nil,
+        secondPass: Bool = true,
+        secondPassSetting: Bool? = nil,
+        realtimeText: String = realtimeText
+    ) -> Harness {
+        let settings = makeSettings(outputMode: .overlayBuffer)
+        settings.polishSpeakerTerms = ["localvoxtral", "Claude Code"]
+        settings.polishContextTrustedEndpointEnabled = false
+        if polisher != nil {
+            settings.llmPolishingEnabled = true
+            settings.llmPolishingEndpointURL = "https://example.com/v1/chat/completions"
+        } else {
+            settings.llmPolishingEnabled = false
+        }
+        let overlay = MockOverlayCoordinator()
+        let clock = ManualSessionClock()
+        let records = RecordLog()
+        let viewModel = DictationViewModel(
+            settings: settings,
+            overlayBufferCoordinator: overlay,
+            startRuntimeServices: false,
+            dependencies: DictationViewModel.Dependencies(
+                onSessionRecord: { records.all.append($0) },
+                clock: clock.clock,
+                batchTranscriber: transcriber
+            )
+        )
+        viewModel.appConfigStore = MockAppConfigStore()
+        if let polisher {
+            viewModel.llmPolishingService = polisher
+        }
+        retainForTestProcessLifetime(viewModel)
+
+        let session = viewModel.session
+        session.sessionOutputMode = .overlayBuffer
+        session.sessionRealtimeConfiguration = RealtimeSessionConfiguration(
+            endpoint: MistralRealtimeWebSocketClient.defaultEndpoint,
+            apiKey: "session-key",
+            model: "voxtral-mini-transcribe-realtime-2602"
+        )
+        if let secondPassSetting {
+            settings.dictationBackendMode = .mistralAPI
+            settings.mistralStopSecondPassEnabled = secondPassSetting
+            session.latchSessionAudio(outputMode: .overlayBuffer)
+        } else {
+            session.sessionHasStopSecondPass = secondPass
+            session.audio.sessionRecording.begin(enabled: true)
+        }
+        session.audio.sessionRecording.append(Self.pcm)
+        viewModel.transcript.currentDictationEventText = realtimeText
+        return Harness(viewModel: viewModel, overlay: overlay, clock: clock, recordLog: records)
+    }
+}
+
+/// Every record the session wrote, in order.
+private final class RecordLog {
+    var all: [DictationSessionRecord] = []
+}
+#endif

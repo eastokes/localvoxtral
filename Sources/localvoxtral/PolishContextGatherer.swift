@@ -1,0 +1,599 @@
+import ClaudeContextWire
+import Foundation
+
+/// Everything a commit gathers before it builds the polish request: the
+/// screen decision (swapped for the joined pane's socket read), the
+/// repository vocabulary, the joined session's repository snapshot and text,
+/// the one budget allocation over every source, the four preparations, the
+/// learned-term grounding, and the merge that resolves the sources against
+/// each other. Off-actor work runs where it did (under its own deadlines);
+/// the result is one value the assembler and the capture read.
+struct PolishContextMaterial {
+    var screenDecision: TerminalScreenContextDecision
+    /// The screen decision as gathered, before any consent withdrawal: the
+    /// diagnostic record's socket-pane swap signal compares against it.
+    let gatheredScreenDecision: TerminalScreenContextDecision
+    /// The screen decision came from the joined pane's socket read, so it
+    /// is the joined session's content and leaves with the join.
+    let screenReadThroughJoin: Bool
+    /// The clipboard read at stop, nil once its consent is withdrawn.
+    var clipboardContext: PolishClipboardContext?
+    var repoVocabularyOutcome: RepoVocabularyMatcher.GroundingOutcome
+    var claudeRepoSnapshot: ClaudeRepoSnapshot?
+    var claudeSessionText: String
+    /// The joined session's prompt box at the stop, read through its mod.
+    /// Kept when consent is withdrawn: the commit's leading space reads it,
+    /// and that never leaves the Mac.
+    let promptDraft: ClaudePromptDraft?
+    let screenRenderDemand: Int
+    let repoRenderDemand: Int
+    let allocation: [PolishContextSource: Int]
+    let clipboardRenderBudget: Int
+    let screenRenderBudget: Int
+    let repoRenderBudget: Int
+    let claudeRenderBudget: Int
+    var claudeRepoPreparation: ClaudeRepoContextPreparation
+    var claudeSessionPreparation: PolishContextPreparation
+    var clipboardPreparation: PolishContextPreparation
+    var screenPreparation: PolishContextPreparation
+    let learnedProject: LearnedTermProjectResolver.Identity?
+    var learnedVocabularyOutcome: RepoVocabularyMatcher.GroundingOutcome
+    /// The agent proposals (#609) that took part in matching: pre-applied
+    /// like any learned entry, never listed as the speaker's vocabulary.
+    var learnedProposals: Set<String>
+    var merged: PolishContextGrounding.Merged
+
+    var claudeRepoOutcome: RepoVocabularyMatcher.GroundingOutcome { claudeRepoPreparation.grounding }
+    var claudeSessionOutcome: RepoVocabularyMatcher.GroundingOutcome { claudeSessionPreparation.grounding }
+    var clipboardVocabularyOutcome: RepoVocabularyMatcher.GroundingOutcome { clipboardPreparation.grounding }
+    var screenVocabularyOutcome: RepoVocabularyMatcher.GroundingOutcome { screenPreparation.grounding }
+}
+
+@MainActor
+enum PolishContextGatherer {
+    struct Input {
+        let settings: SettingsStore
+        let textInsertion: TextInsertionService
+        let context: SessionContextResolver
+        let repoVocabularyGrounding: any RepoVocabularyGrounding
+        let learnedTermStore: LearnedTermStore?
+        /// Nil only when polishing has no configuration, in which case
+        /// nothing here has an endpoint to ground for.
+        let endpointURL: URL?
+        let workingText: String
+        let capturedScreenDecision: TerminalScreenContextDecision
+        let capturedSocketPaneStart: SocketPaneScreenCapture?
+        let capturedClaudeJoin: ClaudeSessionJoin?
+        let capturedClipboardContext: PolishClipboardContext?
+        let templateCarriesDictionarySlot: Bool
+        let needsRepoGroundingForConflictSafety: Bool
+    }
+
+    /// The two gates every repository-vocabulary read passes first: the
+    /// setting, and a permitted endpoint. An injected grounding is asked only
+    /// after both, so "off" and "remote" tests still prove the no-op paths.
+    static func repoVocabularyGroundingIfEnabled(
+        settings: SettingsStore,
+        grounding: any RepoVocabularyGrounding,
+        endpointURL: URL,
+        transcript: String,
+        joinedWorkspace: LocalWorkspacePath?,
+        repositoryRoot: RepoVocabularyRootBox?
+    ) async -> RepoVocabularyMatcher.GroundingOutcome? {
+        guard settings.repoVocabularyEnabled else { return nil }
+        guard PolishContextClipboardReader.isPermittedContextEndpoint(
+            endpointURL,
+            trustedEndpointEnabled: settings.polishContextTrustedEndpointEnabled
+        ) else {
+            Log.polishing.info("Repo vocabulary skipped: polishing endpoint is not local")
+            return nil
+        }
+        return await grounding.grounding(
+            endpointURL: endpointURL,
+            transcript: transcript,
+            joinedWorkspace: joinedWorkspace,
+            repositoryRoot: repositoryRoot
+        )
+    }
+
+    /// Nil when the commit was cancelled at one of its checkpoints.
+    static func gather(_ input: Input) async -> PolishContextMaterial? {
+        let settings = input.settings
+        let textInsertion = input.textInsertion
+        let context = input.context
+        let repoVocabularyGrounding = input.repoVocabularyGrounding
+        let learnedTermStore = input.learnedTermStore
+        let endpointURL = input.endpointURL
+        let workingText = input.workingText
+        let capturedScreenDecision = input.capturedScreenDecision
+        let capturedSocketPaneStart = input.capturedSocketPaneStart
+        let capturedClaudeJoin = input.capturedClaudeJoin
+        let capturedClipboardContext = input.capturedClipboardContext
+        let templateCarriesDictionarySlot = input.templateCarriesDictionarySlot
+        let needsRepoGroundingForConflictSafety = input.needsRepoGroundingForConflictSafety
+
+        // A herdr- or cmux-joined dictation swaps the AX screen
+        // decision for the JOINED pane's clean per-pane socket
+        // read. FIRST await in the Task, before the
+        // repo-vocabulary hop, for the same reason the AX
+        // reconcile runs pre-Task: the stop re-read must sample
+        // the pane at commit, not after up to 3 s of agent output has
+        // scrolled past. Everything downstream (render demand,
+        // vocab grounding, the rendered block, provenance) reads
+        // this decision, so the swap is complete or not at all —
+        // on any pane-read failure it IS `capturedScreenDecision`,
+        // which for these joins is vocabulary-only at best (the
+        // authorizer still refuses raw AX attachment).
+        // The prompt box as the stop left it, asked of the session's mod
+        // now and awaited after the slow reads below, which hide its
+        // round trip. Not a child task: a cancelled commit returns without
+        // waiting out the mod.
+        let promptDraftRead = Task { @MainActor in
+            await context.promptDraft(for: capturedClaudeJoin)
+        }
+
+        var screenDecision = capturedScreenDecision
+        let screenReadThroughJoin = capturedSocketPaneStart != nil && endpointURL != nil
+        if capturedSocketPaneStart != nil,
+           let endpointURL = endpointURL {
+            screenDecision = await SocketPaneScreenContext.reconcileAtStop(
+                start: capturedSocketPaneStart,
+                join: capturedClaudeJoin,
+                resolver: context.claudeSessionJoinResolver,
+                fallback: capturedScreenDecision,
+                settingEnabled: settings.terminalScreenContextEnabled,
+                endpointURL: endpointURL,
+                isAccessibilityTrusted: textInsertion.isAccessibilityTrusted,
+                trustedEndpointEnabled:
+                    settings.polishContextTrustedEndpointEnabled
+            )
+        }
+        // The stop-side pane read above was the LAST reader of a
+        // remote herdr join's `ssh -L`; everything downstream works
+        // from text already in hand. Released through the view model,
+        // which OWNS the handle — the join was consumed pre-Task,
+        // so closing "the join's" tunnel here would leave the owner
+        // holding a closed handle it still had to forget. Only this
+        // commit's lease: a new dictation that cancelled this one
+        // during the read may hold its own by now (#1112).
+        context.releaseRemoteHerdrForward(of: capturedClaudeJoin)
+        guard !Task.isCancelled else { return nil }
+
+        // The polish request is assembled HERE, inside the Task, so
+        // the opt-in repo-vocabulary indexing — whose git subprocess
+        // runs OFF the main actor with a 2 s timeout — can complete
+        // before the request is built without stalling the commit. On
+        // timeout / no repo / feature off it is a fast no-op and the
+        // request is byte-identical to the no-vocabulary path.
+        var repoVocabularyOutcome = RepoVocabularyMatcher.GroundingOutcome.empty
+        // The git root that pipeline resolves is also the
+        // learned-terms project key. Scoped to THIS commit: an
+        // abandoned pipeline that reports a root after its
+        // deadline writes into a box nobody reads again, instead
+        // of attributing a later dictation to the wrong project.
+        let repositoryRootBox = RepoVocabularyRootBox()
+        // A joined LOCAL session names the repo directly, which is the only
+        // way a Claude Desktop dictation finds one: its window has no path in
+        // the title and no shell under it. The type keeps a remote session's
+        // cwd out of this, as it does for the collector below.
+        if (templateCarriesDictionarySlot || needsRepoGroundingForConflictSafety),
+           let endpointURL = endpointURL,
+           let outcome = await Self.repoVocabularyGroundingIfEnabled(
+               settings: settings,
+               grounding: repoVocabularyGrounding,
+               endpointURL: endpointURL,
+               transcript: workingText,
+               joinedWorkspace: capturedClaudeJoin?.localWorkspacePath,
+               repositoryRoot: repositoryRootBox
+           )
+        {
+            repoVocabularyOutcome = outcome
+        }
+
+        // Clipboard vocabulary is grounded in the already
+        // privacy-gated clipboard text (feature toggle ON + permitted
+        // endpoint + never concealed/transient — all enforced when
+        // it was captured; nil context means none of it runs).
+        //
+        // Matching runs over the COMPLETE retained text, never the
+        // rendered excerpt: a term the user copied grounds the
+        // transcript whether or not it survived excerpt selection.
+        // Grounding is input-side and costs no prompt characters,
+        // so it has no reason to inherit the render budget.
+        //
+        // Both the matching and the excerpt selection happen here,
+        // together, and move OFF the main actor when the buffer is
+        // large enough to be worth the hop — see
+        // `PolishContextPreparation`. The render budget is resolved
+        // first because it is also the inline/detached threshold.
+        //
+        // ONE allocation across ALL populated sources, not one per
+        // source: they share a single request's prompt, so they must
+        // share a single budget. Two sources each allocating from
+        // `totalCharacterBudget` would each believe they had all of
+        // it and together spend double.
+        //
+        // Only text that can actually RENDER declares a demand. The
+        // screen demands nothing unless the decision is `.render`
+        // (see below): `vocabularyOnly` and `drop` cost no prompt
+        // characters, and letting them reserve some would starve the
+        // clipboard of budget to render nothing with.
+        let screenRenderDemand: Int = {
+            guard case let .render(excerpt, _, _) = screenDecision else { return 0 }
+            return excerpt.count
+        }()
+
+        // The joined Claude session's repository. Collected inside
+        // the Task, like the repo vocabulary above and for the same
+        // reason: its git subprocesses and file reads run OFF the
+        // main actor under their own deadline, so a slow repo yields
+        // a smaller snapshot rather than a late commit. Every gate
+        // (setting, permitted endpoint, live join, LOCAL workspace)
+        // is inside `claudeRepoSnapshotIfEnabled`, ahead of the
+        // collector — an unjoined pane means no filesystem call at
+        // all, not a collector that reads and then discards.
+        var claudeRepoSnapshot: ClaudeRepoSnapshot?
+        if let endpointURL = endpointURL {
+            claudeRepoSnapshot = await context.claudeRepoSnapshotIfEnabled(
+                join: capturedClaudeJoin,
+                endpointURL: endpointURL,
+                transcript: workingText
+            )
+        }
+        guard !Task.isCancelled else { return nil }
+
+        // The session block's text (workspace, the PRIOR prompt, the
+        // files the agent touched, and a remote session's tool
+        // excerpts) is flat, so it rides the shared preparation like
+        // the clipboard and the screen.
+        //
+        // Gated through `claudeSessionTextIfEnabled` on ALL THREE of
+        // the repo block's gates — current setting, currently permitted
+        // endpoint, this exact join still live — not just the
+        // setting. Both blocks attach the session's content, and
+        // consenting to one is consenting to both; it follows that
+        // withdrawing consent, or a session dying mid-sentence, must
+        // stop both too. Checking only the setting here meant a dead
+        // session's PRIOR PROMPT still rode to whatever endpoint was
+        // configured, including a remote one.
+        let promptDraft = await promptDraftRead.value
+        guard !Task.isCancelled else { return nil }
+        var claudeSessionText = ""
+        if let endpointURL = endpointURL {
+            claudeSessionText = context.claudeSessionTextIfEnabled(
+                join: capturedClaudeJoin,
+                endpointURL: endpointURL,
+                draft: promptDraft
+            )
+        }
+
+        // Only RENDERABLE material declares a demand — the repo's
+        // demand is what it could show, never `groundingText.count`.
+        // That string is mostly `trackedPaths`, which ground but
+        // never render, so counting it made a monorepo bid hundreds
+        // of thousands of characters for content it would not
+        // attach, and take that space from sources that would. It is
+        // also computed off-actor: it walks the harvest, and this is
+        // the `@MainActor` commit path.
+        var repoRenderDemand = 0
+        if let claudeRepoSnapshot {
+            repoRenderDemand = await ClaudeRepoContextPreparation.renderDemand(
+                snapshot: claudeRepoSnapshot
+            )
+        }
+
+        let allocation = PolishContextBudget.allocate(demands: [
+            .repository: repoRenderDemand,
+            .terminal: screenRenderDemand,
+            .claude: claudeSessionText.count,
+            .clipboard: capturedClipboardContext?.retainedCharacterCount ?? 0,
+        ])
+        let clipboardRenderBudget = allocation[.clipboard] ?? 0
+        let screenRenderBudget = allocation[.terminal] ?? 0
+        let repoRenderBudget = allocation[.repository] ?? 0
+        let claudeRenderBudget = allocation[.claude] ?? 0
+
+        // Prepared exactly like every other source: matching over
+        // the COMPLETE harvest, rendering within the grant. The gap
+        // is widest here — a monorepo's tracked path list alone can
+        // exceed the whole prompt budget — which is precisely why
+        // grounding must not inherit the render budget. Every
+        // harvested term votes; only what fits is shown.
+        var claudeRepoPreparation = ClaudeRepoContextPreparation.empty
+        if let claudeRepoSnapshot {
+            claudeRepoPreparation = await ClaudeRepoContextPreparation.prepared(
+                snapshot: claudeRepoSnapshot,
+                transcript: workingText,
+                renderBudget: repoRenderBudget
+            )
+        }
+        let claudeRepoOutcome = claudeRepoPreparation.grounding
+
+        var claudeSessionPreparation = PolishContextPreparation.empty
+        if !claudeSessionText.isEmpty {
+            claudeSessionPreparation = await PolishContextPreparation.prepared(
+                text: claudeSessionText,
+                transcript: workingText,
+                renderBudget: claudeRenderBudget
+            )
+        }
+        let claudeSessionOutcome = claudeSessionPreparation.grounding
+
+        var clipboardPreparation = PolishContextPreparation.empty
+        if let clipboardContext = capturedClipboardContext {
+            clipboardPreparation = await PolishContextPreparation.prepared(
+                text: clipboardContext.retainedText,
+                transcript: workingText,
+                renderBudget: clipboardRenderBudget
+            )
+        }
+        let clipboardVocabularyOutcome = clipboardPreparation.grounding
+
+        // Terminal screen context. Grounded in the screen the user
+        // was looking at when they started speaking, which both
+        // surviving reconciliation outcomes preserve — `.render`
+        // may also show it to the model, `.vocabularyOnly` withholds
+        // the excerpt but the terms the user could SEE while
+        // choosing their words are still the right spellings to
+        // match against. `.drop` yields nil and none of this runs.
+        //
+        // Matching runs over the COMPLETE sanitized screen, never
+        // the excerpt: the budget can cut the rendered excerpt to
+        // nothing (or bar it entirely) and the full screen still
+        // grounds the transcript, exactly as it does for the
+        // clipboard.
+        var screenPreparation = PolishContextPreparation.empty
+        if let screenText = screenDecision.vocabularyGroundingText {
+            screenPreparation = await PolishContextPreparation.prepared(
+                text: screenText,
+                transcript: workingText,
+                renderBudget: screenRenderBudget
+            )
+        }
+        let screenVocabularyOutcome = screenPreparation.grounding
+
+        // What earlier dictations in this project taught. No
+        // harvest and no I/O beyond resolving the project: the
+        // terms are already in memory, and matching them is the
+        // same matcher every other source runs.
+        let learnedProject = LearnedTermProjectResolver.resolve(
+            repositoryRoot: repositoryRootBox.value,
+            workspace: capturedClaudeJoin?.snapshot.learnedTermWorkspace
+        )
+        // An agent's unconfirmed proposals (#609) join only where repo
+        // vocabulary may go: until use confirms them they are the repo's
+        // words, not yet the speaker's.
+        let learnedMemory = learnedTermStore?.snapshot() ?? LearnedTerms()
+        let learnedProposals = learnedProject.map {
+            Self.repoVocabularyPermitted(settings: settings, endpointURL: endpointURL)
+                ? learnedMemory.unconfirmedProposals(projectKey: $0.key) : []
+        } ?? []
+        let learnedVocabularyOutcome = await Self.learnedTermGrounding(
+            confirmed: learnedProject.map { learnedMemory.confirmedTerms(projectKey: $0.key) } ?? [],
+            proposals: learnedProposals,
+            transcript: workingText
+        )
+
+        guard !Task.isCancelled else { return nil }
+
+        // Sources matched independently; the merge is what resolves
+        // them against each other (agreement collapses, conflicting
+        // spans abstain, and a sound-alike term is not offered for
+        // a span or a term another source already rewrote).
+        //
+        // The terminal votes HERE, in the same single merge, rather
+        // than appending its entries downstream. That is the whole
+        // point: a span the screen and the clipboard read differently
+        // must ABSTAIN, and a span they agree on must collapse to one
+        // entry. A source that appends after the merge has silently
+        // opted out of both rules and pre-applies its own reading of
+        // a contested span unopposed — editing words the user did not
+        // say.
+        //
+        // The Claude repo and session sources vote HERE too, in the
+        // same single merge, for exactly the reason the terminal
+        // does. They are the strongest sources on the list — a file
+        // the agent just edited is better evidence of a spelling
+        // than anything on the clipboard — but "strongest" is not
+        // "unopposed": when the repo and the clipboard read the same
+        // heard span as two DIFFERENT terms, neither is pre-applied,
+        // because pre-applying the wrong bytes edits the user's words
+        // into something they did not say. Both `.repository`
+        // candidates share one bucket by design: the terminal-cwd
+        // vocabulary and the joined session's repo are both "the repo
+        // the speaker is working in", and they render under one
+        // header.
+        let merged = Self.merge(
+            repository: repoVocabularyOutcome,
+            claudeRepository: claudeRepoOutcome,
+            terminal: screenVocabularyOutcome,
+            claude: claudeSessionOutcome,
+            clipboard: clipboardVocabularyOutcome,
+            learned: learnedVocabularyOutcome,
+            workingText: workingText
+        )
+
+        return PolishContextMaterial(
+            screenDecision: screenDecision,
+            gatheredScreenDecision: screenDecision,
+            screenReadThroughJoin: screenReadThroughJoin,
+            clipboardContext: capturedClipboardContext,
+            repoVocabularyOutcome: repoVocabularyOutcome,
+            claudeRepoSnapshot: claudeRepoSnapshot,
+            claudeSessionText: claudeSessionText,
+            promptDraft: promptDraft,
+            screenRenderDemand: screenRenderDemand,
+            repoRenderDemand: repoRenderDemand,
+            allocation: allocation,
+            clipboardRenderBudget: clipboardRenderBudget,
+            screenRenderBudget: screenRenderBudget,
+            repoRenderBudget: repoRenderBudget,
+            claudeRenderBudget: claudeRenderBudget,
+            claudeRepoPreparation: claudeRepoPreparation,
+            claudeSessionPreparation: claudeSessionPreparation,
+            clipboardPreparation: clipboardPreparation,
+            screenPreparation: screenPreparation,
+            learnedProject: learnedProject,
+            learnedVocabularyOutcome: learnedVocabularyOutcome,
+            learnedProposals: Set(learnedProposals),
+            merged: merged
+        )
+    }
+
+    /// The single cross-source merge, one candidate per source.
+    static func merge(
+        repository: RepoVocabularyMatcher.GroundingOutcome,
+        claudeRepository: RepoVocabularyMatcher.GroundingOutcome,
+        terminal: RepoVocabularyMatcher.GroundingOutcome,
+        claude: RepoVocabularyMatcher.GroundingOutcome,
+        clipboard: RepoVocabularyMatcher.GroundingOutcome,
+        learned: RepoVocabularyMatcher.GroundingOutcome,
+        workingText: String
+    ) -> PolishContextGrounding.Merged {
+        let sources: [(PolishContextSource, RepoVocabularyMatcher.GroundingOutcome)] = [
+            (.repository, repository),
+            (.repository, claudeRepository),
+            (.terminal, terminal),
+            (.claude, claude),
+            (.clipboard, clipboard),
+            (.learned, learned),
+        ]
+        return PolishContextGrounding.merge(
+            sources.map { source, outcome in
+                PolishContextGrounding.Candidate(
+                    source: source,
+                    entries: outcome.entries,
+                    isFallbackOnly: outcome.isFallbackOnly,
+                    phoneticEntries: outcome.phoneticEntries,
+                    verificationEntries: outcome.verificationCandidates
+                )
+            },
+            maxVerificationPairs: RepoVocabularyMatcher.nominationCap(forTranscript: workingText)
+        )
+    }
+
+    /// What this project's earlier dictations already taught, matched against
+    /// the transcript by the same matcher every live source runs.
+    ///
+    /// No gate beyond polishing itself: a term the speaker has said three
+    /// times in this project is their vocabulary, and it travels with the
+    /// request the way the hand-written Global terms list does (owner
+    /// ruling, 2026-09-20 — `docs/agent/invariants.md`).
+    ///
+    /// Reading the terms touches no disk (`LearnedTermStore.snapshot`), and the
+    /// index build and match move off the main actor like every other source's
+    /// (`PolishContextPreparation`) — bounded work, but the commit path is not
+    /// where bounded work belongs either.
+    ///
+    /// A nil project means the app could not establish one, so the caller
+    /// passes nothing: see `LearnedTermProjectResolver.resolve`.
+    private static func learnedTermGrounding(
+        confirmed: [String],
+        proposals: [String],
+        transcript: String
+    ) async -> RepoVocabularyMatcher.GroundingOutcome {
+        guard !confirmed.isEmpty || !proposals.isEmpty else { return .empty }
+        return await Task.detached(priority: .userInitiated) {
+            // Memory, not evidence on screen now: a learned term spoken as
+            // plain words in prose is offered to the model rather than
+            // pre-applied (`withholdingOrdinaryReadings`, #522).
+            LearnedTermGrounding.outcome(transcript: transcript, confirmed: confirmed, proposals: proposals)
+        }.value
+    }
+
+    /// The repo-vocabulary gate: the setting, and a loopback or trusted
+    /// endpoint.
+    private static func repoVocabularyPermitted(settings: SettingsStore, endpointURL: URL?) -> Bool {
+        guard settings.repoVocabularyEnabled, let endpointURL else { return false }
+        return PolishContextClipboardReader.isPermittedContextEndpoint(
+            endpointURL,
+            trustedEndpointEnabled: settings.polishContextTrustedEndpointEnabled
+        )
+    }
+}
+
+extension PolishContextMaterial {
+    /// This material without the sources whose consent no longer holds, or
+    /// nil when every source it carries is still consented to.
+    ///
+    /// Settings stay live while a stop awaits (the repository index alone can
+    /// take 3 s), and the clipboard and screen were read before that await
+    /// under the consent of the moment. Turning a source off, or revoking
+    /// trust in a remote endpoint, is a withdrawal that must land before the
+    /// request leaves: the source loses its excerpt and its grounding, and the
+    /// merge is redone so none of its spellings are pre-applied. Learned terms
+    /// have no gate beyond polishing (`learnedTermGrounding`), so they stay.
+    ///
+    /// The join is consent too (#1600): revoking a remote host during the
+    /// wait evicts its sessions, and a session that ended takes its context
+    /// with it. `joinStillLive` is asked by the caller right before this
+    /// runs (`SessionContextResolver.claudeJoinStillLive`).
+    @MainActor
+    func withdrawingRevokedConsent(
+        settings: SettingsStore,
+        endpointURL: URL?,
+        joinStillLive: Bool,
+        workingText: String
+    ) -> PolishContextMaterial? {
+        let endpointPermitted = endpointURL.map {
+            PolishContextClipboardReader.isPermittedContextEndpoint(
+                $0,
+                trustedEndpointEnabled: settings.polishContextTrustedEndpointEnabled
+            )
+        } ?? false
+        var material = self
+        var withdrawn: [String] = []
+        if clipboardContext != nil,
+           !(settings.polishClipboardContextEnabled && endpointPermitted) {
+            material.clipboardContext = nil
+            material.clipboardPreparation = .empty
+            withdrawn.append("clipboard")
+        }
+        if screenDecision.vocabularyGroundingText != nil,
+           !(settings.terminalScreenContextEnabled && endpointPermitted)
+            || (screenReadThroughJoin && !joinStillLive) {
+            material.screenDecision = .drop(reason: .policyRejected)
+            material.screenPreparation = .empty
+            withdrawn.append("screen")
+        }
+        if repoVocabularyOutcome != .empty || !learnedProposals.isEmpty,
+           !(settings.repoVocabularyEnabled && endpointPermitted) {
+            material.repoVocabularyOutcome = .empty
+            // Agent proposals (#609) are admitted only where repo vocabulary
+            // may go, so they leave with it.
+            let proposals = learnedProposals
+            let keep = { (entry: ReplacementEntry) in !proposals.contains(entry.replaceWith) }
+            let learned = learnedVocabularyOutcome
+            material.learnedVocabularyOutcome = RepoVocabularyMatcher.GroundingOutcome(
+                entries: learned.entries.filter(keep),
+                isFallbackOnly: learned.isFallbackOnly,
+                phoneticEntries: learned.phoneticEntries.filter(keep),
+                verificationCandidates: learned.verificationCandidates.filter(keep)
+            )
+            material.learnedProposals = []
+            withdrawn.append("repo-vocabulary")
+        }
+        if claudeRepoSnapshot != nil || !claudeSessionText.isEmpty,
+           !(settings.claudeRepoContextEnabled && endpointPermitted && joinStillLive) {
+            material.claudeRepoSnapshot = nil
+            material.claudeRepoPreparation = .empty
+            material.claudeSessionText = ""
+            material.claudeSessionPreparation = .empty
+            withdrawn.append("claude")
+        }
+        guard !withdrawn.isEmpty else { return nil }
+        Log.polishing.notice(
+            "Polish context withdrawn during the stop, consent no longer holds: \(withdrawn.joined(separator: ","), privacy: .public)"
+        )
+        material.merged = PolishContextGatherer.merge(
+            repository: material.repoVocabularyOutcome,
+            claudeRepository: material.claudeRepoOutcome,
+            terminal: material.screenVocabularyOutcome,
+            claude: material.claudeSessionOutcome,
+            clipboard: material.clipboardVocabularyOutcome,
+            learned: material.learnedVocabularyOutcome,
+            workingText: workingText
+        )
+        return material
+    }
+}

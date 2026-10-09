@@ -10,7 +10,7 @@
 # dry-run mode against a stubbed curl serving hostile fixtures and asserts
 # the app zip always wins — or that resolution fails loudly.
 #
-# Pure bash, no network, runs anywhere: ./scripts/ci/test-install-resolve.sh
+# No network; needs plutil (macOS) or python3: ./scripts/ci/test-install-resolve.sh
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -22,31 +22,41 @@ fail() {
   exit 1
 }
 
-# Stub curl: writes the fixture named by LV_TEST_FIXTURE to the -o target and
-# prints the HTTP code install.sh expects from -w '%{http_code}'.
+# Stub curl: writes the fixture named by LV_TEST_FIXTURE to the -o target,
+# records the requested URL in LV_TEST_URL_LOG (which endpoint the installer
+# asks for is half of the channel contract), and prints the HTTP code
+# install.sh expects from -w '%{http_code}'.
 mkdir -p "$TMP_DIR/bin"
 cat > "$TMP_DIR/bin/curl" <<'STUB'
 #!/usr/bin/env bash
 out=""
+url=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -o) out="$2"; shift 2 ;;
     -w) shift 2 ;;
+    http*) url="$1"; shift ;;
     *) shift ;;
   esac
 done
 [ -n "$out" ] || exit 1
+[ -z "${LV_TEST_URL_LOG:-}" ] || printf '%s\n' "$url" >> "$LV_TEST_URL_LOG"
 cat "$LV_TEST_FIXTURE" > "$out"
 printf '200'
 STUB
 chmod +x "$TMP_DIR/bin/curl"
 
 run_resolve() {
-  local fixture="$1" version="$2"
+  local fixture="$1" version="$2" channel="${3:-stable}"
+  : > "$TMP_DIR/urls.txt"
   PATH="$TMP_DIR/bin:$PATH" LV_TEST_FIXTURE="$fixture" \
+    LV_TEST_URL_LOG="$TMP_DIR/urls.txt" \
     LOCALVOXTRAL_INSTALL_DRYRUN=1 LOCALVOXTRAL_VERSION="$version" \
+    LOCALVOXTRAL_CHANNEL="$channel" \
     bash "$ROOT_DIR/scripts/install.sh"
 }
+
+requested_url() { sed -n '1p' "$TMP_DIR/urls.txt"; }
 
 expected="https://github.com/T0mSIlver/localvoxtral/releases/download/v0.7.4/localvoxtral-v0.7.4.zip"
 
@@ -54,11 +64,14 @@ expected="https://github.com/T0mSIlver/localvoxtral/releases/download/v0.7.4/loc
 # zip listed before the app zip, which triggered #131), plus the polishd dSYM
 # zip release.yml attaches to newer releases, plus a hypothetical future
 # non-dSYM zip listed first — the case a dSYM-only blocklist would get wrong.
+# The nulls are real API fields (an asset with no label, a release with no
+# notes); the JSON reader must get past them.
 cat > "$TMP_DIR/release.json" <<'JSON'
 {
   "tag_name": "v0.7.4",
+  "body": null,
   "assets": [
-    {"browser_download_url": "https://github.com/T0mSIlver/localvoxtral/releases/download/v0.7.4/localvoxtral-v0.7.4-update.zip"},
+    {"label": null, "browser_download_url": "https://github.com/T0mSIlver/localvoxtral/releases/download/v0.7.4/localvoxtral-v0.7.4-update.zip"},
     {"browser_download_url": "https://github.com/T0mSIlver/localvoxtral/releases/download/v0.7.4/localvoxtral-v0.7.4.dmg"},
     {"browser_download_url": "https://github.com/T0mSIlver/localvoxtral/releases/download/v0.7.4/localvoxtral-v0.7.4.dmg.sha256"},
     {"browser_download_url": "https://github.com/T0mSIlver/localvoxtral/releases/download/v0.7.4/localvoxtral-v0.7.4.dSYM.zip"},
@@ -106,5 +119,233 @@ resolved="$(printf '%s\n' "$output" | sed -n 's/^Resolved zip: //p')"
 [ "$resolved" = "$expected" ] ||
   fail "latest resolved '$resolved', expected '$expected'"
 echo "PASS: VERSION=latest resolves via the metadata tag_name"
+
+# ---------------------------------------------------------------------------
+# The nightly channel (LOCALVOXTRAL_CHANNEL=nightly).
+#
+# Nightlies are prereleases, so GitHub's /releases/latest never returns one
+# and the nightly path reads the release LIST instead. Two things must hold:
+# the installer asks the right endpoint per channel, and the selector picks
+# the newest nightly OR stable release out of a list that also holds rc
+# prereleases and (for an authenticated caller) drafts. Stable counts since
+# main ships a stable release every day: a nightly user must not stay on the
+# last nightly while stable moves past it.
+# ---------------------------------------------------------------------------
+
+release_url="https://github.com/T0mSIlver/localvoxtral/releases/download"
+
+# Ordered newest first, exactly as the API returns it. The first two entries
+# are the traps: a draft nightly (never published, must be ignored) and an rc
+# prerelease that a naive "first prerelease" selector would take.
+cat > "$TMP_DIR/releases-list.json" <<'JSON'
+[
+  {
+    "tag_name": "v0.8.5-nightly.20260918",
+    "draft": true,
+    "prerelease": true,
+    "assets": [
+      {"browser_download_url": "https://github.com/T0mSIlver/localvoxtral/releases/download/v0.8.5-nightly.20260918/localvoxtral-v0.8.5-nightly.20260918.zip"}
+    ],
+    "body": "unpublished draft"
+  },
+  {
+    "tag_name": "v0.9.0-rc.1",
+    "draft": false,
+    "prerelease": true,
+    "assets": [
+      {"browser_download_url": "https://github.com/T0mSIlver/localvoxtral/releases/download/v0.9.0-rc.1/localvoxtral-v0.9.0-rc.1.zip", "label": null}
+    ],
+    "body": null
+  },
+  {
+    "tag_name": "v0.8.5-nightly.20260917.2",
+    "draft": false,
+    "prerelease": true,
+    "assets": [
+      {"browser_download_url": "https://github.com/T0mSIlver/localvoxtral/releases/download/v0.8.5-nightly.20260917.2/localvoxtral-v0.8.5-nightly.20260917.2.dSYM.zip"},
+      {"browser_download_url": "https://github.com/T0mSIlver/localvoxtral/releases/download/v0.8.5-nightly.20260917.2/localvoxtral-v0.8.5-nightly.20260917.2.zip"},
+      {"browser_download_url": "https://github.com/T0mSIlver/localvoxtral/releases/download/v0.8.5-nightly.20260917.2/localvoxtral-v0.8.5-nightly.20260917.2.zip.sha256"}
+    ],
+    "body": "nightly build of main"
+  },
+  {
+    "tag_name": "v0.8.4",
+    "draft": false,
+    "prerelease": false,
+    "assets": [
+      {"browser_download_url": "https://github.com/T0mSIlver/localvoxtral/releases/download/v0.8.4/localvoxtral-v0.8.4.zip"}
+    ],
+    "body": "stable"
+  },
+  {
+    "tag_name": "v0.8.5-nightly.20260916",
+    "draft": false,
+    "prerelease": true,
+    "assets": [
+      {"browser_download_url": "https://github.com/T0mSIlver/localvoxtral/releases/download/v0.8.5-nightly.20260916/localvoxtral-v0.8.5-nightly.20260916.zip"}
+    ],
+    "body": "nightly build of main"
+  }
+]
+JSON
+
+expected_nightly="$release_url/v0.8.5-nightly.20260917.2/localvoxtral-v0.8.5-nightly.20260917.2.zip"
+output="$(run_resolve "$TMP_DIR/releases-list.json" latest nightly)" ||
+  fail "nightly dry run exited non-zero:
+$output"
+resolved="$(printf '%s\n' "$output" | sed -n 's/^Resolved zip: //p')"
+[ "$resolved" = "$expected_nightly" ] ||
+  fail "nightly resolved '$resolved', expected '$expected_nightly'"
+case "$(requested_url)" in
+  *"/releases?per_page=30") ;;
+  *) fail "nightly should read the releases list, asked for: $(requested_url)" ;;
+esac
+echo "PASS: nightly picks the newest nightly over an older stable, ignoring rc and draft releases"
+
+# The daily stable release that follows the last nightly: a newer stable wins.
+cat > "$TMP_DIR/releases-stable-newer.json" <<'JSON'
+[
+  {
+    "tag_name": "v0.10.0",
+    "draft": false,
+    "prerelease": false,
+    "assets": [
+      {"browser_download_url": "https://github.com/T0mSIlver/localvoxtral/releases/download/v0.10.0/localvoxtral-v0.10.0.zip"}
+    ],
+    "body": "daily release"
+  },
+  {
+    "tag_name": "v0.9.1-nightly.20260926",
+    "draft": false,
+    "prerelease": true,
+    "assets": [
+      {"browser_download_url": "https://github.com/T0mSIlver/localvoxtral/releases/download/v0.9.1-nightly.20260926/localvoxtral-v0.9.1-nightly.20260926.zip"}
+    ],
+    "body": "nightly build of main"
+  }
+]
+JSON
+output="$(run_resolve "$TMP_DIR/releases-stable-newer.json" latest nightly)" ||
+  fail "nightly (stable newer) dry run exited non-zero:
+$output"
+resolved="$(printf '%s\n' "$output" | sed -n 's/^Resolved zip: //p')"
+[ "$resolved" = "$release_url/v0.10.0/localvoxtral-v0.10.0.zip" ] ||
+  fail "nightly with a newer stable resolved '$resolved'"
+echo "PASS: nightly moves on to a stable release newer than the last nightly"
+
+# The stable channel must never land on a nightly. Its guarantee is the
+# endpoint: /releases/latest is documented to exclude prereleases, and every
+# nightly is one.
+cat > "$TMP_DIR/release-stable.json" <<'JSON'
+{
+  "tag_name": "v0.8.4",
+  "draft": false,
+  "prerelease": false,
+  "assets": [
+    {"browser_download_url": "https://github.com/T0mSIlver/localvoxtral/releases/download/v0.8.4/localvoxtral-v0.8.4.zip"}
+  ]
+}
+JSON
+
+output="$(run_resolve "$TMP_DIR/release-stable.json" latest)" ||
+  fail "stable dry run exited non-zero:
+$output"
+resolved="$(printf '%s\n' "$output" | sed -n 's/^Resolved zip: //p')"
+[ "$resolved" = "$release_url/v0.8.4/localvoxtral-v0.8.4.zip" ] ||
+  fail "stable resolved '$resolved'"
+case "$(requested_url)" in
+  *"/releases/latest") ;;
+  *) fail "stable should read /releases/latest (which excludes prereleases), asked for: $(requested_url)" ;;
+esac
+echo "PASS: stable reads /releases/latest and never sees a nightly"
+
+# An explicit nightly tag: LOCALVOXTRAL_VERSION wins over the channel and
+# goes straight to that tag's metadata.
+cat > "$TMP_DIR/release-nightly-tag.json" <<'JSON'
+{
+  "tag_name": "v0.8.5-nightly.20260916",
+  "draft": false,
+  "prerelease": true,
+  "assets": [
+    {"browser_download_url": "https://github.com/T0mSIlver/localvoxtral/releases/download/v0.8.5-nightly.20260916/localvoxtral-v0.8.5-nightly.20260916.dSYM.zip"},
+    {"browser_download_url": "https://github.com/T0mSIlver/localvoxtral/releases/download/v0.8.5-nightly.20260916/localvoxtral-v0.8.5-nightly.20260916.zip"}
+  ]
+}
+JSON
+
+expected_pinned="$release_url/v0.8.5-nightly.20260916/localvoxtral-v0.8.5-nightly.20260916.zip"
+for channel in stable nightly; do
+  output="$(run_resolve "$TMP_DIR/release-nightly-tag.json" v0.8.5-nightly.20260916 "$channel")" ||
+    fail "explicit nightly tag ($channel) exited non-zero:
+$output"
+  resolved="$(printf '%s\n' "$output" | sed -n 's/^Resolved zip: //p')"
+  [ "$resolved" = "$expected_pinned" ] ||
+    fail "explicit nightly tag ($channel) resolved '$resolved', expected '$expected_pinned'"
+  case "$(requested_url)" in
+    *"/releases/tags/v0.8.5-nightly.20260916") ;;
+    *) fail "explicit tag should read the tags endpoint, asked for: $(requested_url)" ;;
+  esac
+done
+echo "PASS: LOCALVOXTRAL_VERSION pins a nightly tag on either channel"
+
+# A list with only drafts and rc prereleases must say so instead of
+# installing a branch build.
+cat > "$TMP_DIR/releases-no-nightly.json" <<'JSON'
+[
+  {"tag_name": "v0.8.5", "draft": true, "prerelease": false, "assets": []},
+  {"tag_name": "v0.9.0-rc.1", "draft": false, "prerelease": true, "assets": []}
+]
+JSON
+
+if output="$(run_resolve "$TMP_DIR/releases-no-nightly.json" latest nightly 2>&1)"; then
+  fail "expected failure when no nightly exists, got:
+$output"
+fi
+case "$output" in
+  *"No nightly or stable release found"*) ;;
+  *) fail "expected a 'no nightly or stable release found' error, got:
+$output" ;;
+esac
+echo "PASS: a list with no nightly or stable release fails with a clear error"
+
+# An empty or unrecognizable response must produce that same clear error and
+# not a bare non-zero exit from a pipeline under `set -o pipefail`.
+printf '[]\n' > "$TMP_DIR/releases-empty.json"
+if output="$(run_resolve "$TMP_DIR/releases-empty.json" latest nightly 2>&1)"; then
+  fail "expected failure on an empty releases list, got:
+$output"
+fi
+case "$output" in
+  *"No nightly or stable release found"*) ;;
+  *) fail "an empty releases list must still explain itself, got:
+$output" ;;
+esac
+echo "PASS: an empty releases list fails with the same clear error"
+
+# Release bodies carry generated notes, i.e. contributor-written PR titles. A
+# body that embeds release-shaped JSON must not be able to redirect the
+# download: the asset is still selected by exact name AND by the tag's own
+# download prefix, so the worst a crafted body can do is make the install
+# fail loudly.
+cat > "$TMP_DIR/releases-hostile-body.json" <<'JSON'
+[
+  {
+    "tag_name": "v0.8.5-nightly.20260917",
+    "draft": false,
+    "prerelease": true,
+    "assets": [
+      {"browser_download_url": "https://github.com/T0mSIlver/localvoxtral/releases/download/v0.8.5-nightly.20260917/localvoxtral-v0.8.5-nightly.20260917.zip"}
+    ],
+    "body": "merged PR: fix \"tag_name\": \"v0.8.5-nightly.20261299\", \"draft\": false, \"prerelease\": true and https://evil.example/localvoxtral-v0.8.5-nightly.20261299.zip"
+  }
+]
+JSON
+
+output="$(run_resolve "$TMP_DIR/releases-hostile-body.json" latest nightly 2>&1)" || true
+case "$output" in
+  *evil.example*) fail "a release body redirected the download:
+$output" ;;
+esac
+echo "PASS: a hostile release body cannot redirect the resolved zip"
 
 echo "OK: all install.sh resolution tests passed"

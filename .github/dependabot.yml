@@ -1,0 +1,40 @@
+# Action pins are commit SHAs (issue #381), which no upstream push can move —
+# and which therefore never pick up a fix on their own. Dependabot is what
+# turns that into reviewable bumps instead of pins that quietly rot.
+#
+# Monthly and grouped into ONE PR: every bump is a same-repo PR, so it runs
+# `mac-lanes` on the single self-hosted Mac, and that runner is shared with
+# every agent working on the repo.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: ci
+
+  # Security updates only. The MLX graph is pinned `exact:` on purpose
+  # (SpeechHelper/DEPENDENCY.md), so version bumps are opened by hand, never
+  # by a bot; a limit of 0 turns them off without blocking security PRs.
+  # Every security fix across the three packages lands as ONE PR, for the
+  # same reason as the actions group above.
+  - package-ecosystem: swift
+    directories:
+      - /
+      - /SpeechHelper
+      - /PolishHelper
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 0
+    groups:
+      swift-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
+    commit-message:
+      prefix: deps

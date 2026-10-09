@@ -4,9 +4,9 @@
 # files, so it runs anywhere (hosted fork PRs included).
 #
 # Not a mirror of the whole pattern list: it pins the decisions that were
-# bugs or near-misses — model-input integrations (the opencode plugin
-# shipped without a pattern, PR #204 review), the marker path, and the
-# run=false side that keeps UI/doc-only diffs off the live-model lane.
+# bugs or near-misses, or owner calls — the join, hook and integration paths
+# the lane executes none of (#643), the marker path, and the run=false side
+# that keeps UI/doc-only diffs off the live-model lane.
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd -P)"
@@ -21,15 +21,21 @@ fail() {
 }
 
 # expect <true|false> <description> <changed-path>... [--marker <text>]
+#   [--skip-marker <absent|waived|no-reason|overridden|unneeded>]
 expect() {
   local expected="$1" description="$2"
   shift 2
-  local changed="$TMP_DIR/changed" marker_file=""
+  local changed="$TMP_DIR/changed" marker_file="" expected_skip=""
   : >"$changed"
   while [[ $# -gt 0 ]]; do
     if [[ "$1" == "--marker" ]]; then
       marker_file="$TMP_DIR/marker"
       printf '%s\n' "$2" >"$marker_file"
+      shift 2
+      continue
+    fi
+    if [[ "$1" == "--skip-marker" ]]; then
+      expected_skip="$2"
       shift 2
       continue
     fi
@@ -48,19 +54,57 @@ expect() {
   [[ "$run" == "$expected" ]] \
     || fail "$description: expected run=$expected, got run=$run ($reason)"
   [[ -n "$reason" ]] || fail "$description: reason line is missing"
+  local skip
+  skip="$(sed -n 's/^skip_marker=//p' <<<"$output")"
+  [[ -n "$skip" ]] || fail "$description: skip_marker line is missing"
+  [[ -z "$expected_skip" || "$skip" == "$expected_skip" ]] \
+    || fail "$description: expected skip_marker=$expected_skip, got skip_marker=$skip ($reason)"
   printf 'PASS: %s (%s)\n' "$description" "$reason"
 }
 
-# --- Model-input integrations ---------------------------------------------
-# Both agent plugins shape what reaches the polish model (prompt extraction,
-# cwd, file grounding); a plugin-only diff must run the lane.
+# --- The join, the hooks and the integrations (owner call, #643) -----------
+# The lane executes none of them; PolishRequestGoldenTests pins what a join
+# hands the request. Each of these used to run the lane.
 
-expect true "opencode plugin change runs the lane" \
-  integrations/opencode/localvoxtral.js
-expect true "opencode integration docs stay lane-relevant (claude-code parity)" \
-  integrations/opencode/README.md
-expect true "claude-code plugin change runs the lane" \
-  integrations/claude-code/plugins/localvoxtral/hooks/hooks.json
+expect false "an agent plugin change does not run the lane" \
+  integrations/opencode/localvoxtral.js \
+  integrations/claude-code/plugins/localvoxtral/hooks/hooks.json \
+  integrations/vibe/README.md
+expect false "the hook publishers and parsers do not run the lane" \
+  Sources/ClaudeHookPublisherCore/ClaudeHookPublisher.swift \
+  Sources/ClaudeContextWire/ClaudeHookWire.swift \
+  Sources/ClaudeContextWire/ClaudeHookInputParser.swift
+expect false "the join resolver, registry and broker do not run the lane" \
+  Sources/localvoxtralCore/ClaudeContext/ClaudeSessionJoinResolver.swift \
+  Sources/localvoxtralCore/ClaudeContext/ClaudeSessionRegistry.swift \
+  Sources/localvoxtralCore/ClaudeContext/ClaudeContextBroker.swift \
+  Sources/localvoxtralCore/ClaudeContext/TerminalScreenClaudeJoin.swift
+expect false "what decides which session the context comes from does not run the lane" \
+  Sources/localvoxtralCore/ClaudeSocketGuard.swift \
+  Sources/localvoxtralCore/ClaudeDesktopAllowlist.swift \
+  Sources/localvoxtralCore/BrowserTabAllowlist.swift \
+  Sources/localvoxtralCore/ClaudeBridgeSessionURL.swift \
+  Sources/localvoxtralCore/ClaudeDesktopSessionURL.swift \
+  Sources/localvoxtralCore/ClaudeContext/ClaudeRemoteContextListener.swift \
+  Sources/localvoxtralCore/ClaudeContext/ClaudeRemoteListenerCoordinator.swift \
+  Sources/localvoxtralCore/ClaudeContext/CmuxSocketPasswordStore.swift
+# What shapes the bytes of a Claude block still runs it.
+expect true "the repository harvest runs the lane" \
+  Sources/localvoxtralCore/ClaudeContext/ClaudeRepoCollector.swift
+expect true "the block framing runs the lane" \
+  Sources/localvoxtralCore/ClaudeContext/ClaudeContextBlocks.swift
+expect true "a multiplexer pane's excerpt runs the lane" \
+  Sources/localvoxtralCore/ClaudeContext/SocketPaneScreenContext.swift
+expect true "the snapshot the session block renders from runs the lane" \
+  Sources/localvoxtralCore/ClaudeSessionState.swift
+
+# Split out of files the lane already watched; they still shape the context.
+expect true "the screen text rules, split from the AX reader, run the lane" \
+  Sources/localvoxtralCore/TerminalScreenText.swift
+expect true "the git runner, split from repo vocabulary, runs the lane" \
+  Sources/localvoxtralCore/RepoGitRunner.swift
+expect false "the forward process seam, split from the supervisor, stays exempt" \
+  Sources/localvoxtralCore/ClaudeContext/ClaudeRemoteForwardProcess.swift
 
 # --- Marker opt-in ----------------------------------------------------------
 
@@ -69,12 +113,186 @@ expect true "[run-llm-eval] marker forces the lane on any diff" \
 expect false "unrelated marker text does not trigger" \
   README.md --marker 'no opt-in here'
 
+# --- Skip marker opt-out ----------------------------------------------------
+# A matching diff that cannot change what reaches the model (a test file moved
+# between targets) can waive the lane, but only with a written reason.
+
+expect false "[skip-llm-eval: reason] waives a matching diff" \
+  Sources/localvoxtralCore/PolishTokenGuard.swift \
+  --marker 'Move test files. [skip-llm-eval: pure move of PolishTokenGuardTests into the core target]' \
+  --skip-marker waived
+printf 'Sources/localvoxtralCore/PolishTokenGuard.swift\n' >"$TMP_DIR/changed"
+printf 'x [skip-llm-eval:  pure move ]\r\n' >"$TMP_DIR/marker"
+reason="$("$FILTER" "$TMP_DIR/changed" "$TMP_DIR/marker")"
+grep -qF 'reason=waived by the skip-llm-eval marker: pure move (the diff matched Sources/localvoxtralCore/PolishTokenGuard.swift' <<<"$reason" \
+  || fail "the waiver reason is not echoed trimmed: $reason"
+echo "PASS: the waiver echoes the marker's reason, trimmed"
+expect true "a bare [skip-llm-eval] does not skip" \
+  Sources/localvoxtralCore/PolishTokenGuard.swift \
+  --marker 'no reason given [skip-llm-eval]' \
+  --skip-marker no-reason
+expect true "[skip-llm-eval:] with a blank reason does not skip" \
+  Sources/localvoxtralCore/PolishTokenGuard.swift \
+  --marker '[skip-llm-eval:   ]' \
+  --skip-marker no-reason
+expect true "[run-llm-eval] beside the skip marker runs the lane" \
+  README.md \
+  --marker '[skip-llm-eval: only a move] and [run-llm-eval]' \
+  --skip-marker overridden
+expect true "[run-llm-eval] also overrides the skip marker on a matching diff" \
+  Sources/localvoxtralCore/PolishTokenGuard.swift \
+  --marker '[run-llm-eval] [skip-llm-eval: only a move]' \
+  --skip-marker overridden
+expect false "a skip marker on a non-matching diff changes nothing" \
+  README.md \
+  --marker '[skip-llm-eval: docs only]' \
+  --skip-marker unneeded
+expect true "the marker's name without brackets does not skip" \
+  Sources/localvoxtralCore/PolishTokenGuard.swift \
+  --marker 'add skip-llm-eval: with a reason to waive the lane' \
+  --skip-marker absent
+expect true "a longer marker name is not the skip marker" \
+  Sources/localvoxtralCore/PolishTokenGuard.swift \
+  --marker '[skip-llm-evals: typo]' \
+  --skip-marker absent
+
 # --- run=false side ---------------------------------------------------------
+
+# --- The ClaudeContext exemption list (#418) --------------------------------
+expect false "an enrollment change does not run the lane" \
+  Sources/localvoxtralCore/ClaudeContext/ClaudeRemoteEnrollmentService.swift
+expect false "the enrollment service's split-out files do not run the lane" \
+  Sources/localvoxtralCore/ClaudeContext/ClaudeRemoteEnrollmentService+Verification.swift \
+  Sources/localvoxtralCore/ClaudeContext/ClaudeRemoteSSHConfigFileSystem.swift
+expect false "a settings-model plus forward-supervisor change does not run the lane" \
+  Sources/localvoxtral/ClaudeContext/ClaudeIntegrationSettingsModel.swift \
+  Sources/localvoxtralCore/ClaudeContext/ClaudeRemoteForwardSupervisor.swift
+expect false "the settings model's files by area do not run the lane" \
+  "Sources/localvoxtral/ClaudeContext/ClaudeIntegrationSettingsModel+SetupRun.swift" \
+  Sources/localvoxtralCore/ClaudeContext/ClaudeShellSetupStatus.swift \
+  Sources/localvoxtralCore/ClaudeContext/HerdrMachineImport.swift
+expect true "an exempt file beside a content change still runs the lane" \
+  Sources/localvoxtralCore/ClaudeContext/ClaudeRemoteEnrollmentService.swift \
+  Sources/localvoxtralCore/ClaudeContext/ClaudeRepoContextSelection.swift
+expect true "a NEW file in ClaudeContext runs the lane until it is exempted" \
+  Sources/localvoxtral/ClaudeContext/SomethingNobodyClassifiedYet.swift
+expect true "a NEW file in the core's ClaudeContext runs the lane too" \
+  Sources/localvoxtralCore/ClaudeContext/SomethingNobodyClassifiedYet.swift
+
+# Every exempt path must exist (a rename must not leave a dead exemption that a
+# new file of the old name would inherit), and the catch-all must be the ONLY
+# pattern that matches it: exempting a file that a named pattern asks for would
+# silently overrule that pattern.
+FILTER_SOURCE="$ROOT_DIR/scripts/ci/llm-lane-filter.sh"
+exempt_paths="$(sed -n "/^EXEMPT=(/,/^)/p" "$FILTER_SOURCE" | sed -n "s/^  '\([^']*\)'.*/\1/p")"
+[[ -n "$exempt_paths" ]] || fail "could not parse the EXEMPT list"
+# The sed above reads one shape of entry. An entry written any other way
+# (double quotes, another indent, a computed value) would skip both checks
+# below, so every line of the array has to be one the sed read.
+exempt_lines="$(sed -n "/^EXEMPT=(/,/^)/p" "$FILTER_SOURCE" | sed '1d;$d' | grep -vcE "^[[:space:]]*(#|$)" || true)"
+[[ "$exempt_lines" == "$(wc -l <<<"$exempt_paths" | tr -d ' ')" ]] \
+  || fail "EXEMPT holds an entry this test cannot parse (single-quoted, two-space indent, one per line)"
+patterns="$(sed -n "/^PATTERNS=(/,/^)/p" "$FILTER_SOURCE" | sed -n "s/^  '\([^']*\)'.*/\1/p")"
+while IFS= read -r exempt; do
+  [[ -e "$ROOT_DIR/$exempt" ]] || fail "exempt path does not exist: $exempt"
+  while IFS= read -r pattern; do
+    [[ "$pattern" == 'Sources/localvoxtral/ClaudeContext/*' ]] && continue
+    [[ "$pattern" == 'Sources/localvoxtralCore/ClaudeContext/*' ]] && continue
+    # shellcheck disable=SC2254
+    case "$exempt" in
+      $pattern) fail "exempt path $exempt is also asked for by pattern $pattern" ;;
+    esac
+  done <<<"$patterns"
+done <<<"$exempt_paths"
+echo "PASS: every exempt path exists and only the catch-all matches it"
 
 expect false "top-level docs do not run the lane" \
   README.md AGENTS.md
 expect false "UI-only Swift change does not run the lane" \
   Sources/localvoxtral/SettingsView.swift
+# Nothing that shapes the polish request is left in the view model files
+# (#432 step 7b): what the request is built from lives in the coordinator.
+expect false "a view model or session change does not run the lane" \
+  Sources/localvoxtral/DictationViewModel.swift \
+  Sources/localvoxtral/DictationSessionController.swift \
+  Sources/localvoxtral/DictationSessionController+Session.swift
+expect true "the stop-commit's polish step runs the lane" \
+  Sources/localvoxtral/StopCommitCoordinator.swift
+expect true "the session's stop-commit, which feeds it, runs the lane" \
+  Sources/localvoxtral/DictationSessionController+StopCommit.swift
+expect true "early polish, which sends pieces and the tail, runs the lane" \
+  Sources/localvoxtral/EarlyPolishRun.swift \
+  Sources/localvoxtralCore/EarlyPolishPlan.swift
+# The pure polish pieces moved to the core target (#432 step 9) and still run it.
+expect true "the token guard in the core target runs the lane" \
+  Sources/localvoxtralCore/PolishTokenGuard.swift
+expect true "the outcome classifier in the core target runs the lane" \
+  Sources/localvoxtralCore/PolishOutcomeClassifier.swift
+expect true "the polish error in the core target runs the lane" \
+  Sources/localvoxtralCore/LLMPolishingError.swift
+expect true "the vocabulary matcher in the core target runs the lane" \
+  Sources/localvoxtralCore/RepoVocabularyMatcher.swift
+expect true "the clipboard vocabulary in the core target runs the lane" \
+  Sources/localvoxtralCore/ClipboardVocabulary.swift
+expect true "the phonetic keys in the core target run the lane" \
+  Sources/localvoxtralCore/DoubleMetaphone.swift
+expect true "the prompt loader and renderer in the core target run the lane" \
+  Sources/localvoxtralCore/AppConfigStore.swift
+expect true "the control-character sanitizer in the core target runs the lane" \
+  Sources/localvoxtralCore/StringExtensions.swift
+expect false "the statusline combine script, moved to the core target, stays exempt" \
+  Sources/localvoxtralCore/ClaudeStatuslineCombine.swift
+# The context budget and cross-source grounding merge moved to the core target
+# and still run it: they decide how many characters reach the model and what
+# gets pre-applied.
+expect true "the context budget in the core target runs the lane" \
+  Sources/localvoxtralCore/PolishContextBudget.swift
+expect true "the cross-source grounding merge in the core target runs the lane" \
+  Sources/localvoxtralCore/PolishContextGrounding.swift
+# Test files run the lane only when they are its own suite or the eval harness
+# (#545: test-target moves bought live inference through the name globs).
+expect false "a unit test named after a polish type does not run the lane" \
+  Tests/localvoxtralTests/PolishTokenGuardTests.swift \
+  Tests/localvoxtralCoreTests/RepoVocabularyMatcherTests.swift
+expect false "a test moved into a folder named after a hook type does not run the lane" \
+  Tests/localvoxtralTests/ClaudeHookPublisherTests.swift \
+  Tests/ClaudeHookPublisherCoreTests/ClaudeHookPublisherTests.swift
+expect false "a helper package's unit test does not run the lane" \
+  PolishHelper/Tests/PolishHelperCoreTests/PolishdRouterTests.swift
+expect true "the lane's own suite runs the lane" \
+  Tests/localvoxtralTests/PolishHelperIntegrationTests.swift
+expect true "the shared eval scorer runs the lane" \
+  Tests/localvoxtralTests/LLMPolishEvalSupport.swift
+expect true "the e2e eval harness runs the lane" \
+  Tests/localvoxtralTests/AgentDictationE2EEvalSupport.swift
+expect true "the e2e corpus loader runs the lane" \
+  Tests/localvoxtralTests/AgentDictationEvalCorpus.swift
+expect true "the harness's TTS and ASR stage runs the lane" \
+  Tests/localvoxtralTestSupport/EvalSpeechStage.swift
+expect true "the harness's recording reader runs the lane" \
+  Tests/localvoxtralTestSupport/RecordedAudioSet.swift
+expect true "the source a test covers still runs the lane" \
+  Tests/localvoxtralTests/PolishTokenGuardTests.swift \
+  Sources/localvoxtralCore/PolishTokenGuard.swift
+expect true "a helper package's sources still run the lane" \
+  PolishHelper/Sources/PolishHelperCore/PolishdRouter.swift
+# Every lane-owned test pattern must still name a file, or a rename would drop
+# the lane's own suite from its trigger without a word.
+lane_test_patterns="$(sed -n "/^LANE_TEST_PATTERNS=(/,/^)/p" "$FILTER_SOURCE" | sed -n "s/^  '\([^']*\)'.*/\1/p")"
+[[ -n "$lane_test_patterns" ]] || fail "could not parse LANE_TEST_PATTERNS"
+tracked_tests="$(cd "$ROOT_DIR" && git ls-files 'Tests/*' 2>/dev/null || true)"
+if [[ -n "$tracked_tests" ]]; then
+  while IFS= read -r pattern; do
+    found=""
+    while IFS= read -r path; do
+      # shellcheck disable=SC2254
+      case "$path" in $pattern) found=1; break ;; esac
+    done <<<"$tracked_tests"
+    [[ -n "$found" ]] || fail "LANE_TEST_PATTERNS entry matches no tracked test file: $pattern"
+  done <<<"$lane_test_patterns"
+  echo "PASS: every lane-owned test pattern names a tracked file"
+fi
+
 expect false "empty changed-file list decides run=false (caller owns fail-open)" \
   ""
 

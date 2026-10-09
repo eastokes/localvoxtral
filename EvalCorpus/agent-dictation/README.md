@@ -27,7 +27,7 @@ fixtures/repo-<name>.json    repo specs the harness git-inits for
 
 The interactive recorder presents the 146 speech-running phrases, records
 mono 16-bit/16 kHz WAVs, offers optional playback, and saves progress after
-every accept. The 17 `polish-only` cases are text inputs and do not need
+every accept. The 36 `polish-only` cases are text inputs and do not need
 recordings.
 
 ```bash
@@ -138,6 +138,26 @@ own: always inspect surface exactness, word accuracy, large regressions, and the
 HTML text because a model can preserve the requested token while damaging the
 surrounding instruction.
 
+To compare prompt edits, give each version of the four `llm_*prompt*.toml`
+files a directory and pass one `--prompt-arm NAME=DIR` per version. The
+current-production variants then run once per arm, and deltas pair each arm
+with the first. A hosted model such as GLM 5.3 on the Mistral API is not
+deterministic at the production temperature, so add a second arm that names
+the baseline directory again: its deltas are the noise floor the others must
+beat.
+
+```bash
+./scripts/ablate-agent-eval.py <frozen log> \
+  --endpoint https://api.mistral.ai/v1/chat/completions --model zai-glm-5-3 \
+  --request-shape mistral --temperature 0.3 --reasoning-effort low \
+  --api-key-file ~/.config/localvoxtral/mistral_api_key \
+  --prompt-arm main=arms/main --prompt-arm main-repeat=arms/main \
+  --prompt-arm edit=arms/edit --variants current-production
+```
+
+A polish-only case the log predates is scored too: its input is the corpus
+text, so the runner adds it from the corpus.
+
 The `aligned-hint` and `aligned-preapply` arms narrow that upper bound. They run
 only as a fallback when the recorded production matcher emitted no repo or
 clipboard mapping, require a score and runner-up margin, choose the smallest
@@ -207,6 +227,37 @@ are never committed. Delete a local set when it is
 no longer needed. Running either eval launcher without a recording argument
 retains the repeatable `say`-based nightly baseline.
 
+## ASR-only runs on Linux
+
+`AgentDictationASREvalTests` runs the speech stage alone: each of the 146
+speech-running cases from a recording set, through the production realtime
+client, with no polish. It is in the core suite, so the dev box runs it
+against vLLM (`scripts/linux/README.md`). vLLM serves BF16 Voxtral, not the
+shipped 4-bit model, so its numbers point in a direction and the Mac's
+`eval-e2e` stays the proof.
+
+Write `.agent-eval-asr-enable.json` at the checkout root (the set can be a
+symlink to a directory outside the checkout), run the suite, then delete the
+marker:
+
+```json
+{"label":"vllm-bf16-owner","asr":"vllm-voxtral-bf16",
+ "endpoint":"ws://127.0.0.1:8000/v1/realtime",
+ "asrModel":"mistralai/Voxtral-Mini-4B-Realtime-2602",
+ "recordingDirectory":"EvalRecordings/agent-dictation/owner"}
+```
+
+```bash
+scripts/linux/voxtral-vllm.sh up
+scripts/core-tests-linux.sh --filter AgentDictationASREvalTests
+```
+
+`"subset": true` runs a partial set, and `"caseIDs": [...]` picks cases. The
+scoreboard gives word accuracy against `spokenForm` and against
+`intendedText`, and the `tokens` metric for the `asr-only` stratum, whose
+required cases assert as in `eval-e2e`. The transcripts go to
+`EvalRecordings/agent-dictation/asr-runs/<label>.jsonl` and never to the log.
+
 ## Stratum file schema (schemaVersion 1)
 
 ```jsonc
@@ -226,7 +277,9 @@ Pipelines:
   assert raw recognition only.
 - `polish-only` — `spokenForm` is fed directly to the polish path as input
   text. Used by `punctuation-spacing-migration`, whose inputs carry
-  ASR-artifact spacing ("tomorrow ?") that TTS cannot speak.
+  ASR-artifact spacing ("tomorrow ?") that TTS cannot speak, and by
+  `github-references`, whose inputs are the recognizer's own spellings
+  (`PR349`, number words) that TTS would not reproduce.
 
 ## Case schema
 
@@ -271,6 +324,7 @@ Pipelines:
 | `h-paste-macro.json` | `paste-clipboard-macro` | "paste clipboard"/"colle le presse-papier" embedding + negatives that must not fire. |
 | `i-repo-vocabulary.json` | `repo-vocabulary` | git ls-files vocabulary resolves loose speech to exact repo paths (fixture-backed). |
 | `j-guard-stress.json` | `guard-stress` | Token-guard stress: flag/URL/hash/env-var-dense prompts. |
+| `k-github-references.json` | `github-references` | "issue"/"PR"/"pull request" + number → `PR #712`, from digits, number words or a glued `PR349`; negatives such as "PR 2 of 3". Polish-only. |
 
 ## Authoring rules
 
@@ -304,12 +358,12 @@ Pipelines:
   `stratum.resolvedPipeline`.
 - Feed either a manifest-bound human WAV set or speak `spokenForm` with
   `/usr/bin/say` at LEI16@16000 (see
-  `RealtimeAPIVLLMIntegrationTests.makeSpokenPCM16Data`), FR cases with a
+  `EvalSpeechStage.synthesizedPCM16`), FR cases with a
   French voice. Never mix sources within one scoreboard.
 - Arrange `features` BEFORE the run: pasteboard payload, git-inited fixture
   repo (files from the spec, checked out on the spec's `branch`) fronted as
   the active terminal repo.
-- Score on `LLMPolishEvalSupport.normalizedSpacing`-normalized output:
+- Score on `AgentDictationEvalCorpus.normalizedSpacing`-normalized output:
   `tokens` = all requiredTokens present (case per `caseInsensitive`) and no
   forbiddenSubstrings (case-insensitive); `exactText` = normalized equality
   with `intendedText`.

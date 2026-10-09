@@ -1,0 +1,597 @@
+#!/usr/bin/env bash
+set -uo pipefail
+
+# `lv_open`: `open`, plus the env the lanes need the app to see.
+# shellcheck source=scripts/lib/launch-app.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/launch-app.sh"
+
+# End-to-end dictation check of the PACKAGED app. Run on a macOS GUI session:
+#   ./scripts/e2e-dictation.sh [dist/localvoxtral.app] [scenario-file ...]
+#
+# For each scenario (scripts/e2e/scenarios/*.scenario) it launches the harness
+# build with a WAV in place of the microphone (docs/test-harness.md,
+# "Dictating from a file"), focuses a throwaway target window, runs one
+# dictation through the control socket, and scores the text that landed in the
+# target against the phrase that was spoken. Everything between the capture
+# callback and the focused app is the production path: chunk buffering, the
+# realtime socket, transcript merging, insertion, the overlay commit.
+#
+# What it does not cover: MicrophoneCaptureService (the file replaces it), the
+# modifier gesture (the socket calls the handler the gesture reaches), and
+# polishing, which is off so that the score measures the app and not a model.
+#
+# A scenario is data, not a script:
+#   mode=live|overlay
+#   phrase=<what `say` speaks and the score is measured against>
+#   min_word_accuracy=<0..1, scripts/lib/word-accuracy.sh>
+#
+# It needs a harness bundle under its own bundle id
+# (`LOCALVOXTRAL_E2E_HARNESS=1 LOCALVOXTRAL_BUNDLE_ID=com.localvoxtral.e2e-harness
+# ./scripts/package_app.sh release`), an STT server on LV_E2E_REALTIME_ENDPOINT, an unlocked screen and
+# that bundle's Accessibility grant. It takes the keyboard focus for about half a
+# minute per scenario and says so out loud first (LV_E2E_ANNOUNCE=0 to mute).
+#
+# The speech service is shared, and under load it can fall seconds behind the
+# audio, which fails a correct app (#548). scripts/e2e/speech-service-probe.py
+# plays the same WAV to the service without the app and times the final
+# transcript. It runs once before the app starts, with the owner's app
+# already quit so that its own speech helper is not loaded beside the service
+# (#1832), and again after a scenario fails; a failure is NOT RUN only when the probe finds the service lagging
+# past what the app waits for (SERVICE_LAG_LIMIT_SECONDS). A healthy probe, or
+# one that measured nothing, leaves the failure a FAIL.
+#
+# Exit status: 0 every scenario passed, 1 a scenario failed, 3 the machine was
+# not in a state to run one (locked, no STT server, a lagging speech service),
+# 4 the app under test has no Accessibility grant. A caller that schedules this
+# can treat 3 as "skipped" and 1 as a regression. 4 is never a skip: the
+# grant does not come back by itself, so every later run would skip too.
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+APP_PATH="${1:-dist/localvoxtral.app}"
+[ "$#" -gt 0 ] && shift
+APP_PROCESS="localvoxtral"
+# The owner's app. The run quits and relaunches it but leaves its defaults
+# alone: owner-app-session.sh only restores a backup a dead lane left in them.
+BUNDLE_ID="com.localvoxtral.app"
+# The app under test has its own id (#1198), so its own defaults and its own
+# Accessibility row, which the owner's release never takes over.
+HARNESS_BUNDLE_ID="com.localvoxtral.e2e-harness"
+OWNER_APP_BUNDLE=""
+DRILL_LAUNCHED=0
+FAILED=0
+NOT_RUNNABLE=0
+NEEDS_OWNER=0
+CLEANED_UP=0
+HARNESS_DEFAULTS_WRITTEN=0
+ANNOUNCED=0
+WORK_DIR=""
+TARGET_OUTPUT_DIRS=()
+SUMMARY=()
+OSASCRIPT_TIMEOUT_SECONDS="${OSASCRIPT_TIMEOUT_SECONDS:-8}"
+OSASCRIPT_TIMEOUT_BIN=""
+
+REALTIME_ENDPOINT="${LV_E2E_REALTIME_ENDPOINT:-ws://127.0.0.1:8000/v1/realtime}"
+REALTIME_MODEL="${LV_E2E_REALTIME_MODEL:-T0mSIlver/Voxtral-Mini-4B-Realtime-2602-4bit-qhead}"
+CONTROL_SOCKET="${HOME}/Library/Application Support/localvoxtral/dogfood/control/control.sock"
+TARGET_BUNDLE_ID="com.localvoxtral.e2e-target"
+TARGET_MACOS="15.0" # Package.swift's platform floor
+SPEECH_PROBE="${LV_E2E_SPEECH_PROBE:-$SCRIPT_DIR/e2e/speech-service-probe.py}"
+# The check stops the session this long after the file drains, and the app
+# then waits at least TimingConstants.finalizationMinimumOpen for the final
+# transcript. A service further behind the speech than the sum can drop the
+# last words from a correct app. test-speech-service-probe.sh pins the 1.5.
+POST_DRAIN_SILENCE_SECONDS=2
+APP_FINALIZATION_MINIMUM_OPEN_SECONDS=1.5
+SERVICE_LAG_LIMIT_SECONDS="$(awk -v a="$POST_DRAIN_SILENCE_SECONDS" -v b="$APP_FINALIZATION_MINIMUM_OPEN_SECONDS" 'BEGIN { print a + b }')"
+
+if command -v timeout >/dev/null 2>&1; then
+  OSASCRIPT_TIMEOUT_BIN="$(command -v timeout)"
+fi
+
+record_pass() {
+  SUMMARY+=("PASS: $1")
+  printf 'PASS: %s\n' "$1"
+}
+
+record_fail() {
+  SUMMARY+=("FAIL: $1")
+  printf 'FAIL: %s\n' "$1" >&2
+  FAILED=1
+}
+
+# The machine, not the app: nothing was measured, so nothing regressed.
+record_not_runnable() {
+  SUMMARY+=("NOT RUN: $1")
+  printf 'NOT RUN: %s\n' "$1" >&2
+  NOT_RUNNABLE=1
+}
+
+# The machine needs the owner before any run can measure the app.
+record_needs_owner() {
+  SUMMARY+=("NOT RUN: $1")
+  printf 'NOT RUN: %s\n' "$1" >&2
+  NEEDS_OWNER=1
+}
+
+print_summary() {
+  printf '\nE2E dictation summary:\n'
+  if ((${#SUMMARY[@]} == 0)); then
+    printf 'FAIL: no checks ran.\n'
+    return
+  fi
+  local line
+  for line in "${SUMMARY[@]}"; do
+    printf '  %s\n' "$line"
+  done
+}
+
+finish() {
+  print_summary
+  if ((FAILED)); then exit 1; fi
+  if ((NEEDS_OWNER)); then exit 4; fi
+  if ((NOT_RUNNABLE)); then exit 3; fi
+  exit 0
+}
+
+# shellcheck source=scripts/lib/owner-app-session.sh
+source "${SCRIPT_DIR}/lib/owner-app-session.sh"
+
+# A runner with nobody at it (LOCALVOXTRAL_DEDICATED_GUI=1, the Mac Mini)
+# neither announces nor pauses before taking the keyboard.
+DEDICATED_GUI="${LOCALVOXTRAL_DEDICATED_GUI:-0}"
+
+announce() {
+  [[ "${LV_E2E_ANNOUNCE:-1}" == "1" && "$DEDICATED_GUI" != 1 ]] || return 0
+  command -v say >/dev/null 2>&1 || return 0
+  say "$1" >/dev/null 2>&1 || true
+}
+
+stop_target() {
+  # Each target writes its pid at launch (`open` does not hand one back). It
+  # is killed only while that pid still runs the target's executable, so a
+  # pid reused since is left alone. WORK_DIR is under $TMPDIR, a symlink on
+  # macOS (/var -> /private/var), and ps may name either form.
+  local out pid comm resolved
+  local executable="$WORK_DIR/e2e-target.app/Contents/MacOS/e2e-target"
+  resolved="$(cd "$WORK_DIR" 2>/dev/null && pwd -P)/e2e-target.app/Contents/MacOS/e2e-target"
+  for out in ${TARGET_OUTPUT_DIRS[@]+"${TARGET_OUTPUT_DIRS[@]}"}; do
+    pid="$(cat "$out/pid" 2>/dev/null)"
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    comm="$(ps -p "$pid" -o comm= 2>/dev/null)"
+    [[ "$comm" == "$executable" || "$comm" == "$resolved" ]] || continue
+    kill "$pid" >/dev/null 2>&1 || true
+  done
+  TARGET_OUTPUT_DIRS=()
+}
+
+cleanup() {
+  if ((CLEANED_UP)); then
+    return
+  fi
+  CLEANED_UP=1
+  # A signal mid-cleanup would re-enter it as a no-op and exit, leaving the
+  # owner's app stopped and the lane's defaults installed. Every step below is
+  # bounded, so finish it.
+  trap '' INT TERM HUP
+
+  stop_target
+  # Only a run that launched, or cleared the slot to launch, owns whatever
+  # localvoxtral is running now. Before that point it is the owner's app.
+  if ((DRILL_LAUNCHED)) || [[ -n "$OWNER_APP_BUNDLE" ]]; then
+    quit_app
+  fi
+  if ((HARNESS_DEFAULTS_WRITTEN)); then
+    defaults delete "$HARNESS_BUNDLE_ID" >/dev/null 2>&1 || true
+  fi
+  relaunch_owner_app
+  [[ -n "$WORK_DIR" ]] && rm -rf "$WORK_DIR"
+  if ((ANNOUNCED)); then
+    announce "localvoxtral end to end check finished."
+  fi
+}
+
+signal_cleanup() {
+  local status="$1"
+  trap - EXIT INT TERM HUP
+  cleanup
+  exit "$status"
+}
+
+trap cleanup EXIT
+trap 'signal_cleanup 130' INT
+trap 'signal_cleanup 143' TERM
+trap 'signal_cleanup 129' HUP
+
+# --- scenario files ---------------------------------------------------------
+
+scenario_value() {
+  # scenario_value <file> <key>: the text after the first `key=`, verbatim.
+  sed -n "s/^$2=//p" "$1" | head -n 1
+}
+
+# --- speech service lag -----------------------------------------------------
+
+probe_speech_service() {
+  # probe_speech_service <label> <wav>: 0 within the limit, 1 lagging past
+  # it, 2 nothing measured. Prints the probe's line either way.
+  local label="$1" wav="$2" line lag
+  if ! line="$(python3 "$SPEECH_PROBE" "$REALTIME_ENDPOINT" "$REALTIME_MODEL" "$wav" "$POST_DRAIN_SILENCE_SECONDS" 2>&1)"; then
+    printf '%s: speech service probe measured nothing: %s\n' "$label" "$line" >&2
+    return 2
+  fi
+  printf '%s: speech service probe: %s\n' "$label" "$line"
+  lag="$(sed -n 's/^lag=\([-0-9.]*\) .*/\1/p' <<<"$line")"
+  PROBE_LAG="$lag"
+  if [[ -z "$lag" ]]; then
+    return 2
+  fi
+  if awk -v l="$lag" -v m="$SERVICE_LAG_LIMIT_SECONDS" 'BEGIN { exit !(l + 0 > m + 0) }'; then
+    return 1
+  fi
+  return 0
+}
+
+fail_unless_service_lagged() {
+  # fail_unless_service_lagged <name> <wav> <reason>: a scenario failed after
+  # the app dictated. The service's lag right after decides whose failure it is.
+  local name="$1" wav="$2" reason="$3" status=0
+  PROBE_LAG=""
+  probe_speech_service "$name" "$wav" || status=$?
+  if ((status == 1)); then
+    record_not_runnable "$reason The speech service finished the same audio ${PROBE_LAG} s after the speech ended, past the ${SERVICE_LAG_LIMIT_SECONDS} s the app waits, so this measured the service, not the app."
+  else
+    record_fail "$reason"
+  fi
+}
+
+# --- control socket ---------------------------------------------------------
+
+control() {
+  # One line in, one line of JSON out, then the server closes.
+  printf '%s\n' "$1" | nc -U -w 10 "$CONTROL_SOCKET" 2>/dev/null
+}
+
+json_has() {
+  # json_has <json> <"key":value>, against the socket's space-free rendering.
+  [[ "$1" == *"$2"* ]]
+}
+
+# --- app log ----------------------------------------------------------------
+
+app_log_since() {
+  log show --start "$1" --style compact \
+    --predicate 'subsystem == "com.localvoxtral" AND process == "localvoxtral"' 2>/dev/null
+}
+
+wait_for_audio_drained() {
+  # wait_for_audio_drained <log-start> <timeout-seconds>
+  local start="$1" deadline=$((SECONDS + $2)) lines
+  if ! app_log_since "$start" >/dev/null; then
+    return 2
+  fi
+  while ((SECONDS < deadline)); do
+    # Captured, not piped into `grep -q`: grep leaving at the first match
+    # SIGPIPEs `log show`, and under pipefail that reads as "no match".
+    lines="$(app_log_since "$start")"
+    if grep -q "dogfood audio file drained" <<<"$lines"; then
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+# --- target -----------------------------------------------------------------
+
+build_target_app() {
+  local bundle="$WORK_DIR/e2e-target.app"
+  mkdir -p "$bundle/Contents/MacOS" || return 1
+  cat >"$bundle/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key><string>$TARGET_BUNDLE_ID</string>
+  <key>CFBundleName</key><string>e2e-target</string>
+  <key>CFBundleExecutable</key><string>e2e-target</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleVersion</key><string>1</string>
+  <key>LSMinimumSystemVersion</key><string>$TARGET_MACOS</string>
+  <key>NSHighResolutionCapable</key><true/>
+</dict>
+</plist>
+PLIST
+  # Without -target, swiftc builds for the SDK's macOS, and an SDK newer than
+  # the running system makes `open` refuse the app with error -10825.
+  swiftc -O -target "$(uname -m)-apple-macos$TARGET_MACOS" \
+    -o "$bundle/Contents/MacOS/e2e-target" "$SCRIPT_DIR/e2e/target-app.swift"
+}
+
+start_target() {
+  # start_target <output-dir>: a focused, empty text view, or failure.
+  local out="$1" deadline
+  mkdir -p "$out" || return 1
+  rm -f "$out/text" "$out/state" "$out/pid"
+  TARGET_OUTPUT_DIRS+=("$out")
+  open -n "$WORK_DIR/e2e-target.app" --args "$out" || return 1
+  deadline=$((SECONDS + 15))
+  while ((SECONDS < deadline)); do
+    if [[ -f "$out/state" ]] && [[ "$(cat "$out/state")" == "active=1 key=1 focused=1" ]]; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  printf 'target state: %s\n' "$(cat "$out/state" 2>/dev/null || echo missing)" >&2
+  return 1
+}
+
+wait_for_settled_text() {
+  # wait_for_settled_text <file> <timeout>: non-empty and unchanged for 3 s.
+  local file="$1" deadline=$((SECONDS + $2)) last="" current stable_since=0
+  while ((SECONDS < deadline)); do
+    current="$(cat "$file" 2>/dev/null || true)"
+    if [[ -n "$current" && "$current" == "$last" ]]; then
+      ((stable_since == 0)) && stable_since=$SECONDS
+      if ((SECONDS - stable_since >= 3)); then
+        return 0
+      fi
+    else
+      stable_since=0
+      last="$current"
+    fi
+    sleep 0.5
+  done
+  [[ -n "$last" ]]
+}
+
+# --- one scenario -----------------------------------------------------------
+
+launch_app_under_test() {
+  local deadline app_pid=""
+  rm -f "$CONTROL_SOCKET"
+  DRILL_LAUNCHED=1
+  lv_open -n "$APP_PATH" || return 1
+  deadline=$((SECONDS + 20))
+  while ((SECONDS < deadline)); do
+    app_pid="$(pgrep -xn "$APP_PROCESS" 2>/dev/null || true)"
+    if [[ -n "$app_pid" && -S "$CONTROL_SOCKET" ]]; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  return 1
+}
+
+run_scenario() {
+  local file="$1" name mode phrase minimum wav out wav_bytes seconds log_start
+  local reply drained text score
+  name="$(basename "$file" .scenario)"
+  mode="$(scenario_value "$file" mode)"
+  phrase="$(scenario_value "$file" phrase)"
+  minimum="$(scenario_value "$file" min_word_accuracy)"
+  if [[ "$mode" != "live" && "$mode" != "overlay" ]] || [[ -z "$phrase" || -z "$minimum" ]]; then
+    record_fail "$name: scenario needs mode=live|overlay, phrase= and min_word_accuracy=."
+    return
+  fi
+
+  wav="$WORK_DIR/$name.wav"
+  out="$WORK_DIR/$name"
+  if ! say -o "$wav" --file-format=WAVE --data-format=LEI16@16000 "$phrase"; then
+    record_not_runnable "$name: system TTS (say) could not write the WAV."
+    return
+  fi
+  wav_bytes="$(wc -c <"$wav" | tr -d ' ')"
+  seconds=$((wav_bytes / 32000 + 1))
+
+  export LOCALVOXTRAL_DOGFOOD_AUDIO_FILE="$wav"
+  if ! launch_app_under_test; then
+    record_fail "$name: the app did not start and open its control socket within 20 s."
+    return
+  fi
+  if ! start_target "$out"; then
+    record_not_runnable "$name: the target window did not take the keyboard focus."
+    return
+  fi
+
+  log_start="$(date '+%Y-%m-%d %H:%M:%S')"
+  reply="$(control "session start $mode")"
+  printf '%s: session start -> %s\n' "$name" "$reply"
+  if json_has "$reply" '"accessibilityTrusted":false'; then
+    record_needs_owner "$name: the app under test has no Accessibility grant. Allow the localvoxtral-dev-signed localvoxtral in System Settings > Privacy & Security > Accessibility (Device Control and Data Access on macOS 27); toggle it off and on if it is listed."
+    return
+  fi
+  if json_has "$reply" '"secureInputActive":true'; then
+    record_not_runnable "$name: Secure Keyboard Entry is held by another app."
+    return
+  fi
+  if ! json_has "$reply" '"started":true'; then
+    record_fail "$name: the dictation did not start."
+    return
+  fi
+
+  wait_for_audio_drained "$log_start" $((seconds + 45))
+  drained=$?
+  if ((drained == 2)); then
+    printf 'WARNING: %s: the unified log is not readable here; waiting %s s instead.\n' "$name" $((seconds + 15)) >&2
+    sleep $((seconds + 15))
+  elif ((drained == 1)); then
+    record_fail "$name: the audio file never finished playing, so capture never started."
+    app_log_since "$log_start" | tail -n 60 >&2
+    control "session stop" >/dev/null
+    return
+  fi
+  # The source is sending silence now. Two seconds of it lets the server close
+  # the last words before the stop finalizes.
+  sleep "$POST_DRAIN_SILENCE_SECONDS"
+
+  reply="$(control "session stop")"
+  printf '%s: session stop -> %s\n' "$name" "$reply"
+
+  if ! wait_for_settled_text "$out/text" 45; then
+    app_log_since "$log_start" | tail -n 60 >&2
+    fail_unless_service_lagged "$name" "$wav" "$name: no text reached the target within 45 s of the stop."
+    return
+  fi
+  if [[ "$(cat "$out/state" 2>/dev/null)" != "active=1 key=1 focused=1" ]]; then
+    record_not_runnable "$name: the target lost the keyboard focus during the dictation."
+    return
+  fi
+
+  text="$(cat "$out/text")"
+  score="$("$SCRIPT_DIR/lib/word-accuracy.sh" "$phrase" "$text")"
+  printf '%s: spoken:   %s\n%s: inserted: %s\n' "$name" "$phrase" "$name" "$text"
+  if awk -v s="$score" -v m="$minimum" 'BEGIN { exit !(s + 0 >= m + 0) }'; then
+    record_pass "$name: word accuracy $score (minimum $minimum)."
+  else
+    app_log_since "$log_start" | tail -n 60 >&2
+    fail_unless_service_lagged "$name" "$wav" "$name: word accuracy $score is under the minimum $minimum."
+  fi
+}
+
+end_scenario() {
+  stop_target
+  quit_app
+  unset LOCALVOXTRAL_DOGFOOD_AUDIO_FILE
+}
+
+# --- preconditions ----------------------------------------------------------
+
+if [[ "$(uname)" != "Darwin" ]]; then
+  record_fail "e2e-dictation.sh drives the packaged macOS app and must run on macOS."
+  finish
+fi
+
+if ! recover_previous_defaults_backup; then
+  finish
+fi
+
+if [[ ! -d "$APP_PATH" ]]; then
+  record_fail "App bundle not found: $APP_PATH (build with LOCALVOXTRAL_E2E_HARNESS=1 ./scripts/package_app.sh release)."
+  finish
+fi
+
+# Test seam (test-e2e-dictation-preconditions.sh): no PlistBuddy off macOS.
+PLISTBUDDY="${LV_E2E_PLISTBUDDY:-/usr/libexec/PlistBuddy}"
+if [[ "$("$PLISTBUDDY" -c 'Print :LVXE2EHarness' "$APP_PATH/Contents/Info.plist" 2>/dev/null)" != "true" ]]; then
+  record_fail "$APP_PATH is not a harness build; only a harness build can dictate from a file."
+  finish
+fi
+app_bundle_id="$("$PLISTBUDDY" -c 'Print :CFBundleIdentifier' "$APP_PATH/Contents/Info.plist" 2>/dev/null)"
+if [[ "$app_bundle_id" != "$HARNESS_BUNDLE_ID" ]]; then
+  record_fail "$APP_PATH has bundle id '$app_bundle_id', not $HARNESS_BUNDLE_ID; package it with LOCALVOXTRAL_BUNDLE_ID=$HARNESS_BUNDLE_ID."
+  finish
+fi
+
+SCENARIOS=("$@")
+if ((${#SCENARIOS[@]} == 0)); then
+  SCENARIOS=("$SCRIPT_DIR"/e2e/scenarios/*.scenario)
+fi
+for scenario in "${SCENARIOS[@]}"; do
+  if [[ ! -f "$scenario" ]]; then
+    record_fail "Scenario file not found: $scenario"
+    finish
+  fi
+done
+
+lock_state="$("$SCRIPT_DIR/ci/screen-lock-state.sh" 2>/dev/null || echo error)"
+if [[ "$lock_state" != "unlocked" ]]; then
+  record_not_runnable "The screen is not unlocked (probe: $lock_state); a locked session holds Secure Keyboard Entry."
+  finish
+fi
+
+if [[ "$REALTIME_ENDPOINT" == "ws://127.0.0.1:8000/"* && -d /Users/Shared/localvoxtral/run ]]; then
+  "$SCRIPT_DIR/mac/lv-test-servers.sh" ensure speechd || true
+fi
+endpoint_authority="${REALTIME_ENDPOINT#*://}"
+endpoint_authority="${endpoint_authority%%/*}"
+endpoint_host="${endpoint_authority%%:*}"
+if [[ "$endpoint_authority" == *:* ]]; then
+  endpoint_port="${endpoint_authority##*:}"
+elif [[ "$REALTIME_ENDPOINT" == wss://* ]]; then
+  endpoint_port=443
+else
+  endpoint_port=80
+fi
+if ! nc -z -w 3 "$endpoint_host" "$endpoint_port" >/dev/null 2>&1; then
+  record_not_runnable "No STT server answers on $REALTIME_ENDPOINT."
+  finish
+fi
+
+WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/lv-e2e-dictation.XXXXXX")"
+# The app under test runs as the owner, with the owner's preferences; its
+# History, recordings and other stores go here instead of the owner's (#985).
+# lv_open hands this to the app.
+if ! lv_isolate_data lv-e2e-data; then
+  record_not_runnable "Could not make a data folder for the app under test; not launching it on the owner's data."
+  finish
+fi
+if ! build_target_app; then
+  record_not_runnable "Could not compile the target app (scripts/e2e/target-app.swift)."
+  finish
+fi
+record_pass "Target app compiled."
+
+# One localvoxtral at a time: the control socket, the hook socket and the
+# dictation key are per user, not per bundle id. Quit before the probe: the
+# owner's app on the managed backend keeps a second speech model loaded, which
+# slowed the service past the limit on otherwise idle runs (#1832). Cleanup
+# relaunches it on every exit, NOT RUN included.
+quit_owner_app
+if pgrep -x "$APP_PROCESS" >/dev/null 2>&1; then
+  record_fail "Existing app instance did not quit; cannot launch a fresh instance."
+  finish
+fi
+if [[ -n "$OWNER_APP_BUNDLE" ]]; then
+  probe_label="before the app, the owner's app quit"
+else
+  probe_label="before the app, no owner app running"
+fi
+
+# Before the app starts: a service already behind would fail every scenario,
+# and nothing the app does can have caused it yet.
+probe_wav="$WORK_DIR/speech-probe.wav"
+if ! say -o "$probe_wav" --file-format=WAVE --data-format=LEI16@16000 "$(scenario_value "${SCENARIOS[0]}" phrase)"; then
+  record_not_runnable "System TTS (say) could not write the speech probe's WAV."
+  finish
+fi
+PROBE_LAG=""
+probe_speech_service "$probe_label" "$probe_wav"
+case $? in
+  1)
+    record_not_runnable "The speech service on $REALTIME_ENDPOINT finished a clip ${PROBE_LAG} s after the speech ended, past the ${SERVICE_LAG_LIMIT_SECONDS} s the app waits; it is too loaded to measure the app."
+    finish
+    ;;
+  2)
+    record_not_runnable "The speech service on $REALTIME_ENDPOINT did not transcribe the probe clip."
+    finish
+    ;;
+esac
+
+announce "localvoxtral end to end check starting. It takes the keyboard for about a minute."
+ANNOUNCED=1
+[[ "$DEDICATED_GUI" == 1 ]] || sleep 3
+
+# The harness starts from nothing but these. External dictation so the app
+# talks to the STT test service and spawns no helper of its own; polishing off
+# so the inserted text is the transcript.
+HARNESS_DEFAULTS_WRITTEN=1
+defaults delete "$HARNESS_BUNDLE_ID" >/dev/null 2>&1 || true
+if ! defaults write "$HARNESS_BUNDLE_ID" settings.dictation_backend_mode -string external_url \
+  || ! defaults write "$HARNESS_BUNDLE_ID" settings.polishing_backend_mode -string external_url \
+  || ! defaults write "$HARNESS_BUNDLE_ID" settings.realtime_provider -string realtime_api \
+  || ! defaults write "$HARNESS_BUNDLE_ID" settings.realtime_api_endpoint_url -string "$REALTIME_ENDPOINT" \
+  || ! defaults write "$HARNESS_BUNDLE_ID" settings.realtime_api_model_name -string "$REALTIME_MODEL" \
+  || ! defaults write "$HARNESS_BUNDLE_ID" settings.llm_polishing_enabled -bool false \
+  || ! defaults write "$HARNESS_BUNDLE_ID" settings.onboarding_completed -bool true \
+  || ! defaults write "$HARNESS_BUNDLE_ID" debug.dogfood_control_socket_enabled -bool true; then
+  record_fail "Could not write the harness's defaults."
+  finish
+fi
+record_pass "Harness defaults written; external STT, polishing off, control socket on."
+
+for scenario in "${SCENARIOS[@]}"; do
+  run_scenario "$scenario"
+  end_scenario
+done
+
+finish

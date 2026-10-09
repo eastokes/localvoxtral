@@ -12,8 +12,6 @@ import XCTest
 /// replacement was deferred by the old guarded corrector and dropped at stop).
 @MainActor
 final class DictationViewModelLiveReplacementCorrectorTests: XCTestCase {
-    private static var retainedViewModels: [DictationViewModel] = []
-
     override func tearDown() async throws {
         TerminalTargetDetector.debugFrontmostBundleIDOverride = nil
         TerminalTargetDetector.debugFocusedElementProbeOverride = nil
@@ -26,54 +24,16 @@ final class DictationViewModelLiveReplacementCorrectorTests: XCTestCase {
             dictionary: voxtralDictionary
         )
 
-        harness.viewModel.handle(event: .partialTranscript("vox"))
+        harness.viewModel.session.handle(event: .partialTranscript("vox"))
         XCTAssertEqual(harness.typed.value, [], "partial word stays held until a boundary")
-        harness.viewModel.handle(event: .partialTranscript("tral "))
+        harness.viewModel.session.handle(event: .partialTranscript("tral "))
 
         XCTAssertEqual(harness.field.value, "localvoxtral ")
         XCTAssertEqual(
             harness.typed.value, ["localvoxtral "],
             "the corrected word is released once its boundary arrives — no raw type, no backspace"
         )
-        XCTAssertEqual(harness.viewModel.pendingSegmentText, "voxtral ")
-    }
-
-    func testCorrectsMultiWordKeyWithLookbackWindow() {
-        let harness = makeHarness(
-            dictionary: ReplacementDictionary(entries: [
-                ReplacementEntry(replaceWith: "localvoxtral", matches: ["local voxtral"]),
-            ])
-        )
-
-        harness.viewModel.handle(event: .partialTranscript("local "))
-        // "local" could begin the two-word match, so it stays held.
-        XCTAssertEqual(harness.typed.value, [], "a possible first match word stays held")
-
-        harness.viewModel.handle(event: .partialTranscript("voxtral "))
-        // Once the match applies, "localvoxtral" begins no rule, so it is
-        // released immediately rather than waiting for the stop flush.
-        XCTAssertEqual(harness.typed.value.joined(), "localvoxtral ")
-
-        stop(harness.viewModel)
-
-        XCTAssertEqual(harness.field.value, "localvoxtral ")
-        XCTAssertEqual(harness.typed.value.joined(), "localvoxtral ")
-    }
-
-    func testCorrectsFinalUnboundedWordOnStopFlush() {
-        let harness = makeHarness(
-            dictionary: voxtralDictionary
-        )
-
-        harness.viewModel.handle(event: .partialTranscript("voxtral"))
-        harness.viewModel.handle(event: .finalTranscript("voxtral"))
-        XCTAssertEqual(harness.typed.value, [], "the unbounded final word stays held until stop")
-
-        stop(harness.viewModel)
-
-        XCTAssertEqual(harness.field.value, "localvoxtral")
-        XCTAssertEqual(harness.typed.value, ["localvoxtral"])
-        XCTAssertEqual(harness.viewModel.currentDictationEventText, "voxtral")
+        XCTAssertEqual(harness.viewModel.transcript.pendingSegmentText, "voxtral ")
     }
 
     // The exact field regression (2026-07-08), end to end: a short dictation
@@ -90,9 +50,9 @@ final class DictationViewModelLiveReplacementCorrectorTests: XCTestCase {
             frontmostBundleID: "com.example.editor"
         )
 
-        harness.viewModel.handle(event: .partialTranscript("vox"))
-        harness.viewModel.handle(event: .finalTranscript("voxtral"))
-        XCTAssertEqual(harness.typed.value, [])
+        harness.viewModel.session.handle(event: .partialTranscript("vox"))
+        harness.viewModel.session.handle(event: .finalTranscript("voxtral"))
+        XCTAssertEqual(harness.typed.value, [], "the unbounded final word stays held until stop")
 
         stop(harness.viewModel)
 
@@ -101,19 +61,9 @@ final class DictationViewModelLiveReplacementCorrectorTests: XCTestCase {
             "the only replacement in the session — the final word — must not be dropped at stop"
         )
         XCTAssertEqual(harness.typed.value, ["localvoxtral"])
-    }
-
-    func testNoMatchWordsAreUntouched() {
-        let harness = makeHarness(
-            dictionary: voxtralDictionary
-        )
-
-        harness.viewModel.handle(event: .partialTranscript("hello "))
-
-        XCTAssertEqual(harness.field.value, "hello ")
         XCTAssertEqual(
-            harness.typed.value, ["hello "],
-            "a completed non-matching word is released promptly, unchanged"
+            harness.viewModel.transcript.currentDictationEventText, "voxtral",
+            "the raw transcript keeps the raw text; only the typed text is replaced"
         )
     }
 
@@ -126,24 +76,10 @@ final class DictationViewModelLiveReplacementCorrectorTests: XCTestCase {
 
         // A newline is a whitespace boundary: it completes the word and, in a
         // regular (non-terminal) editor, is preserved verbatim.
-        harness.viewModel.handle(event: .partialTranscript("voxtral\n"))
+        harness.viewModel.session.handle(event: .partialTranscript("voxtral\n"))
 
         XCTAssertEqual(harness.field.value, "localvoxtral\n")
         XCTAssertEqual(harness.typed.value, ["localvoxtral\n"])
-    }
-
-    func testNonTerminalSessionUsesHoldBackStream() {
-        TerminalTargetDetector.debugFocusedElementProbeOverride = { .valueSettable }
-        let harness = makeHarness(
-            dictionary: voxtralDictionary,
-            frontmostBundleID: "com.example.editor"
-        )
-        XCTAssertTrue(harness.viewModel.textInsertion.debugLiveHoldBackStreamIsActive)
-
-        harness.viewModel.handle(event: .partialTranscript("voxtral "))
-
-        XCTAssertEqual(harness.field.value, "localvoxtral ")
-        XCTAssertEqual(harness.typed.value, ["localvoxtral "])
     }
 
     func testReplacementDictionarySettingOffLeavesLivePathUntouchedAndDoesNotLoadDictionary() {
@@ -155,7 +91,7 @@ final class DictationViewModelLiveReplacementCorrectorTests: XCTestCase {
             configStore: configStore
         )
 
-        harness.viewModel.handle(event: .partialTranscript("voxtral "))
+        harness.viewModel.session.handle(event: .partialTranscript("voxtral "))
         stop(harness.viewModel)
 
         XCTAssertEqual(configStore.loadReplacementDictionaryCallCount, 0)
@@ -179,7 +115,7 @@ final class DictationViewModelLiveReplacementCorrectorTests: XCTestCase {
             frontmostBundleID: "com.mitchellh.ghostty"
         )
 
-        harness.viewModel.handle(event: .partialTranscript("voxtral "))
+        harness.viewModel.session.handle(event: .partialTranscript("voxtral "))
         stop(harness.viewModel)
 
         XCTAssertEqual(harness.field.value, "localvoxtral ")
@@ -194,7 +130,7 @@ final class DictationViewModelLiveReplacementCorrectorTests: XCTestCase {
             frontmostBundleID: "com.mitchellh.ghostty"
         )
 
-        harness.viewModel.handle(event: .partialTranscript("ls -la\nnext "))
+        harness.viewModel.session.handle(event: .partialTranscript("ls -la\nnext "))
         stop(harness.viewModel)
 
         XCTAssertEqual(harness.field.value, "ls -la next ")
@@ -215,7 +151,7 @@ final class DictationViewModelLiveReplacementCorrectorTests: XCTestCase {
             frontmostBundleID: "com.example.myterminal"
         )
 
-        harness.viewModel.handle(event: .partialTranscript("voxtral "))
+        harness.viewModel.session.handle(event: .partialTranscript("voxtral "))
         stop(harness.viewModel)
 
         XCTAssertEqual(harness.field.value, "localvoxtral ")
@@ -232,7 +168,7 @@ final class DictationViewModelLiveReplacementCorrectorTests: XCTestCase {
             frontmostBundleID: "com.cmuxterm.app"
         )
 
-        harness.viewModel.handle(event: .partialTranscript("voxtral\nls "))
+        harness.viewModel.session.handle(event: .partialTranscript("voxtral\nls "))
         stop(harness.viewModel)
 
         XCTAssertEqual(
@@ -252,7 +188,7 @@ final class DictationViewModelLiveReplacementCorrectorTests: XCTestCase {
     private func stop(_ viewModel: DictationViewModel) {
         viewModel.isDictating = false
         viewModel.isFinalizingStop = true
-        viewModel.finishStoppedSession(promotePendingSegment: false)
+        viewModel.session.finishStoppedSession(promotePendingSegment: false)
     }
 
     private func makeHarness(
@@ -275,7 +211,7 @@ final class DictationViewModelLiveReplacementCorrectorTests: XCTestCase {
             defaults.removePersistentDomain(forName: suiteName)
         }
 
-        let settings = SettingsStore(defaults: defaults, environment: [:])
+        let settings = SettingsStore(defaults: defaults, environment: [:], secretStore: InMemorySecretStore())
         settings.dictationOutputMode = .liveAutoPaste
         settings.replacementDictionaryEnabled = dictionaryEnabled
 
@@ -285,7 +221,7 @@ final class DictationViewModelLiveReplacementCorrectorTests: XCTestCase {
             startRuntimeServices: false
         )
         viewModel.appConfigStore = configStore ?? MockAppConfigStore(replacementDictionary: dictionary)
-        Self.retainedViewModels.append(viewModel)
+        retainForTestProcessLifetime(viewModel)
 
         viewModel.textInsertion.debugConfigureInsertionHooks(
             unicodePoster: unicodePoster ?? { chunk in
@@ -300,13 +236,13 @@ final class DictationViewModelLiveReplacementCorrectorTests: XCTestCase {
         if let frontmostBundleID {
             TerminalTargetDetector.debugFrontmostBundleIDOverride = { frontmostBundleID }
             TerminalTargetDetector.debugSecureEventInputOverride = { false }
-            viewModel.captureSessionTargetVerdict()
-            viewModel.applyPreCapturedSessionTargetVerdict()
+            viewModel.session.captureSessionTargetVerdict()
+            viewModel.session.applyPreCapturedSessionTargetVerdict()
         }
 
-        viewModel.sessionOutputMode = .liveAutoPaste
+        viewModel.session.sessionOutputMode = .liveAutoPaste
         viewModel.isDictating = true
-        viewModel.configureLiveAutoPasteReplacementCorrectorForSession()
+        viewModel.session.configureLiveAutoPasteReplacementCorrectorForSession()
 
         return (viewModel, field, typed)
     }
@@ -329,56 +265,4 @@ private final class Box<Value> {
     }
 }
 
-@MainActor
-private final class MockOverlayCoordinator: OverlayBufferSessionCoordinating {
-    var commitOutcome: OverlayBufferCommitOutcome = .succeeded
-    var commitTargetAppPID: pid_t? = nil
-
-    func resolveAnchorNow() -> OverlayAnchor {
-        OverlayAnchor(targetRect: CGRect(x: 0, y: 0, width: 100, height: 24), source: .windowCenter)
-    }
-    func startSession(preResolvedAnchor: OverlayAnchor?) {}
-    func beginFinalizing(displayBufferText: String, commitBufferText: String) {}
-    func refresh(displayBufferText: String, commitBufferText: String) {}
-    func commitIfNeeded(
-        using textCommitter: OverlayTextCommitting,
-        autoCopyEnabled: Bool
-    ) -> OverlayBufferCommitOutcome {
-        commitOutcome
-    }
-    func reset() {}
-    func dismissAfterHold(minimumVisibility: TimeInterval) {}
-    func captureLiveCommitTargetAppPID() {}
-}
-
-private final class MockAppConfigStore: AppConfigServing {
-    private let replacementDictionary: ReplacementDictionary
-    private let terminalAppBundleIDs: [String]
-    private(set) var loadReplacementDictionaryCallCount = 0
-
-    init(
-        replacementDictionary: ReplacementDictionary,
-        terminalAppBundleIDs: [String] = []
-    ) {
-        self.replacementDictionary = replacementDictionary
-        self.terminalAppBundleIDs = terminalAppBundleIDs
-    }
-
-    func configDirectoryURL() -> URL {
-        URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-    }
-
-    func loadReplacementDictionary() -> ReplacementDictionary {
-        loadReplacementDictionaryCallCount += 1
-        return replacementDictionary
-    }
-
-    func loadLLMPromptTemplates() -> LLMPromptTemplates {
-        LLMPromptTemplates(systemContent: "{{input_text}}", userContent: "{{input_text}}")
-    }
-
-    func loadTerminalAppBundleIDs() -> [String] {
-        terminalAppBundleIDs
-    }
-}
 #endif

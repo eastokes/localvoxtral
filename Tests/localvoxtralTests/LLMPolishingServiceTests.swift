@@ -1,4 +1,6 @@
 import Foundation
+import localvoxtralTestSupport
+import Synchronization
 import XCTest
 @testable import localvoxtral
 
@@ -9,25 +11,83 @@ final class LLMPolishingServiceTests: XCTestCase {
         userPrompts: ["first", "second"]
     )
 
-    /// The polish request timeout must accommodate the managed worst case: a
-    /// 4B model with an invalidated polishd prefix cache re-prefills ~2.3k
-    /// tokens and took 23.6 s on a real request — the previous 15 s timeout
-    /// abandoned it and the user lost the polish (field, 2026-07-11). Polish
-    /// is async behind the overlay, so slow beats discarded. Pinned through
-    /// the request-construction seam — no networking, no wall-clock.
-    func testPolishRequestTimeoutAccommodatesManagedWorstCase() throws {
-        XCTAssertEqual(LLMPolishingService.requestTimeoutInterval, 40)
-
+    /// #1688: a server that answers 200 and then keeps the body open is cut
+    /// off at the request's whole budget, so the stop commit falls back to
+    /// the raw text instead of waiting on the session's 7-day timeout. The
+    /// budget is an hour, so URLSession's idle timer cannot be what ends it.
+    func testAResponseThatNeverFinishesTimesOutAtItsBudget() async throws {
+        let previous = StubHTTPProtocol.reply.withLock { $0 }
+        StubHTTPProtocol.reply.withLock { $0 = .stalls }
+        defer { StubHTTPProtocol.reply.withLock { $0 = previous } }
+        let clock = ManualSessionClock()
+        let service = LLMPolishingService(session: StubHTTPProtocol.session(), sleep: clock.clock.sleep)
         let configuration = LLMPolishingConfiguration(
-            endpointURL: URL(string: "http://127.0.0.1:8472/v1/chat/completions")!,
+            endpointURL: URL(string: "http://\(StubHTTPProtocol.host)/v1/chat/completions")!,
             apiKey: "",
             model: "model"
         )
-        let urlRequest = try LLMPolishingService.makeURLRequest(
-            request: request,
-            configuration: configuration
+        let request = LLMPolishingRequest(
+            inputText: "hello", systemPrompt: "system", userPrompts: ["first"], timeoutSeconds: 3_600)
+        let finished = BoundedWait()
+        let polishing = Task {
+            defer { finished.resolve() }
+            return try await service.polish(request: request, configuration: configuration)
+        }
+
+        await clock.waitForSleepers(1)
+        clock.advance(by: 3_599)
+        XCTAssertEqual(clock.pendingSleepers, 1, "not before its budget")
+        clock.advance(by: 1)
+
+        let ended = await finished.value(failAfter: 10)
+        XCTAssertTrue(ended, "the request outlived its budget")
+        guard ended else { return polishing.cancel() }
+        do {
+            _ = try await polishing.value
+            XCTFail("a response that never finished was used")
+        } catch LLMPolishingError.timedOut(let seconds) {
+            XCTAssertEqual(seconds, 3_600)
+        }
+    }
+
+    /// An hour-long dictation used to get the same 40 s as a sentence and
+    /// always timed out (#318). The transcript's length reaches the URLRequest.
+    func testLongTranscriptGetsALongerTimeout() throws {
+        let long = LLMPolishingRequest(
+            inputText: String(repeating: "word ", count: 1_800),  // 9,000 characters
+            systemPrompt: "system",
+            userPrompts: ["first"]
         )
-        XCTAssertEqual(urlRequest.timeoutInterval, 40)
+        let urlRequest = try LLMPolishingService.makeURLRequest(
+            request: long,
+            configuration: LLMPolishingConfiguration(
+                endpointURL: URL(string: "http://127.0.0.1:8472/v1/chat/completions")!,
+                apiKey: "",
+                model: "model"
+            )
+        )
+        XCTAssertEqual(urlRequest.timeoutInterval, 152.5, accuracy: 1e-9)
+    }
+
+    /// Term suggestions set their own timeout; the transcript scaling must not
+    /// replace it.
+    func testExplicitTimeoutWinsOverScaling() throws {
+        let explicit = LLMPolishingRequest(
+            inputText: String(repeating: "word ", count: 1_800),
+            systemPrompt: "",
+            userPrompts: ["first"],
+            timeoutSeconds: 7
+        )
+        let urlRequest = try LLMPolishingService.makeURLRequest(
+            request: explicit,
+            configuration: LLMPolishingConfiguration(
+                endpointURL: URL(string: "https://api.mistral.ai/v1/chat/completions")!,
+                apiKey: "key",
+                model: "mistral-small-latest",
+                requestShape: .mistral
+            )
+        )
+        XCTAssertEqual(urlRequest.timeoutInterval, 7)
     }
 
     func testNilSamplingDefaultsKeepLegacyRequestBytesIdentical() throws {
@@ -305,40 +365,68 @@ final class LLMPolishingServiceTests: XCTestCase {
         XCTAssertEqual(normalized.scheme, "mailto")
     }
 
-    /// End-to-end proof that a base-URL configuration produces a request whose
-    /// URL targets `/v1/chat/completions` — the whole point of accepting a base
-    /// URL in Settings.
-    func testMakeURLRequestNormalizesBaseURLConfigurationToChatCompletions() throws {
-        let configuration = LLMPolishingConfiguration(
-            endpointURL: URL(string: "http://127.0.0.1:8080")!,
-            apiKey: "",
-            model: "model"
-        )
-        let urlRequest = try LLMPolishingService.makeURLRequest(
-            request: request,
-            configuration: configuration
-        )
-        XCTAssertEqual(
-            urlRequest.url?.absoluteString,
-            "http://127.0.0.1:8080/v1/chat/completions"
-        )
+    /// End-to-end proof that the configured endpoint reaches the wire through
+    /// `makeURLRequest`'s normalization: a base-URL configuration targets
+    /// `/v1/chat/completions` (the whole point of accepting a base URL in
+    /// Settings), and a full-URL configuration passes through byte-for-byte
+    /// (backward compatibility for everyone who already typed the full path).
+    func testMakeURLRequestNormalizesBaseURLAndPassesFullURLThrough() throws {
+        let cases: [(endpoint: String, expected: String)] = [
+            ("http://127.0.0.1:8080", "http://127.0.0.1:8080/v1/chat/completions"),
+            (
+                "https://api.openai.com/v1/chat/completions",
+                "https://api.openai.com/v1/chat/completions"
+            ),
+        ]
+
+        for testCase in cases {
+            let configuration = LLMPolishingConfiguration(
+                endpointURL: URL(string: testCase.endpoint)!,
+                apiKey: "",
+                model: "model"
+            )
+            let urlRequest = try LLMPolishingService.makeURLRequest(
+                request: request,
+                configuration: configuration
+            )
+            XCTAssertEqual(
+                urlRequest.url?.absoluteString,
+                testCase.expected,
+                "configured endpoint \(testCase.endpoint)"
+            )
+        }
     }
 
-    /// A full-URL configuration reaches the wire byte-for-byte unchanged
-    /// (backward compatibility for everyone who already typed the full path).
-    func testMakeURLRequestLeavesFullURLConfigurationUnchanged() throws {
-        let configuration = LLMPolishingConfiguration(
-            endpointURL: URL(string: "https://api.openai.com/v1/chat/completions")!,
-            apiKey: "",
-            model: "model"
-        )
-        let urlRequest = try LLMPolishingService.makeURLRequest(
+    /// The context gate approves the configured endpoint only (#1298): a 307
+    /// from a loopback polish server must not carry the transcript and its
+    /// context to another origin.
+    func testRedirectCannotForwardContextToUnpermittedOrigin() async throws {
+        final class Hits: Sendable {
+            let count = Mutex(0)
+        }
+        let hits = Hits()
+        let elsewhere = try FakeOpencodePromptRelay(status: { _ in
+            hits.count.withLock { $0 += 1 }
+            return 200
+        })
+        let target = "http://127.0.0.1:\(elsewhere.port)/v1/chat/completions"
+        let configured = try FakeOpencodePromptRelay(status: { _ in 307 }, location: { _ in target })
+        addTeardownBlock {
+            configured.stop()
+            elsewhere.stop()
+        }
+
+        _ = try? await LLMPolishingService().polish(
             request: request,
-            configuration: configuration
+            configuration: LLMPolishingConfiguration(
+                endpointURL: URL(string: "http://127.0.0.1:\(configured.port)/v1/chat/completions")!,
+                apiKey: "",
+                model: "model"
+            )
         )
-        XCTAssertEqual(
-            urlRequest.url?.absoluteString,
-            "https://api.openai.com/v1/chat/completions"
-        )
+
+        let reached = await configured.waitForCalls(1)
+        XCTAssertTrue(reached, "the configured endpoint got the request")
+        XCTAssertEqual(hits.count.withLock { $0 }, 0, "the redirect target got nothing")
     }
 }

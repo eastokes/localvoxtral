@@ -7,16 +7,18 @@ import Synchronization
 
 /// Loopback OpenAI-Realtime-compatible ASR server: a drop-in for the Python `voxmlx`
 /// process. Serves `GET /health` (the supervisor's readiness probe) and a WebSocket
-/// `/v1/realtime` on the same port, driving a `VoxtralRealtimeStreamSession` per connection.
+/// `/v1/realtime` on the same port, driving one `SpeechASRStreamingSession` per connection.
+/// Which engine backs that session (Voxtral, Nemotron) is `SpeechModelLoader`'s decision.
 ///
 /// All model/session access is confined to one serial queue — MLX inference is not
 /// concurrency-safe, and dictation uses one connection at a time anyway. The Network
 /// callbacks (also serialized per connection) only parse bytes and hand decoded messages to
 /// that queue in order.
 public final class RealtimeSpeechServer: @unchecked Sendable {
-    private let model: VoxtralRealtimeModel
+    private let engine: SpeechASREngine
     private let transcriptionDelayMs: Int?
     private let stepMilliseconds: Int
+    private let utteranceLimit: UtteranceLimit
     private let listener: NWListener
     private let netQueue = DispatchQueue(label: "localvoxtral.speechd.net")
     private let inferenceQueue = DispatchQueue(label: "localvoxtral.speechd.inference")
@@ -25,43 +27,49 @@ public final class RealtimeSpeechServer: @unchecked Sendable {
     /// `{ exit(1) }` so a dead port gets the process restarted (mirrors PolishHelper).
     public var onListenerFailure: (@Sendable (Error) -> Void)?
 
-    /// Load the Voxtral model and build a server ready to `start()`. Public entry point for the
-    /// executable target, which cannot see the (module-internal) model type. Sets the MLX GPU
+    /// Load the model and build a server ready to `start()`. Public entry point for the
+    /// executable target, which cannot see the (module-internal) model types. Sets the MLX GPU
     /// cache limit and loads from an HF id or a local directory.
     public static func load(
         modelID: String?,
         modelRevision: String?,
         modelDirectory: String?,
+        engine: SpeechASREngineKind? = nil,
         port: UInt16,
         transcriptionDelayMs: Int?,
         cacheLimitMB: Int,
-        stepMilliseconds: Int = 100
+        stepMilliseconds: Int = 80,
+        utteranceLimit: UtteranceLimit = UtteranceLimit()
     ) async throws -> RealtimeSpeechServer {
         Memory.cacheLimit = cacheLimitMB * 1024 * 1024
-        let model = try await SpeechModelLoader.load(
+        let engine = try await SpeechModelLoader.load(
             modelID: modelID,
             modelRevision: modelRevision,
-            modelDirectory: modelDirectory
+            modelDirectory: modelDirectory,
+            engine: engine
         )
         return try RealtimeSpeechServer(
-            model: model,
+            engine: engine,
             port: port,
             transcriptionDelayMs: transcriptionDelayMs,
-            stepMilliseconds: stepMilliseconds
+            stepMilliseconds: stepMilliseconds,
+            utteranceLimit: utteranceLimit
         )
     }
 
     public enum ServerError: Error { case noModelSpecified }
 
     init(
-        model: VoxtralRealtimeModel,
+        engine: SpeechASREngine,
         port: UInt16,
         transcriptionDelayMs: Int?,
-        stepMilliseconds: Int
+        stepMilliseconds: Int,
+        utteranceLimit: UtteranceLimit
     ) throws {
-        self.model = model
+        self.engine = engine
         self.transcriptionDelayMs = transcriptionDelayMs
         self.stepMilliseconds = stepMilliseconds
+        self.utteranceLimit = utteranceLimit
         let parameters = NWParameters.tcp
         parameters.allowLocalEndpointReuse = true
         parameters.requiredLocalEndpoint = NWEndpoint.hostPort(
@@ -121,17 +129,20 @@ public final class RealtimeSpeechServer: @unchecked Sendable {
     private final class Connection: @unchecked Sendable {
         var phase: Phase = .http
         var buffer = Data()
-        var session: VoxtralRealtimeStreamSession?
-        var stepBatcher: StepBatcher
+        var session: SpeechASRStreamingSession?
+        let feed: CoalescingStepFeed
         // Append-only delta contract lives in OUR layer now (the engine is an upstream
         // dependency whose raw `Delta` re-emits the whole transcript on a non-prefix step).
         // Feed it the session's full-transcript snapshot after each step/finish; emit only
         // its append-only delta. Touched only on the inference queue, like `session`.
         var deltas = TranscriptDeltaEmitter()
+        // Latches an early engine stop (length cap or end-of-stream) so it is reported once
+        // per engine session. Inference queue only, like `session`.
+        var stopReporter = UtteranceStopReporter()
         enum Phase { case http, webSocket }
 
         init(stepMilliseconds: Int) {
-            self.stepBatcher = StepBatcher(cadenceMilliseconds: stepMilliseconds)
+            self.feed = CoalescingStepFeed(minimumMilliseconds: stepMilliseconds)
         }
     }
 
@@ -143,18 +154,43 @@ public final class RealtimeSpeechServer: @unchecked Sendable {
     private func receive(_ connection: NWConnection, _ ctx: Connection) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 1 << 16) {
             [weak self] data, _, isComplete, error in
-            guard let self else { connection.cancel(); return }
+            guard let self else { ctx.feed.close(); connection.cancel(); return }
             if let data, !data.isEmpty {
                 ctx.buffer.append(data)
                 do {
                     try self.drain(connection, ctx)
                 } catch {
-                    connection.cancel()
+                    self.close(connection, ctx)
                     return
                 }
             }
-            if error != nil || isComplete { connection.cancel(); return }
+            guard !ctx.feed.isClosed else { return }
+            if error != nil || isComplete { self.close(connection, ctx); return }
             self.receive(connection, ctx)
+        }
+    }
+
+    /// The connection is done, by a close frame or a dropped socket: its queued
+    /// appends skip their steps, so a dictation behind a cancelled voice memo waits
+    /// for one step at most (#1317).
+    private func close(_ connection: NWConnection, _ ctx: Connection, sendingCloseFrame: Bool = false) {
+        guard !ctx.feed.isClosed else { return }
+        ctx.feed.close()
+        if sendingCloseFrame {
+            rawSend(connection, WebSocketFrameCodec.close(), thenClose: true)
+        } else {
+            connection.cancel()
+        }
+        // A health probe never touched the engine.
+        guard ctx.phase == .webSocket else { return }
+        // A client that disconnects without a final commit (mid-utterance
+        // cancel) would otherwise release its session's buffers into the
+        // pool with no clear behind them. Serial queue: this lands after
+        // the connection's already-queued work, which the closed feed skips.
+        inferenceQueue.async {
+            ctx.session = nil
+            ctx.stopReporter.reset()
+            Memory.clearCache()
         }
     }
 
@@ -169,8 +205,9 @@ public final class RealtimeSpeechServer: @unchecked Sendable {
 
             guard head.isWebSocketUpgrade, let key = head.header("sec-websocket-key") else {
                 // Plain HTTP: the readiness probe. Anything else also gets a simple 200 so a
-                // stray GET can't wedge the supervisor.
-                let json = head.path == "/health" ? #"{"status":"ok"}"# : #"{"status":"ok"}"#
+                // stray GET can't wedge the supervisor. The pid lets the supervisor tell
+                // its own child from another process on the port (#1760).
+                let json = #"{"status":"ok","pid":\#(ProcessInfo.processInfo.processIdentifier)}"#
                 self.rawSend(connection, WebSocketHandshake.httpResponse(status: "200 OK", json: json),
                              thenClose: true)
                 return
@@ -184,7 +221,7 @@ public final class RealtimeSpeechServer: @unchecked Sendable {
         }
 
         // WebSocket phase: decode every complete frame currently buffered.
-        while ctx.phase == .webSocket {
+        while ctx.phase == .webSocket, !ctx.feed.isClosed {
             let result = try WebSocketFrameCodec.decode(ctx.buffer)
             guard case .frame(let frame, let consumed) = result else { break }
             ctx.buffer.removeFirst(consumed)
@@ -197,15 +234,7 @@ public final class RealtimeSpeechServer: @unchecked Sendable {
         case .ping:
             rawSend(connection, WebSocketFrameCodec.pong(frame.payload))
         case .close:
-            rawSend(connection, WebSocketFrameCodec.close(), thenClose: true)
-            // A client that disconnects without a final commit (mid-utterance
-            // cancel) would otherwise release its session's buffers into the
-            // pool with no clear behind them. Serial queue: this lands after
-            // any already-queued steps for this connection.
-            inferenceQueue.async {
-                ctx.session = nil
-                Memory.clearCache()
-            }
+            close(connection, ctx, sendingCloseFrame: true)
         case .pong, .continuation:
             break
         case .text, .binary:
@@ -223,30 +252,44 @@ public final class RealtimeSpeechServer: @unchecked Sendable {
     // MARK: - Inference (serial queue)
 
     private func dispatch(_ message: RealtimeClientMessage, _ connection: NWConnection, _ ctx: Connection) {
+        if case .audioAppend(let base64) = message {
+            // Decoded here, on the network queue, so every append the feed counts
+            // reaches `receive`.
+            guard let samples = PCM16.decode(base64: base64) else {
+                sendServer(connection, .error(message: "Invalid PCM16 payload"))
+                return
+            }
+            ctx.feed.audioQueued()
+            inferenceQueue.async { [weak self] in
+                guard let self, let batch = ctx.feed.receive(samples) else { return }
+                let session = self.ensureSession(ctx)
+                session.step(batch)
+                // Emit the append-only delta from the full transcript snapshot, NOT the
+                // engine's raw `Delta` (which re-emits the whole transcript on a non-prefix
+                // step — our no-backspace insertion path would duplicate it).
+                let delta = ctx.deltas.emit(fullText: session.text)
+                if !delta.isEmpty { self.sendServer(connection, .transcriptDelta(delta)) }
+                self.reportEarlyStopIfNeeded(session, connection, ctx)
+            }
+            return
+        }
         inferenceQueue.async { [weak self] in
             guard let self else { return }
             switch message {
             case .sessionUpdate:
                 self.sendServer(connection, .sessionUpdated)
-            case .audioAppend(let base64):
-                guard let samples = PCM16.decode(base64: base64) else {
-                    self.sendServer(connection, .error(message: "Invalid PCM16 payload"))
-                    return
-                }
-                for batch in ctx.stepBatcher.append(samples) {
-                    let session = self.ensureSession(ctx)
-                    session.step(batch)
-                    // Emit the append-only delta from the full transcript snapshot, NOT the
-                    // engine's raw `Delta` (which re-emits the whole transcript on a non-prefix
-                    // step — our no-backspace insertion path would duplicate it).
-                    let delta = ctx.deltas.emit(fullText: session.text)
-                    if !delta.isEmpty { self.sendServer(connection, .transcriptDelta(delta)) }
-                }
+            case .audioAppend:
+                break  // queued above
             case .commit(let final):
                 guard final else { return }  // non-final commit is a no-op, matching voxmlx
+                guard !ctx.feed.isClosed else { return }  // nobody to answer
                 let session = self.ensureSession(ctx)
-                let remainder = ctx.stepBatcher.flushRemainder()
-                if !remainder.isEmpty { session.step(remainder) }
+                for batch in ctx.feed.flushRemainder() { session.step(batch) }
+                self.reportGrownSteps(ctx)
+                // The remainder can be what crosses the limit (Nemotron then drops it).
+                // Check before finish(), which ends every Voxtral stream and would
+                // read as the model stopping early.
+                self.reportEarlyStopIfNeeded(session, connection, ctx)
                 session.finish()
                 let tail = ctx.deltas.emit(fullText: session.text)
                 if !tail.isEmpty { self.sendServer(connection, .transcriptDelta(tail)) }
@@ -255,7 +298,7 @@ public final class RealtimeSpeechServer: @unchecked Sendable {
                 self.sendServer(connection, .transcriptDone(text: ctx.deltas.emittedText))
                 ctx.session = nil  // ready for the next utterance
                 ctx.deltas = TranscriptDeltaEmitter()
-                ctx.stepBatcher.clear()
+                ctx.stopReporter.reset()
                 // The engine's finish() clears the buffer pool, but at that point the
                 // session's KV caches and encoder state are still live — dropping the
                 // session afterwards releases them INTO the pool, which then sits at
@@ -267,7 +310,9 @@ public final class RealtimeSpeechServer: @unchecked Sendable {
             case .clear:
                 ctx.session = nil
                 ctx.deltas = TranscriptDeltaEmitter()
-                ctx.stepBatcher.clear()
+                ctx.stopReporter.reset()
+                ctx.feed.clear()
+                _ = ctx.feed.takeLargestStepSamples()
                 // Same idle-footprint contract as the commit path above.
                 Memory.clearCache()
             case .ignored:
@@ -277,11 +322,49 @@ public final class RealtimeSpeechServer: @unchecked Sendable {
     }
 
     /// Must be called on `inferenceQueue`.
-    private func ensureSession(_ ctx: Connection) -> VoxtralRealtimeStreamSession {
+    private func ensureSession(_ ctx: Connection) -> SpeechASRStreamingSession {
         if let s = ctx.session { return s }
-        let s = model.makeStreamSession(temperature: 0.0, transcriptionDelayMs: transcriptionDelayMs)
+        let s = engine.makeSession(
+            transcriptionDelayMs: transcriptionDelayMs,
+            utteranceLimit: utteranceLimit
+        )
         ctx.session = s
         return s
+    }
+
+    /// Steps grow past the minimum only when one step took longer than the audio it
+    /// covered: the GPU is not keeping up at the minimum. Say so once per utterance.
+    /// Must be called on `inferenceQueue`.
+    private func reportGrownSteps(_ ctx: Connection) {
+        let largest = ctx.feed.takeLargestStepSamples()
+        guard largest > ctx.feed.minimumSamples else { return }
+        FileHandle.standardError.write(Data(
+            "speechd: steps grew to \(largest / 16) ms (minimum \(stepMilliseconds) ms); the GPU did not keep up with the minimum step\n".utf8))
+    }
+
+    /// An engine session that stops before the client's final commit returns nothing from
+    /// every later step, so the app would see deltas simply stop (#314). Say so once: an
+    /// `error` event the app shows on its status line, and a stderr line for the helper log.
+    /// Must be called on `inferenceQueue`.
+    private func reportEarlyStopIfNeeded(
+        _ session: SpeechASRStreamingSession,
+        _ connection: NWConnection,
+        _ ctx: Connection
+    ) {
+        guard let stop = ctx.stopReporter.report(session.utteranceStop) else { return }
+        switch stop {
+        case .lengthLimit:
+            FileHandle.standardError.write(Data(
+                "speechd: utterance reached the \(utteranceLimit.seconds)s limit; later audio is not transcribed\n".utf8))
+            sendServer(connection, .transcriptionStopped(message: utteranceLimit.reachedMessage))
+        case .endOfStream:
+            FileHandle.standardError.write(Data(
+                "speechd: model ended the stream after \(session.decodedTokenCount) tokens; later audio is not transcribed\n".utf8))
+            sendServer(
+                connection,
+                .transcriptionStopped(message: UtteranceLimit.endOfStreamMessage)
+            )
+        }
     }
 
     // MARK: - Send helpers
@@ -298,25 +381,60 @@ public final class RealtimeSpeechServer: @unchecked Sendable {
     }
 }
 
+/// Resolves the checkpoint the app pinned into a loaded engine. The engine is the one
+/// the app's catalog names with `--engine`, else inferred from the model
+/// (`SpeechASREngineKind.resolve`).
 enum SpeechModelLoader {
     static func load(
         modelID: String?,
         modelRevision: String?,
-        modelDirectory: String?
-    ) async throws -> VoxtralRealtimeModel {
+        modelDirectory: String?,
+        engine: SpeechASREngineKind?
+    ) async throws -> SpeechASREngine {
+        switch SpeechASREngineKind.resolve(
+            named: engine, modelID: modelID, modelDirectory: modelDirectory
+        ) {
+        case .voxtral:
+            return VoxtralASREngine(model: try await loadModel(
+                modelID: modelID,
+                modelRevision: modelRevision,
+                modelDirectory: modelDirectory,
+                fromDirectory: { try VoxtralRealtimeModel.fromDirectory($0) },
+                fromPretrained: { try await VoxtralRealtimeModel.fromPretrained($0) }
+            ))
+        case .nemotron:
+            return NemotronASREngine(model: try await loadModel(
+                modelID: modelID,
+                modelRevision: modelRevision,
+                modelDirectory: modelDirectory,
+                fromDirectory: { try NemotronASRModel.fromDirectory($0) },
+                fromPretrained: { try await NemotronASRModel.fromPretrained($0) }
+            ))
+        }
+    }
+
+    /// The same three-way resolution for every engine: an explicit directory, the
+    /// app-pinned revision already in the shared Hugging Face cache, or — development
+    /// only — whatever the repo's `main` resolves to.
+    private static func loadModel<Model>(
+        modelID: String?,
+        modelRevision: String?,
+        modelDirectory: String?,
+        fromDirectory: (URL) throws -> Model,
+        fromPretrained: (String) async throws -> Model
+    ) async throws -> Model {
         if let dir = modelDirectory {
-            return try VoxtralRealtimeModel.fromDirectory(URL(fileURLWithPath: dir))
+            return try fromDirectory(URL(fileURLWithPath: dir))
         }
         if let id = modelID, let revision = modelRevision {
-            let directory = try SpeechHFCacheModelLocator.locate(
+            return try fromDirectory(try SpeechHFCacheModelLocator.locate(
                 repoID: id,
                 revision: revision,
                 cacheRoot: SpeechHFCacheModelLocator.defaultCacheRoot()
-            )
-            return try VoxtralRealtimeModel.fromDirectory(directory)
+            ))
         }
         if let id = modelID {
-            return try await VoxtralRealtimeModel.fromPretrained(id)
+            return try await fromPretrained(id)
         }
         throw RealtimeSpeechServer.ServerError.noModelSpecified
     }

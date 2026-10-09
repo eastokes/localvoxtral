@@ -7,15 +7,26 @@ set -euo pipefail
 #
 # Usage:
 #   ./scripts/try-pr.sh <pr-number>            # e.g. ./scripts/try-pr.sh 30
-#   ./scripts/try-pr.sh main                   # latest green build of main
-#   ./scripts/try-pr.sh main --dogfood         # instrumented dogfood build
+#   ./scripts/try-pr.sh main                   # main's newest build; offers to
+#                                              # build main's head when behind
+#   ./scripts/try-pr.sh 42 --ui-gate           # install where the UI gate can launch it
 #
-# --dogfood fetches the LOCALVOXTRAL_DOGFOOD-instrumented artifact
-# (localvoxtral-app-dogfood), verifies its Info.plist stamp, arms the runtime
-# capture opt-in default, and launches it. The dogfood artifact is OPT-IN in
-# CI ([dogfood-package] marker or a manual dispatch with dogfood=true), so if
-# the target's run doesn't carry one, this script offers to trigger a build
-# and shows the latest run that does have one.
+# --ui-gate installs the bundle into the SSH UI gate's artifact root
+# (~/localvoxtral-ui-artifacts) instead of leaving it in /tmp, and does NOT
+# launch it — starting it is the gate's `launch` verb, which records the pid
+# every other verb then addresses. The gate refuses to launch anything outside
+# that root on purpose (a world-writable root would let any local process plant
+# a bundle claiming com.localvoxtral.app), so the install destination is what
+# moves, never the roots. Default behaviour is unchanged: /tmp, then `open`.
+# A build with the test harness (the gate's `app` verbs) comes from a UI Smoke
+# dispatch instead, which installs it for the gate (docs/test-harness.md).
+#
+# A dispatch this script starts passes herdr=false. The dispatch exists to produce an
+# artifact, and the live herdr lane — which a dispatch otherwise forces on —
+# only adds time and one more way for `gh run watch --exit-status` to give up
+# before downloading anything. The herdr
+# contract is held where it belongs: the path filter + [run-herdr-integration]
+# marker on PRs.
 #
 # Requires: gh (authenticated). Artifacts exist for CI runs made after the
 # artifact-upload step landed; use "gh run rerun <run-id>" on older PRs.
@@ -25,19 +36,20 @@ if [[ "$(uname)" != "Darwin" ]]; then
   exit 1
 fi
 
+USAGE="usage: $0 <pr-number|main> [--ui-gate]"
 TARGET=""
-DOGFOOD=0
+UI_GATE=0
 for arg in "$@"; do
   case "$arg" in
-    --dogfood) DOGFOOD=1 ;;
+    --ui-gate) UI_GATE=1 ;;
     -*)
       echo "unknown flag: $arg" >&2
-      echo "usage: $0 <pr-number|main> [--dogfood]" >&2
+      echo "$USAGE" >&2
       exit 1
       ;;
     *)
       if [[ -n "$TARGET" ]]; then
-        echo "usage: $0 <pr-number|main> [--dogfood]" >&2
+        echo "$USAGE" >&2
         exit 1
       fi
       TARGET="$arg"
@@ -45,12 +57,11 @@ for arg in "$@"; do
   esac
 done
 if [[ -z "$TARGET" ]]; then
-  echo "usage: $0 <pr-number|main> [--dogfood]" >&2
+  echo "$USAGE" >&2
   exit 1
 fi
 
 ARTIFACT="localvoxtral-app"
-(( DOGFOOD )) && ARTIFACT="localvoxtral-app-dogfood"
 
 # BRANCH is what a workflow_dispatch would target; empty when dispatch is
 # impossible (cross-repo fork PRs have no branch in this repo to dispatch on).
@@ -89,99 +100,152 @@ run_has_artifact() {
   grep -qxF "$ARTIFACT" <<<"$names"
 }
 
-if (( DOGFOOD )) && ! run_has_artifact "$RUN_ID"; then
-  echo "No dogfood artifact on CI run $RUN_ID for '$TARGET' — the dogfood lane is opt-in"
-  echo "([dogfood-package] in the PR body / head commit message, or a manual dispatch)."
-  echo
-
-  # Newest non-expired dogfood artifact anywhere in the repo, so there is
-  # always a concrete "latest build that HAS one" to point at (or use).
-  # sort_by(.created_at) because the REST endpoint documents no response
-  # ordering; 7-day retention keeps the population well inside one page.
-  LATEST="$(gh api "repos/{owner}/{repo}/actions/artifacts?name=localvoxtral-app-dogfood&per_page=100" \
-    --jq '[.artifacts[] | select(.expired | not)] | sort_by(.created_at) | last
-          | if . == null then ""
-            else "\(.workflow_run.id)\t\(.workflow_run.head_branch)\t\(.workflow_run.head_sha[0:7])\t\(.created_at)"
-            end')"
-  LATEST_RUN=""
-  if [[ -n "$LATEST" ]]; then
-    IFS=$'\t' read -r LATEST_RUN LATEST_BRANCH LATEST_SHA LATEST_DATE <<<"$LATEST"
-    echo "Latest existing dogfood build: $LATEST_BRANCH @ $LATEST_SHA (run $LATEST_RUN, created $LATEST_DATE)"
-  else
-    echo "No dogfood artifact exists anywhere yet (or all have expired — 7-day retention)."
-  fi
-
-  if [[ ! -t 0 ]]; then
-    echo >&2
-    echo "stdin is not a TTY — rerun interactively, or trigger a build yourself:" >&2
-    if [[ -n "$BRANCH" ]]; then
-      echo "  gh workflow run CI --ref $BRANCH -f dogfood=true" >&2
-    else
-      echo "  (cross-repo fork PR: fork PRs run on GitHub-hosted runners and never build" >&2
-      echo "   dogfood artifacts — push the branch to this repo instead)" >&2
-    fi
+# Watch a CI run to the end and make it the one to download.
+watch_run() {
+  echo "Watching run $1 (full CI + packaging; minutes when the Mac is free, longer behind a queue)..."
+  if ! gh run watch "$1" --exit-status; then
+    echo "CI run $1 did not finish green — see: gh run view $1" >&2
+    [[ "$BRANCH" == "main" ]] && echo "(A push to main cancels a build of main still waiting for the Mac.)" >&2
     exit 1
   fi
+  # The newest-dispatch heuristic in dispatch_and_wait can pick up someone
+  # else's concurrent dispatch (possibly with other inputs); verify the
+  # watched run actually produced the artifact before downloading.
+  if ! run_has_artifact "$1"; then
+    echo "Run $1 finished green but has no $ARTIFACT artifact — a concurrent" >&2
+    echo "dispatch may have been picked up instead of ours. Rerun this script." >&2
+    exit 1
+  fi
+  RUN_ID="$1"
+}
 
-  echo
-  [[ -n "$BRANCH" ]] && echo "  [t] trigger a fresh dogfood CI build of '$TARGET' and wait for it"
-  [[ -n "$LATEST_RUN" ]] && echo "  [l] use that latest existing dogfood build instead"
-  echo "  [q] quit"
-  read -r -p "Choice: " CHOICE
-  case "$CHOICE" in
-    t|T)
-      if [[ -z "$BRANCH" ]]; then
-        echo "Can't dispatch for a cross-repo fork PR — and fork PRs run on GitHub-hosted" >&2
-        echo "runners, which never build dogfood artifacts (the lane is self-hosted-only)." >&2
-        echo "Push the branch to this repo instead." >&2
+# Dispatch CI on $BRANCH with the extra inputs given, then watch_run it.
+# herdr=false: see the note in the header.
+dispatch_and_wait() {
+  # gh workflow run doesn't return the run id; detect the new run by
+  # comparing against the newest dispatch run that existed beforehand.
+  local prev cand new_run=""
+  prev="$(gh run list --workflow CI --event workflow_dispatch --branch "$BRANCH" \
+    --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
+  gh workflow run CI --ref "$BRANCH" -f herdr=false "$@"
+  echo "Dispatched. Waiting for the run to register..."
+  for _ in $(seq 1 24); do
+    sleep 5
+    cand="$(gh run list --workflow CI --event workflow_dispatch --branch "$BRANCH" \
+      --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
+    if [[ -n "$cand" && "$cand" != "$prev" ]]; then
+      new_run="$cand"
+      break
+    fi
+  done
+  if [[ -z "$new_run" ]]; then
+    echo "Dispatched run never appeared — check: gh run list --workflow CI --event workflow_dispatch" >&2
+    exit 1
+  fi
+  watch_run "$new_run"
+}
+
+# A draft PR's run is green without mac-lanes, the job that builds the bundle
+# (ci.yml), so say that instead of letting `gh run download` fail on a name.
+if ! run_has_artifact "$RUN_ID"; then
+  # One head can carry a draft's run (no bundle) and the run `gh pr ready`
+  # started, so look past the newest green one before giving up.
+  WITH_ARTIFACT=""
+  ACTIVE_RUN=""
+  if [[ -n "${HEAD_SHA:-}" ]]; then
+    for candidate in $(gh run list --workflow CI --commit "$HEAD_SHA" --status success --limit 10 \
+        --json databaseId --jq '.[].databaseId'); do
+      if run_has_artifact "$candidate"; then
+        WITH_ARTIFACT="$candidate"
+        break
+      fi
+    done
+    ACTIVE_RUN="$(gh run list --workflow CI --commit "$HEAD_SHA" --limit 10 --json databaseId,status \
+      --jq '[.[] | select(.status != "completed")][0].databaseId // empty')"
+  elif [[ "$TARGET" == "main" ]]; then
+    # A push to main skips mac-lanes, so main's newest green run has no
+    # bundle; take the newest one that does (a dispatch). The staleness
+    # check below offers to build main's head when this one is behind.
+    for candidate in $(gh run list --workflow CI --branch main --status success --limit 30 \
+        --json databaseId --jq '.[].databaseId'); do
+      if run_has_artifact "$candidate"; then
+        WITH_ARTIFACT="$candidate"
+        break
+      fi
+    done
+  fi
+  if [[ -n "$WITH_ARTIFACT" ]]; then
+    RUN_ID="$WITH_ARTIFACT"
+  elif [[ "$TARGET" == "main" ]]; then
+    RUN_ID=""
+  elif [[ -n "$ACTIVE_RUN" ]]; then
+    echo "CI run $ACTIVE_RUN is still building '$TARGET'. Wait for it: ./scripts/watch-checks.sh --run $ACTIVE_RUN" >&2
+    exit 1
+  else
+    echo "No green CI run for '$TARGET' carries the $ARTIFACT artifact." >&2
+    echo "A draft PR skips mac-lanes, the job that builds it: gh pr ready $TARGET, or put [mac-lanes] in its body and push." >&2
+    echo "Nor does a diff that changes nothing in the bundle (docs, tests, CI scripts; scripts/ci/mac-package-filter.sh);" >&2
+    echo "[mac-lanes] in the body and a push forces it." >&2
+    exit 1
+  fi
+fi
+
+# Main's bundles come only from dispatches, so the newest one is usually
+# behind main. Say by how much, and offer to build main's head.
+if [[ "$TARGET" == "main" ]]; then
+  MAIN_HEAD="$(gh api "repos/{owner}/{repo}/commits/main" --jq '.sha')"
+  BUILT_SHA=""
+  [[ -n "$RUN_ID" ]] && BUILT_SHA="$(gh run view "$RUN_ID" --json headSha --jq '.headSha')"
+  if [[ "$BUILT_SHA" != "$MAIN_HEAD" ]]; then
+    if [[ -n "$BUILT_SHA" ]]; then
+      BEHIND="$(gh api "repos/{owner}/{repo}/compare/$BUILT_SHA...$MAIN_HEAD" --jq '.ahead_by')"
+      echo "main's newest build (run $RUN_ID, ${BUILT_SHA:0:7}) is $BEHIND commit(s) behind main (${MAIN_HEAD:0:7})."
+    else
+      echo "No green CI run of main carries the $ARTIFACT artifact; pushes to main skip mac-lanes."
+    fi
+    # A dispatch already building main: wait for it rather than put a
+    # second one on the single Mac.
+    IFS=$'\t' read -r ACTIVE_RUN ACTIVE_SHA < <(gh run list --workflow CI --branch main \
+      --event workflow_dispatch --limit 10 --json databaseId,status,headSha \
+      --jq '[.[] | select(.status != "completed")][0] | if . == null then "\t" else "\(.databaseId)\t\(.headSha)" end')
+    if [[ ! -t 0 ]]; then
+      if [[ -n "$ACTIVE_RUN" ]]; then
+        echo "Run $ACTIVE_RUN is building main at ${ACTIVE_SHA:0:7}: ./scripts/watch-checks.sh --run $ACTIVE_RUN" >&2
+      else
+        echo "To build main's head: gh workflow run CI --ref main -f herdr=false" >&2
+      fi
+      if [[ -z "$RUN_ID" ]]; then
+        echo "stdin is not a TTY, so nothing to launch." >&2
         exit 1
       fi
-      # gh workflow run doesn't return the run id; detect the new run by
-      # comparing against the newest dispatch run that existed beforehand.
-      PREV_DISPATCH="$(gh run list --workflow CI --event workflow_dispatch --branch "$BRANCH" \
-        --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
-      gh workflow run CI --ref "$BRANCH" -f dogfood=true
-      echo "Dispatched. Waiting for the run to register..."
-      NEW_RUN=""
-      for _ in $(seq 1 24); do
-        sleep 5
-        CAND="$(gh run list --workflow CI --event workflow_dispatch --branch "$BRANCH" \
-          --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
-        if [[ -n "$CAND" && "$CAND" != "$PREV_DISPATCH" ]]; then
-          NEW_RUN="$CAND"
-          break
-        fi
-      done
-      if [[ -z "$NEW_RUN" ]]; then
-        echo "Dispatched run never appeared — check: gh run list --workflow CI --event workflow_dispatch" >&2
-        exit 1
+      echo "stdin is not a TTY; launching the older build." >&2
+    else
+      echo
+      if [[ -n "$ACTIVE_RUN" ]]; then
+        echo "  [b] wait for run $ACTIVE_RUN, already building main at ${ACTIVE_SHA:0:7} (default)"
+      else
+        echo "  [b] build main's head on CI and wait for it (default)"
       fi
-      echo "Watching run $NEW_RUN (full CI + dogfood packaging; ~a few minutes on a warm runner)..."
-      if ! gh run watch "$NEW_RUN" --exit-status; then
-        echo "CI run failed — see: gh run view $NEW_RUN" >&2
-        exit 1
-      fi
-      # The newest-dispatch heuristic above can pick up someone else's
-      # concurrent dispatch (possibly without dogfood=true); verify the
-      # watched run actually produced the artifact before downloading.
-      if ! run_has_artifact "$NEW_RUN"; then
-        echo "Run $NEW_RUN finished green but has no dogfood artifact — a concurrent" >&2
-        echo "dispatch may have been picked up instead of ours. Rerun this script." >&2
-        exit 1
-      fi
-      RUN_ID="$NEW_RUN"
-      ;;
-    l|L)
-      if [[ -z "$LATEST_RUN" ]]; then
-        echo "No existing dogfood build to use." >&2
-        exit 1
-      fi
-      RUN_ID="$LATEST_RUN"
-      ;;
-    *)
-      exit 0
-      ;;
-  esac
+      [[ -n "$RUN_ID" ]] && echo "  [o] launch the older build"
+      echo "  [q] quit"
+      read -r -p "Choice: " CHOICE
+      case "${CHOICE:-b}" in
+        b|B)
+          if [[ -n "$ACTIVE_RUN" ]]; then
+            watch_run "$ACTIVE_RUN"
+          else
+            dispatch_and_wait
+          fi
+          ;;
+        o|O)
+          [[ -n "$RUN_ID" ]] || exit 0
+          ;;
+        *)
+          exit 0
+          ;;
+      esac
+    fi
+  fi
 fi
 
 DEST="$(mktemp -d /tmp/localvoxtral-try.XXXXXX)"
@@ -192,15 +256,22 @@ xattr -cr "$APP" 2>/dev/null || true
 
 # Which binary is this? The Info.plist stamp is the ground truth (docs/agent/field-debugging.md:
 # "confirm WHICH binary the user is actually running" has cost an hour once).
-STAMP="$(/usr/libexec/PlistBuddy -c 'Print :LVXDogfoodCapture' "$APP/Contents/Info.plist" 2>/dev/null || echo absent)"
-echo "Dogfood capture stamp: $STAMP"
-if (( DOGFOOD )) && [[ "$STAMP" != "true" ]]; then
-  echo "FATAL: --dogfood requested but the downloaded bundle is not stamped (LVXDogfoodCapture: $STAMP)." >&2
-  echo "Refusing to launch a build that can't capture — this is exactly the wrong-binary confusion." >&2
+STAMP="$(/usr/libexec/PlistBuddy -c 'Print :LVXE2EHarness' "$APP/Contents/Info.plist" 2>/dev/null || echo absent)"
+if [[ "$STAMP" != "absent" ]]; then
+  echo "FATAL: this CI bundle is stamped LVXE2EHarness=$STAMP: it carries the test harness, which no release build may." >&2
   exit 1
 fi
-if (( ! DOGFOOD )) && [[ "$STAMP" != "absent" ]]; then
-  echo "WARNING: this 'clean' artifact is stamped LVXDogfoodCapture=$STAMP — it can capture if armed."
+
+# --ui-gate: move the bundle out of /tmp and into the gate's artifact root
+# BEFORE signing, so the copy that actually runs is the one that got the
+# ad-hoc re-sign (macOS 26 stalls the first launch of an unsigned-locally
+# downloaded bundle, and TCC keys the grant to the signature of the binary
+# that launches). Done after the stamp check so a harness artifact is
+# rejected before a few hundred MB get copied.
+if (( UI_GATE )); then
+  APP="$("$(dirname "$0")/mac/install-ui-artifact.sh" "$APP" --no-hint \
+    --label "$TARGET @ CI run $RUN_ID")"
+  xattr -cr "$APP" 2>/dev/null || true
 fi
 
 # Detect whether the downloaded bundle is ad-hoc. The reliable marker is the
@@ -223,7 +294,9 @@ if (( IS_ADHOC )); then
   # _dyld_start (Gatekeeper first-exec scan); a LOCAL ad-hoc re-sign is the
   # field-proven fix. Only ad-hoc artifacts are re-signed, so an identity-signed
   # build keeps its stable signature — and its TCC grant — untouched.
-  codesign --force --deep --sign - "$APP"
+  # Keep the entitlements: the widget extension does not load without its
+  # sandbox, and a plain --deep re-sign strips it.
+  codesign --force --deep --preserve-metadata=entitlements --sign - "$APP"
 fi
 
 if pgrep -x localvoxtral >/dev/null 2>&1; then
@@ -231,33 +304,40 @@ if pgrep -x localvoxtral >/dev/null 2>&1; then
   echo "      two menu bar icons / hotkey conflicts."
 fi
 
-if (( DOGFOOD )); then
-  # Arm the runtime opt-in BEFORE launch so the first session already
-  # captures. Same bundle id as the clean build, so this is the app's normal
-  # defaults domain — and harmless to leave armed: release binaries don't
-  # contain the capture code at all (compile gate), so a later clean try-pr
-  # ignores the key.
-  defaults write com.localvoxtral.app debug.dogfood_capture_enabled -bool true
-  echo "Dogfood capture ARMED (debug.dogfood_capture_enabled = true)."
-  echo "  records: ~/Library/Application Support/localvoxtral/dogfood"
-  echo "  disarm:  defaults write com.localvoxtral.app debug.dogfood_capture_enabled -bool false"
-fi
-
 LAUNCH_LABEL="$SIGNER"
-(( DOGFOOD )) && LAUNCH_LABEL="$LAUNCH_LABEL, dogfood"
-echo "Launching build of '$TARGET' (CI run $RUN_ID, ${LAUNCH_LABEL}): $APP"
+if (( UI_GATE )); then
+  echo "Installed build of '$TARGET' (CI run $RUN_ID, ${LAUNCH_LABEL}): $APP"
+else
+  echo "Launching build of '$TARGET' (CI run $RUN_ID, ${LAUNCH_LABEL}): $APP"
+fi
 # The designated requirement is what TCC keys the Accessibility grant on.
 # Compare this block between two try-pr runs: identical DR => the grant
 # survives; a DR that changes every run (ad-hoc pins the per-build cdhash) is
 # exactly why the app has to be re-added in System Settings each time.
 echo "Designated requirement (compare across try-pr runs — stable == TCC grant survives):"
 codesign -d --requirements - "$APP" 2>&1 | sed 's/^/  /' || true
-if [[ "$SIGNER" == "Authority=ad-hoc" ]]; then
+if (( IS_ADHOC )); then
   echo "NOTE: ad-hoc signed build — if text insertion fails, remove and re-add"
   echo "      localvoxtral in System Settings > Privacy & Security > Accessibility"
-  echo "      (TCC grants don't survive ad-hoc signature changes)."
+  echo "      (Device Control and Data Access on macOS 27)."
+  echo "      TCC grants don't survive ad-hoc signature changes."
   echo "      For a SAME-REPO PR this is unexpected: CI should identity-sign it."
   echo "      An ad-hoc same-repo artifact means the self-hosted runner user lost"
   echo "      the localvoxtral-dev cert (check: security find-identity -v -p codesigning)."
 fi
+
+if (( UI_GATE )); then
+  # Deliberately no `open`: the gate's `launch` records the pid that `ax`,
+  # `key`, `shot` and `quit` all address, and it refuses to start a second
+  # instance. An instance started here would be unrecorded — invisible to the
+  # gate, and a hotkey / port 8471-8472 rival for the one it does start.
+  GATE_ARG="$APP"
+  case "$APP" in
+    "$HOME"/*) GATE_ARG="${APP#"$HOME"/}" ;;
+  esac
+  echo "Not launched — the UI gate owns launching. From the dev box:"
+  echo "  ssh lv-ui 'launch ${GATE_ARG}'"
+  exit 0
+fi
+
 open "$APP"

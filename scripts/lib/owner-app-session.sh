@@ -1,0 +1,299 @@
+# Shared by the lanes that borrow the owner's localvoxtral on the GUI Mac
+# (ui-smoke.sh, e2e-dictation.sh, capture-readme-assets.sh, record-demo.sh):
+# quit the owner's running instance and bring it back afterwards, and keep the
+# lane's settings out of the owner's defaults.
+#
+# UI Smoke, capture-readme-assets.sh and record-demo.sh run the app on a
+# defaults suite of their own (#1029, #1450), and e2e on a bundle id of its
+# own (#1198); none writes the owner's domain. Before that, each lane
+# snapshotted the owner's domain into a backup file, forced its settings into
+# the domain and restored the backup on exit. A lane killed mid-run left its
+# backup on disk and its settings in the owner's domain, so every lane still
+# restores such a backup before it starts.
+#
+# Source it after setting:
+#   APP_PROCESS, BUNDLE_ID, OWNER_APP_BUNDLE (empty), OSASCRIPT_TIMEOUT_BIN,
+#   OSASCRIPT_TIMEOUT_SECONDS, and a record_fail function.
+#
+# A backup is one file: a header saying whether the domain existed and the
+# checksum of the exported plist, then the plist. Restoring deletes the live
+# domain only after the backup validates; a backup that does not validate
+# stops the restore with the domain untouched (#991).
+#
+# Written for the runner's bash 3.2.
+DEFAULTS_BACKUP_HEADER="localvoxtral defaults backup v1"
+# The lanes that took backups, each on a path of its own: UI Smoke and e2e
+# shared `ui-smoke`. A backup is ~/.localvoxtral-<lane>.defaults-backup;
+# before #991 it was ~/.localvoxtral-<lane>.pre.plist plus a `.had-domain`
+# marker.
+DEFAULTS_BACKUP_LANES="ui-smoke capture-assets record-demo"
+
+defaults_backup_checksum() {
+  cksum <"$1" | awk '{ print $1 " " $2 }'
+}
+
+# read_defaults_backup <backup> <payload-out>: prints `present` or `absent`
+# and writes the plist to <payload-out>, or fails if any part of the backup
+# does not check out.
+read_defaults_backup() {
+  local backup="$1" payload="$2" state sum
+  [[ "$(sed -n '1p' "$backup")" == "$DEFAULTS_BACKUP_HEADER" ]] || return 1
+  state="$(sed -n '2s/^domain=//p' "$backup")"
+  sum="$(sed -n '3s/^cksum=//p' "$backup")"
+  [[ "$(sed -n '4p' "$backup")" == "--" ]] || return 1
+  tail -n +5 "$backup" >"$payload" || return 1
+  [[ -n "$sum" && "$(defaults_backup_checksum "$payload")" == "$sum" ]] || return 1
+  case "$state" in
+    present) plutil -lint -s "$payload" >/dev/null 2>&1 || return 1 ;;
+    absent) [[ ! -s "$payload" ]] || return 1 ;;
+    *) return 1 ;;
+  esac
+  printf '%s\n' "$state"
+}
+
+# apply_defaults_backup <present|absent> <plist>: replace the live domain.
+apply_defaults_backup() {
+  defaults delete "$BUNDLE_ID" >/dev/null 2>&1 || true
+  if [[ "$1" == present ]]; then
+    defaults import "$BUNDLE_ID" "$2" >/dev/null 2>&1 || return 1
+  fi
+}
+
+# restore_legacy_defaults_backup <plist>: a backup a pre-#991 lane left. Its
+# marker cannot be trusted: a lane killed between the export and the marker
+# left an export with no marker. Importing the plist is right either way,
+# since an absent domain was backed up as an empty dict. Leaves the backup on
+# disk; the caller removes it.
+restore_legacy_defaults_backup() {
+  local legacy="$1"
+  if ! plutil -lint -s "$legacy" >/dev/null 2>&1; then
+    printf 'ERROR: %s is not a valid plist; leaving the %s domain untouched.\n' "$legacy" "$BUNDLE_ID" >&2
+    return 1
+  fi
+  apply_defaults_backup present "$legacy"
+}
+
+# restore_defaults_backup <backup>: leaves the backup on disk; the caller
+# removes it.
+restore_defaults_backup() {
+  local backup="$1" payload state
+  payload="$(mktemp "${backup}.payload.XXXXXX")" || return 1
+  if ! state="$(read_defaults_backup "$backup" "$payload")"; then
+    rm -f "$payload"
+    printf 'ERROR: %s does not validate; leaving the %s domain untouched.\n' "$backup" "$BUNDLE_ID" >&2
+    return 1
+  fi
+  if ! apply_defaults_backup "$state" "$payload"; then
+    rm -f "$payload"
+    return 1
+  fi
+  rm -f "$payload"
+}
+
+# Restores the owner's domain from a backup a killed run left. Only the
+# oldest backup holds the owner's own settings: an older lane recovered only
+# its own path, so a later backup on another path can hold the forced modes
+# of the run killed before it. The oldest is restored first and removed last,
+# after every other backup: a recovery killed at any step leaves the oldest
+# on disk, and the next one restores it again. A backup that does not
+# validate fails the lane with every backup and the domain left as they are.
+recover_previous_defaults_backup() {
+  local lane backup legacy found oldest=""
+  for lane in $DEFAULTS_BACKUP_LANES; do
+    backup="${HOME}/.localvoxtral-${lane}.defaults-backup"
+    legacy="${HOME}/.localvoxtral-${lane}.pre.plist"
+    # The staging files a killed snapshot or restore left beside the backup.
+    rm -f "${backup}".staged.* "${backup}".export.* "${backup}".payload.*
+    [[ -e "$legacy" ]] || rm -f "${legacy}.had-domain"
+    for found in "$backup" "$legacy"; do
+      [[ -e "$found" ]] || continue
+      if [[ -z "$oldest" || "$found" -ot "$oldest" ]]; then
+        oldest="$found"
+      fi
+    done
+  done
+  [[ -n "$oldest" ]] || return 0
+
+  printf 'WARNING: found a defaults backup from a previous interrupted run (%s); restoring owner defaults before continuing.\n' "$oldest" >&2
+  if [[ "$oldest" == *.pre.plist ]]; then
+    restore_legacy_defaults_backup "$oldest"
+  else
+    restore_defaults_backup "$oldest"
+  fi || {
+    record_fail "Could not restore the previous defaults backup at $oldest; refusing to run the app."
+    return 1
+  }
+  # A backup left behind would be restored over the owner's later changes,
+  # so a failed removal fails the lane, with the oldest kept while any other
+  # backup remains.
+  for lane in $DEFAULTS_BACKUP_LANES; do
+    for found in "${HOME}/.localvoxtral-${lane}.defaults-backup" "${HOME}/.localvoxtral-${lane}.pre.plist"; do
+      [[ "$found" == "$oldest" ]] || rm -f "$found" "${found}.had-domain" || {
+        record_fail "Could not remove the defaults backup at $found; refusing to run the app."
+        return 1
+      }
+    done
+  done
+  rm -f "$oldest" "${oldest}.had-domain" || {
+    record_fail "Could not remove the restored defaults backup at $oldest; refusing to run the app."
+    return 1
+  }
+  printf 'WARNING: previous defaults backup restored; every backup removed.\n' >&2
+}
+
+# The suite the lanes write their settings into, and the app reads instead of
+# $BUNDLE_ID when LOCALVOXTRAL_DEFAULTS_SUITE names it. Emptied before and
+# after a run, so a killed run's settings never reach the next.
+HARNESS_DEFAULTS_SUITE="com.localvoxtral.harness"
+
+use_harness_defaults() {
+  defaults delete "$HARNESS_DEFAULTS_SUITE" >/dev/null 2>&1 || true
+  LOCALVOXTRAL_DEFAULTS_SUITE="$HARNESS_DEFAULTS_SUITE"
+  export LOCALVOXTRAL_DEFAULTS_SUITE
+}
+
+# Starts the suite from a copy of the owner's domain, for a lane that runs on
+# the owner's setup with a few settings pinned on top. Reads the owner's
+# domain, never writes it.
+copy_owner_defaults_to_harness() {
+  local exported read_error
+  if ! defaults read "$BUNDLE_ID" >/dev/null 2>&1; then
+    # Only "does not exist" means a fresh Mac; any other failure would run
+    # the lane on the app's defaults instead of the owner's setup.
+    read_error="$(defaults read "$BUNDLE_ID" 2>&1 >/dev/null)"
+    [[ "$read_error" == *"does not exist"* ]] || return 1
+    return 0
+  fi
+  exported="$(defaults export "$BUNDLE_ID" -)" || return 1
+  printf '%s\n' "$exported" | defaults import "$HARNESS_DEFAULTS_SUITE" -
+}
+
+# A no-op for a run that never got to use_harness_defaults: it touches nothing.
+drop_harness_defaults() {
+  [[ -n "${LOCALVOXTRAL_DEFAULTS_SUITE:-}" ]] || return 0
+  defaults delete "$HARNESS_DEFAULTS_SUITE" >/dev/null 2>&1 || true
+}
+
+# A read-only digest of the owner's domain. A lane logs it before it launches
+# the app and again after the app quits, before the owner's app comes back.
+owner_defaults_digest() {
+  local exported
+  exported="$(defaults export "$BUNDLE_ID" - 2>/dev/null)" || exported="<absent>"
+  printf '%s' "$exported" | cksum | awk '{ print $1 }'
+}
+
+# Prints whether the owner's domain moved since OWNER_DEFAULTS_BEFORE. Silent
+# when the lane never got that far.
+report_owner_defaults() {
+  [[ -n "${OWNER_DEFAULTS_BEFORE:-}" ]] || return 0
+  local after
+  after="$(owner_defaults_digest)"
+  if [[ "$after" == "$OWNER_DEFAULTS_BEFORE" ]]; then
+    printf 'Owner defaults unchanged (%s digest %s).\n' "$BUNDLE_ID" "$after"
+  else
+    printf 'WARNING: owner defaults changed during the run (%s digest %s before, %s after).\n' "$BUNDLE_ID" "$OWNER_DEFAULTS_BEFORE" "$after" >&2
+  fi
+}
+
+run_osascript() {
+  if [[ -n "$OSASCRIPT_TIMEOUT_BIN" ]]; then
+    "$OSASCRIPT_TIMEOUT_BIN" "${OSASCRIPT_TIMEOUT_SECONDS}s" osascript "$@"
+  else
+    # macOS does not ship GNU timeout; if it is unavailable, run osascript
+    # directly rather than failing the smoke drill before AX checks can run.
+    osascript "$@"
+  fi
+}
+
+quit_app() {
+  if ! pgrep -x "$APP_PROCESS" >/dev/null 2>&1; then
+    return
+  fi
+
+  run_osascript -e "tell application \"$APP_PROCESS\" to quit" >/dev/null 2>&1 || true
+  local deadline=$((SECONDS + 10))
+  while ((SECONDS < deadline)); do
+    if ! pgrep -x "$APP_PROCESS" >/dev/null 2>&1; then
+      return
+    fi
+    sleep 0.5
+  done
+}
+
+# Quits the owner's running instance, remembering its bundle for
+# relaunch_owner_app. The bundle is read off the executable path because the
+# owner may run a try-pr copy rather than /Applications.
+quit_owner_app() {
+  local pid executable
+  pid="$(pgrep -x "$APP_PROCESS" 2>/dev/null | head -n 1)"
+  [[ -n "$pid" ]] || return 0
+  executable="$(ps -o comm= -p "$pid" 2>/dev/null || true)"
+  if [[ "$executable" == */Contents/MacOS/* ]]; then
+    OWNER_APP_BUNDLE="${executable%%/Contents/MacOS/*}"
+  else
+    # Unresolvable: still mark the slot as taken so cleanup quits the drill's
+    # instance, but there is nothing to relaunch.
+    OWNER_APP_BUNDLE="unknown"
+    printf 'WARNING: could not resolve the bundle of running pid %s (%s); it will not be relaunched.\n' "$pid" "$executable" >&2
+  fi
+  quit_app
+}
+
+# Plain `open`, not lv_open: the owner's app must come back with the owner's
+# environment, not the lane's CI-only flags (they would hide its API keys).
+# `open` still hands the app this shell's RUNNER_TRACKING_ID, and at the end of
+# the job the Actions runner kills every process carrying the job's id as an
+# orphan, the relaunched owner app included. So the relaunch drops it, and the
+# lane's flags with it.
+relaunch_owner_app() {
+  [[ -n "$OWNER_APP_BUNDLE" && "$OWNER_APP_BUNDLE" != "unknown" ]] || return 0
+  if pgrep -x "$APP_PROCESS" >/dev/null 2>&1; then
+    printf 'WARNING: a localvoxtral instance is still running; not relaunching the owner app at %s.\n' "$OWNER_APP_BUNDLE" >&2
+    return 0
+  fi
+  if [[ ! -d "$OWNER_APP_BUNDLE" ]]; then
+    printf 'WARNING: the owner app at %s is gone; not relaunching it.\n' "$OWNER_APP_BUNDLE" >&2
+    return 0
+  fi
+  # LOCALVOXTRAL_DATA_HOME too: the owner's app must reopen on the owner's
+  # History, not on the lane's folder that is deleted after the run (#985).
+  # LOCALVOXTRAL_DEFAULTS_SUITE: and on the owner's preferences (#1029).
+  if env -u RUNNER_TRACKING_ID -u LOCALVOXTRAL_DISABLE_LOGIN_KEYCHAIN -u LOCALVOXTRAL_DOGFOOD_AUDIO_FILE \
+    -u LOCALVOXTRAL_DATA_HOME -u LOCALVOXTRAL_DEFAULTS_SUITE open "$OWNER_APP_BUNDLE"; then
+    printf "Relaunched the owner's app at %s.\n" "$OWNER_APP_BUNDLE"
+  else
+    printf 'WARNING: failed to relaunch the owner app at %s.\n' "$OWNER_APP_BUNDLE" >&2
+  fi
+}
+
+# On a runner nobody sits at (LOCALVOXTRAL_DEDICATED_GUI=1, the Mac Mini),
+# answer the app's permission prompts: there, tccd matches no new CI build to
+# the last grant, so every build asks again for the microphone and for
+# Automation (#1838). Clicks Allow on each prompt naming the app for up to
+# $1 seconds; with `once`, returns after the first. On an attended Mac it
+# does nothing and the owner answers.
+answer_app_prompts() {
+  local seconds="$1" mode="${2:-}"
+  [[ "${LOCALVOXTRAL_DEDICATED_GUI:-0}" == 1 ]] || return 0
+  osascript >/dev/null 2>&1 <<OSA || true
+tell application "System Events"
+  repeat $((seconds * 2)) times
+    if exists process "UserNotificationCenter" then
+      tell process "UserNotificationCenter"
+        repeat with w in windows
+          if (value of static texts of w as text) contains "“$APP_PROCESS”" then
+            if exists button "Allow" of w then
+              click button "Allow" of w
+            else if exists button "OK" of w then
+              click button "OK" of w
+            end if
+            if "$mode" is "once" then return
+          end if
+        end repeat
+      end tell
+    end if
+    delay 0.5
+  end repeat
+end tell
+OSA
+}

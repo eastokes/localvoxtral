@@ -55,8 +55,26 @@ public struct ClaudeRemoteHTTPLimits: Sendable, Equatable {
 /// cases — no length, no prefix, no digest. A diagnostic that narrows a secret
 /// is not a diagnostic worth having.
 public enum ClaudeRemoteAuthorizationShape: Sendable, Equatable {
-    /// No `Authorization` header, or a `Bearer` scheme with an empty credential.
-    case missing
+    /// No `Authorization` header at all — the caller never attempted to
+    /// authenticate.
+    ///
+    /// Split from `.empty` deliberately, because the two have different
+    /// senders and opposite diagnoses. No generation of the plugin can produce
+    /// this shape: the pre-1.1.0 http hook declared a static
+    /// `Authorization: Bearer ${…}` entry in its manifest, and the command shim
+    /// that replaced it writes the header before it dials and fails open
+    /// without ever dialing when the token is unset. So an absent header means
+    /// something that is not a hook — the enrollment verify probe, a `curl`
+    /// during setup, anything else on loopback.
+    case absent
+    /// An `Authorization` header arrived and yielded no credential: a `Bearer`
+    /// scheme with nothing after it, or a value that is blank. (A non-blank
+    /// value naming some other scheme is `.malformed`, not this.)
+    ///
+    /// This is the pre-1.1.0 plugin's exact signature (`Bearer `, from a
+    /// `${CLAUDE_PLUGIN_OPTION_TOKEN}` Claude Code never expanded into an http
+    /// hook) and the only shape that earns the update-the-plugin remedy.
+    case empty
     /// Present, but not a `Bearer` credential we are willing to read.
     case malformed
     case bearer(String)
@@ -102,6 +120,11 @@ public enum ClaudeRemoteHTTPError: Error, Equatable {
     case unsupportedTransferEncoding
     case lengthRequired
     case bodyTooLarge(Int)
+}
+
+public enum ClaudeRemoteSessionStatus: String, Sendable {
+    case joined
+    case unknown
 }
 
 public enum ClaudeRemoteHTTPCodec {
@@ -253,25 +276,35 @@ public enum ClaudeRemoteHTTPCodec {
     /// hours of rejections said nothing about which of the two fixes — update the
     /// plugin, or re-run enrollment — the user actually needed.
     ///
+    /// `.absent` and `.empty` are likewise kept apart rather than collapsed into
+    /// one "no credential" answer. Collapsing them made the update-the-plugin
+    /// remedy fire for callers that are not hooks at all — the enrollment verify
+    /// probe posts to this endpoint with no `Authorization` header ON PURPOSE
+    /// and reads the 401 as its success signal — so a healthy setup wrote a line
+    /// accusing a current plugin, in the one subsystem whose documented
+    /// diagnostic route is reading the log later.
+    ///
     /// It classifies SHAPE only. The credential is returned for the caller to
     /// authenticate; nothing here measures, hashes, or reports it.
     public static func authorizationShape(
         in headerValue: String?,
         limits: ClaudeRemoteHTTPLimits = .default
     ) -> ClaudeRemoteAuthorizationShape {
-        guard let headerValue else { return .missing }
+        guard let headerValue else { return .absent }
         // Oversized before anything else: a header this long is not a credential
         // we failed to read, it is a header we refuse to read.
         guard headerValue.utf8.count <= limits.maxTokenBytes else { return .malformed }
         let parts = headerValue.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
-        guard let scheme = parts.first else { return .missing }
+        // A header that is present and blank still means the sender TRIED: a
+        // hook whose template expanded to nothing looks like this, and an
+        // anonymous caller does not send the field at all.
+        guard let scheme = parts.first else { return .empty }
         guard scheme.lowercased() == "bearer" else { return .malformed }
         // `Bearer` with an empty credential — including the header parser's
-        // already-trimmed `Bearer ` — is the pre-1.1.0 plugin's exact shape, and
-        // is reported as a missing token rather than a malformed header.
-        guard parts.count == 2 else { return .missing }
+        // already-trimmed `Bearer ` — is the pre-1.1.0 plugin's exact shape.
+        guard parts.count == 2 else { return .empty }
         let token = parts[1].trimmingCharacters(in: .whitespaces)
-        return token.isEmpty ? .missing : .bearer(token)
+        return token.isEmpty ? .empty : .bearer(token)
     }
 
     /// The event name a hook URL carries, e.g. `/v1/hook/SessionStart`.
@@ -286,47 +319,112 @@ public enum ClaudeRemoteHTTPCodec {
         return name
     }
 
+    /// The reply header that asks a host to run its agent for the session's
+    /// project terms, and its one value (`RemoteProjectTermRequests`).
+    public static let termsHeaderName = "X-Lvx-Terms"
+    public static let termsHeaderValue = "wanted"
+    /// The reply headers of quick capture's asks (#745,
+    /// `RemoteQuickCaptureRequests`): the host's README opening for the
+    /// session's project, and a draft whose id is the value.
+    public static let readmeHeaderName = "X-Lvx-Readme"
+    public static let readmeHeaderValue = "wanted"
+    public static let draftHeaderName = "X-Lvx-Draft"
+    /// The reply header of `/v1/doctor` (`RemoteDoctorRoute`): how many of
+    /// the Mac's checks failed, in decimal. The host's `localvoxtral doctor`
+    /// takes its exit status from this number, not from the body's wording.
+    public static let doctorFailedHeaderName = "X-Lvx-Doctor-Failed"
+    public static let modProofHeaderName = "X-Lvx-Mod-Proof"
+
+    /// A draft id as the Mac mints it and the host shim accepts it: 32
+    /// lowercase hex digits.
+    public static func isDraftID(_ value: String) -> Bool {
+        value.utf8.count == 32 && value.utf8.allSatisfy { byte in
+            (byte >= UInt8(ascii: "0") && byte <= UInt8(ascii: "9"))
+                || (byte >= UInt8(ascii: "a") && byte <= UInt8(ascii: "f"))
+        }
+    }
+
     /// Serialize a response. Always `Connection: close` — one request per
     /// connection means a peer can never keep a slot alive by going quiet
     /// between requests.
-    public static func response(status: Int, body: Data? = nil) -> Data {
+    public static func response(
+        status: Int,
+        body: Data? = nil,
+        sessionStatus: ClaudeRemoteSessionStatus? = nil,
+        termsWanted: Bool = false,
+        readmeWanted: Bool = false,
+        draftID: String? = nil,
+        doctorFailed: Int? = nil,
+        modProof: String? = nil,
+        contentType: String = "application/json"
+    ) -> Data {
         var head = "HTTP/1.1 \(status) \(reasonPhrase(for: status))\r\n"
         head += "Connection: close\r\n"
-        head += "Content-Type: application/json\r\n"
+        head += "Content-Type: \(contentType)\r\n"
         head += "Content-Length: \(body?.count ?? 0)\r\n"
         if status == 401 { head += "WWW-Authenticate: Bearer\r\n" }
+        if status == 200, let sessionStatus {
+            head += "X-Lvx-Session: \(sessionStatus.rawValue)\r\n"
+        }
+        // The Mac asks this session's host for its project's terms (#641).
+        // Fixed bytes like the line above: the host shim matches them
+        // exactly, and they never reach its stdout.
+        if status == 200, termsWanted {
+            head += "\(termsHeaderName): \(termsHeaderValue)\r\n"
+        }
+        if status == 200, readmeWanted {
+            head += "\(readmeHeaderName): \(readmeHeaderValue)\r\n"
+        }
+        if status == 200, let draftID, isDraftID(draftID) {
+            head += "\(draftHeaderName): \(draftID)\r\n"
+        }
+        if status == 200, let doctorFailed, doctorFailed >= 0 {
+            head += "\(doctorFailedHeaderName): \(doctorFailed)\r\n"
+        }
+        // A remote mod answer's HMAC (#1412): 64 hex digits or nothing. A
+        // refusal carries one too, so the mod can tell the app's from a
+        // squatter's.
+        if let modProof, modProof.utf8.count == 64,
+           modProof.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) {
+            head += "\(modProofHeaderName): \(modProof)\r\n"
+        }
         head += "\r\n"
         var data = Data(head.utf8)
         if let body { data.append(body) }
         return data
     }
 
-    /// The ONLY body shape this listener ever returns.
+    /// The ONE body shape this listener ever returns — a constant, not a
+    /// function of anything the request said.
     ///
-    /// `ClaudeHookOutput` has exactly two properties, so the response key
-    /// allowlist (`terminalSequence`, `suppressOutput`) is a property of the
-    /// type rather than of a filter someone has to remember to apply. Claude
-    /// Code executes what it finds here — an extra key would at best be ignored
-    /// and at worst be a control channel we did not mean to open.
-    public static func markerResponseBody(marker: String?) -> Data {
-        if let line = ClaudeHookOutput.markerOutputLine(marker: marker) { return line }
-        // No marker, or a marker we are not willing to emit: still answer, but
-        // with nothing for the terminal to execute.
+    /// `ClaudeHookOutput` has exactly one property, so the response key
+    /// allowlist (`suppressOutput`) is a property of the type rather than of a
+    /// filter someone has to remember to apply. Claude Code executes what it
+    /// finds here — an extra key would at best be ignored and at worst be a
+    /// control channel we did not mean to open — and being a CONSTANT is the
+    /// stronger statement: no accepted record, and no rejected one, can vary
+    /// what the remote shim is allowed to print.
+    public static let hookResponseBody: Data = {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-        return (try? encoder.encode(ClaudeHookOutput(terminalSequence: nil))) ?? Data("{}".utf8)
-    }
+        return (try? encoder.encode(ClaudeHookOutput())) ?? Data("{\"suppressOutput\":true}".utf8)
+    }()
 
     static func reasonPhrase(for status: Int) -> String {
         switch status {
         case 200: return "OK"
+        case 202: return "Accepted"
+        case 204: return "No Content"
         case 400: return "Bad Request"
         case 401: return "Unauthorized"
+        case 403: return "Forbidden"
         case 404: return "Not Found"
         case 405: return "Method Not Allowed"
         case 411: return "Length Required"
+        case 409: return "Conflict"
         case 413: return "Payload Too Large"
         case 431: return "Request Header Fields Too Large"
+        case 503: return "Service Unavailable"
         default: return "Error"
         }
     }

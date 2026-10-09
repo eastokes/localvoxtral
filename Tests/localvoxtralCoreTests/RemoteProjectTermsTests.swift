@@ -1,0 +1,582 @@
+import ClaudeContextWire
+import Foundation
+import Synchronization
+import XCTest
+@testable import localvoxtralCore
+import localvoxtralTestSupport
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
+
+/// The Mac's half of #641 over a real loopback socket: which hook reply
+/// carries `X-Lvx-Terms: wanted`, and which `POST /v1/terms` lands in the
+/// learned terms. The host half is `scripts/ci/test-remote-shim-terms.sh`.
+final class RemoteProjectTermsTests: XCTestCase {
+    private final class MemoryHostStore: ClaudeRemoteHostStoreIO, @unchecked Sendable {
+        private let contents = Mutex<Data?>(nil)
+        func read(from url: URL) throws -> Data? { contents.withLock { $0 } }
+        func write(_ data: Data, to url: URL) throws { contents.withLock { $0 = data } }
+    }
+
+    private final class FakeStore: ProjectTermProposalStoring, @unchecked Sendable {
+        let memory = Mutex(LearnedTerms())
+        let now: @Sendable () -> Date
+        init(now: @escaping @Sendable () -> Date) { self.now = now }
+        func snapshot() -> LearnedTerms { memory.withLock { $0 } }
+        func recordProposal(
+            _ terms: [String], line: String?, revision: Int?,
+            agent: ProjectTermProposal.Agent,
+            project: LearnedTermProjectIdentity,
+            excluding: [String]
+        ) {
+            let moment = now()
+            memory.withLock { $0.recordProposal(terms, line: line, revision: revision, agent: agent, project: project, excluding: excluding, now: moment) }
+        }
+        func recordProposalFailure(project: LearnedTermProjectIdentity) {
+            let moment = now()
+            memory.withLock { $0.recordProposalFailure(project: project, now: moment) }
+        }
+    }
+
+    private final class Clock: @unchecked Sendable {
+        private let value = Mutex(Date(timeIntervalSince1970: 3_000_000))
+        func now() -> Date { value.withLock { $0 } }
+        func advance(_ seconds: TimeInterval) { value.withLock { $0 = $0.addingTimeInterval(seconds) } }
+    }
+
+    private struct Response {
+        var status: Int
+        var headers: [String: String]
+    }
+
+    private let clock = Clock()
+    private var hosts: ClaudeRemoteHostRegistry!
+    private var sessions: ClaudeSessionRegistry!
+    private var store: FakeStore!
+    private var requests: RemoteProjectTermRequests!
+    private var usage: UsageLedger!
+    private var listener: ClaudeRemoteContextListener!
+    private var port: UInt16 = 0
+    private var token = ""
+    private var hostID = ""
+
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        let clock = clock
+        hosts = try ClaudeRemoteHostRegistry(
+            fileURL: URL(fileURLWithPath: "/tmp/lvx-remote-terms-hosts.json"),
+            io: MemoryHostStore(),
+            now: { clock.now() }
+        )
+        let enrollment = try hosts.enroll(label: "buildhost")
+        token = enrollment.token
+        hostID = enrollment.host.id
+        sessions = ClaudeSessionRegistry(now: { clock.now() }, isProcessAlive: { _ in true })
+        store = FakeStore(now: { clock.now() })
+        usage = UsageLedger(fileURL: nil)
+        requests = RemoteProjectTermRequests(store: store, hosts: hosts, now: { clock.now() }, usageRecorder: usage)
+        port = try unusedLoopbackPort()
+        listener = ClaudeRemoteContextListener(
+            registry: sessions,
+            hosts: hosts,
+            limits: ClaudeRemoteListenerLimits(port: port),
+            now: { clock.now() },
+            projectTerms: requests
+        )
+        try listener.start()
+    }
+
+    override func tearDown() {
+        listener?.stop()
+        listener = nil
+        super.tearDown()
+    }
+
+    // MARK: Client
+
+    private func send(path: String, headers: [String: String], body: Data, contentLength: Int? = nil) throws -> Response {
+        var head = "POST \(path) HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: \(contentLength ?? body.count)\r\n"
+        for (name, value) in headers.sorted(by: { $0.key < $1.key }) { head += "\(name): \(value)\r\n" }
+        head += "\r\n"
+        let request = Data(head.utf8) + body
+
+        let fd = socket(AF_INET, POSIXSocket.stream, 0)
+        XCTAssertGreaterThanOrEqual(fd, 0)
+        defer { close(fd) }
+        var address = sockaddr_in()
+        POSIXSocket.setLength(of: &address)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = port.bigEndian
+        address.sin_addr = in_addr(s_addr: INADDR_LOOPBACK.bigEndian)
+        let connected = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                connect(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        XCTAssertEqual(connected, 0)
+        var timeout = timeval(tv_sec: 5, tv_usec: 0)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        _ = request.withUnsafeBytes { raw -> Int in
+            var offset = 0
+            while offset < raw.count {
+                let written = write(fd, raw.baseAddress!.advanced(by: offset), raw.count - offset)
+                if written <= 0 { break }
+                offset += written
+            }
+            return offset
+        }
+        shutdown(fd, Int32(SHUT_WR))
+        var received = Data()
+        var chunk = [UInt8](repeating: 0, count: 4096)
+        while true {
+            let count = read(fd, &chunk, chunk.count)
+            if count <= 0 { break }
+            received.append(contentsOf: chunk[0..<count])
+        }
+        let text = String(decoding: received, as: UTF8.self)
+        let lines = text.components(separatedBy: "\r\n")
+        let status = Int(lines.first?.split(separator: " ").dropFirst().first ?? "") ?? 0
+        var parsed: [String: String] = [:]
+        for line in lines.dropFirst() {
+            if line.isEmpty { break }
+            guard let colon = line.firstIndex(of: ":") else { continue }
+            parsed[line[..<colon].lowercased()] = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+        }
+        return Response(status: status, headers: parsed)
+    }
+
+    /// A hook as the host shim sends it: Claude Code's event JSON, the token,
+    /// the shim's version and, for Vibe, the agent header.
+    @discardableResult
+    private func hook(
+        _ event: String,
+        session: String,
+        agent: ProjectTermProposal.Agent = .claude,
+        version: String? = nil,
+        project: String? = nil,
+        token: String? = nil
+    ) throws -> Response {
+        var headers = ["Authorization": "Bearer \(token ?? self.token)", "Content-Type": "application/json"]
+        switch agent {
+        case .claude:
+            headers["X-Lvx-Plugin-Version"] = version ?? RemoteProjectTermRequests.minimumPluginVersion
+        case .vibe:
+            headers["X-Lvx-Agent"] = "vibe"
+            headers["X-Lvx-Vibe-Hooks-Version"] = version ?? RemoteProjectTermRequests.minimumVibeHooksVersion
+        case .opencode:
+            preconditionFailure("opencode has no remote shim")
+        }
+        if let project { headers["X-Lvx-Env-Project"] = project }
+        let body = #"{"hook_event_name":"\#(event)","session_id":"\#(session)","cwd":"/srv/work/quill-fix","prompt":"hello"}"#
+        return try send(path: "/v1/hook/\(event)", headers: headers, body: Data(body.utf8))
+    }
+
+    private func answer(
+        session: String,
+        agent: ProjectTermProposal.Agent = .claude,
+        body: String = #"{"terms":["Quillmark","Glyph Atlas","https://example.com"]}"#,
+        usage: String? = nil,
+        token: String? = nil,
+        contentLength: Int? = nil
+    ) throws -> Response {
+        var headers = ["Authorization": "Bearer \(token ?? self.token)", "X-Lvx-Terms-Session": session]
+        if agent == .vibe { headers["X-Lvx-Agent"] = "vibe" }
+        if let usage { headers["X-Lvx-Usage"] = usage }
+        return try send(path: "/v1/terms", headers: headers, body: Data(body.utf8), contentLength: contentLength)
+    }
+
+    private func key(_ session: String, agent: ProjectTermProposal.Agent = .claude) -> String {
+        (agent == .vibe ? "vibe:" : "") + "remote:\(hostID):\(session)"
+    }
+
+    /// The commit path: the dictation joined this session.
+    @discardableResult
+    private func dictate(into session: String, agent: ProjectTermProposal.Agent = .claude) throws -> Bool {
+        let snapshot = try XCTUnwrap(sessions.snapshot(sessionID: key(session, agent: agent)))
+        return requests.request(for: snapshot, excluding: ["inkwell"])
+    }
+
+    private var wanted: String { ClaudeRemoteHTTPCodec.termsHeaderValue }
+    private var termsHeader: String { ClaudeRemoteHTTPCodec.termsHeaderName.lowercased() }
+
+    // MARK: The ask
+
+    func testTheNextHookOfAJoinedSessionIsAskedExactlyOnce() throws {
+        try hook("SessionStart", session: "s1")
+        XCTAssertNil(try hook("Stop", session: "s1").headers[termsHeader], "nothing asks before a dictation")
+
+        XCTAssertTrue(try dictate(into: "s1"))
+        let asked = try hook("UserPromptSubmit", session: "s1")
+        XCTAssertEqual(asked.status, 200)
+        XCTAssertEqual(asked.headers[termsHeader], wanted)
+        XCTAssertEqual(asked.headers["x-lvx-session"], "joined")
+        XCTAssertNil(try hook("Stop", session: "s1").headers[termsHeader], "the header goes out once")
+        XCTAssertFalse(try dictate(into: "s1"), "the project is stamped: a second dictation asks nothing")
+    }
+
+    func testOnlyTheMarkedSessionIsAsked() throws {
+        try hook("SessionStart", session: "s1")
+        try hook("SessionStart", session: "s2")
+        try dictate(into: "s1")
+        XCTAssertNil(try hook("UserPromptSubmit", session: "s2").headers[termsHeader])
+        XCTAssertEqual(try hook("UserPromptSubmit", session: "s1").headers[termsHeader], wanted)
+    }
+
+    func testAHostOnAnOldShimIsNeverAsked() throws {
+        try hook("SessionStart", session: "s1", version: "1.14.0")
+        XCTAssertFalse(try dictate(into: "s1"))
+        XCTAssertNil(try hook("UserPromptSubmit", session: "s1", version: "1.14.0").headers[termsHeader])
+        XCTAssertTrue(store.snapshot().needsProposal(projectKey: "remote:quill-fix", now: clock.now()))
+
+        try hook("SessionStart", session: "v1", agent: .vibe, version: "1.1.0")
+        XCTAssertFalse(try dictate(into: "v1", agent: .vibe))
+    }
+
+    func testAnOldSessionOnAnUpdatedHostKeepsItsMarkUnsent() throws {
+        try hook("SessionStart", session: "new")
+        try hook("SessionStart", session: "old", version: "1.14.0")
+        XCTAssertTrue(try dictate(into: "old"), "the host reported a new shim")
+        XCTAssertNil(try hook("Stop", session: "old", version: "1.14.0").headers[termsHeader])
+        XCTAssertEqual(try answer(session: "old").status, 409, "an ask that never went out takes no answer")
+    }
+
+    func testAMarkExpiresWhenTheSessionStaysQuiet() throws {
+        try hook("SessionStart", session: "s1")
+        try dictate(into: "s1")
+        clock.advance(RemoteProjectTermRequests.markLifetime + 1)
+        XCTAssertNil(try hook("UserPromptSubmit", session: "s1").headers[termsHeader])
+    }
+
+    func testARevokedHostOrALocalJoinIsNotAsked() throws {
+        let local = try XCTUnwrap(sessions.ingest(
+            ClaudeHookRecord(event: .sessionStart, sessionID: "local-1", timestamp: 0, rawCwd: "/work/quill"),
+            origin: .localAuthenticated(peerUID: 501)))
+        XCTAssertFalse(requests.request(for: local, excluding: []), "a local join is never the host's to answer")
+
+        try hook("SessionStart", session: "s1")
+        let snapshot = try XCTUnwrap(sessions.snapshot(sessionID: key("s1")))
+        try hosts.revoke(hostID: hostID)
+        XCTAssertFalse(requests.request(for: snapshot, excluding: []))
+    }
+
+    // MARK: The answer
+
+    func testAnAnswerLandsAsUnconfirmedProposalsUnderTheSessionsProject() throws {
+        try hook("SessionStart", session: "s1", project: "quillmark")
+        try dictate(into: "s1")
+        try hook("UserPromptSubmit", session: "s1", project: "quillmark")
+
+        XCTAssertEqual(try answer(session: "s1").status, 200)
+        let memory = store.snapshot()
+        let project = try XCTUnwrap(memory.projects.first { $0.key == "remote:quillmark" })
+        XCTAssertNotNil(project.proposedAt)
+        XCTAssertEqual(project.terms.map(\.term), ["Quillmark", "Glyph Atlas"], "a URL is not term-shaped")
+        XCTAssertEqual(project.terms.map(\.sources), [["agent:claude"], ["agent:claude"]])
+        XCTAssertTrue(project.terms.allSatisfy(\.isUnconfirmedProposal))
+        XCTAssertEqual(try answer(session: "s1").status, 409, "one answer per ask")
+    }
+
+    /// #891: the answer's sentence lands on the project. A project answered
+    /// before is asked again only through a runner that asks for it.
+    func testTheProjectsSentenceLandsAndAnOldAnswerIsAskedAgainOnlyByANewShim() throws {
+        let old = RemoteProjectTermRequests.minimumPluginVersion
+        try hook("SessionStart", session: "s1", version: old, project: "quillmark")
+        try dictate(into: "s1")
+        try hook("UserPromptSubmit", session: "s1", version: old, project: "quillmark")
+        XCTAssertEqual(try answer(session: "s1").status, 200)
+        XCTAssertNil(store.snapshot().projects.first { $0.key == "remote:quillmark" }?.agentLineAt)
+
+        clock.advance(ProjectTermProposal.retryAfter)
+        try hook("SessionStart", session: "s1b", version: old, project: "quillmark")
+        XCTAssertFalse(try dictate(into: "s1b"), "the host's runner does not ask for the sentence")
+
+        let new = RemoteProjectTermRequests.minimumLinePluginVersion
+        try hook("SessionStart", session: "s2", version: new, project: "quillmark")
+        XCTAssertTrue(try dictate(into: "s2"))
+        try hook("UserPromptSubmit", session: "s2", version: new, project: "quillmark")
+        let body = #"{"terms":["Quillmark","qmk"],"description":"Quillmark renders Markdown to PDF: the qmk CLI, page sizes, fonts."}"#
+        XCTAssertEqual(try answer(session: "s2", body: body).status, 200)
+        let project = try XCTUnwrap(store.snapshot().projects.first { $0.key == "remote:quillmark" })
+        XCTAssertEqual(project.agentLine, "Quillmark renders Markdown to PDF: the qmk CLI, page sizes, fonts.")
+        XCTAssertEqual(project.terms.map(\.term), ["Quillmark", "qmk"], "the newer answer replaces the older one's (#914)")
+
+        clock.advance(ProjectTermProposal.retryAfter)
+        try hook("SessionStart", session: "s3", version: new, project: "quillmark")
+        XCTAssertFalse(try dictate(into: "s3"), "answered with the sentence: not asked again")
+
+        // Vibe's runner has no schema flag: an answer without the sentence
+        // still counts, or the host's done stamp leaves the Mac asking daily.
+        try hook("SessionStart", session: "v1", agent: .vibe, version: RemoteProjectTermRequests.minimumLineVibeHooksVersion, project: "inkwell")
+        XCTAssertTrue(try dictate(into: "v1", agent: .vibe))
+        try hook("UserPromptSubmit", session: "v1", agent: .vibe, version: RemoteProjectTermRequests.minimumLineVibeHooksVersion, project: "inkwell")
+        XCTAssertEqual(try answer(session: "v1", agent: .vibe, body: #"{"terms":["inkwell"]}"#).status, 200)
+        let inkwell = try XCTUnwrap(store.snapshot().projects.first { $0.key == "remote:inkwell" })
+        XCTAssertNil(inkwell.agentLine)
+        XCTAssertNotNil(inkwell.agentLineAt)
+    }
+
+    /// #914: a project answered through a runner that asked for the code's
+    /// names is asked once more, only by a runner that asks for names people
+    /// say, and that answer replaces the old one's untouched terms.
+    func testAnAnswerToTheOldPromptIsAskedAgainOnlyByTheSpokenNamesShim() throws {
+        let line = RemoteProjectTermRequests.minimumLinePluginVersion
+        try hook("SessionStart", session: "s1", version: line, project: "quillmark")
+        try dictate(into: "s1")
+        try hook("UserPromptSubmit", session: "s1", version: line, project: "quillmark")
+        XCTAssertEqual(try answer(session: "s1", body: #"{"terms":["Quillmark","qmk"],"description":"Quillmark."}"#).status, 200)
+
+        clock.advance(ProjectTermProposal.retryAfter)
+        try hook("SessionStart", session: "s2", version: line, project: "quillmark")
+        XCTAssertFalse(try dictate(into: "s2"), "the host's runner asks the same prompt")
+
+        let spoken = RemoteProjectTermRequests.minimumSpokenPluginVersion
+        try hook("SessionStart", session: "s3", version: spoken, project: "quillmark")
+        XCTAssertTrue(try dictate(into: "s3"))
+        try hook("UserPromptSubmit", session: "s3", version: spoken, project: "quillmark")
+        XCTAssertEqual(try answer(session: "s3", body: #"{"terms":["Quillmark","Bindery"],"description":"Quillmark."}"#).status, 200)
+        let project = try XCTUnwrap(store.snapshot().projects.first { $0.key == "remote:quillmark" })
+        XCTAssertEqual(project.terms.map(\.term), ["Quillmark", "Bindery"])
+        XCTAssertEqual(project.answeredRevision, ProjectTermProposal.promptRevision)
+
+        clock.advance(ProjectTermProposal.retryAfter)
+        try hook("SessionStart", session: "s4", version: spoken, project: "quillmark")
+        XCTAssertFalse(try dictate(into: "s4"), "answered with the current prompt")
+    }
+
+    func testEachAnswerCountsOneHostRunWithoutUsage() throws {
+        try hook("SessionStart", session: "s1", project: "quillmark")
+        try dictate(into: "s1")
+        try hook("UserPromptSubmit", session: "s1", project: "quillmark")
+        XCTAssertEqual(try answer(session: "s1", token: String(repeating: "A", count: 43)).status, 401)
+        XCTAssertTrue(usage.entries().isEmpty, "a refused answer is no run of ours")
+
+        XCTAssertEqual(try answer(session: "s1").status, 200)
+        XCTAssertEqual(try answer(session: "s1").status, 409)
+
+        XCTAssertEqual(
+            usage.entries(),
+            [UsageEntry(date: clock.now(), feature: .projectTerms, backend: .claudeCode, model: "sonnet")]
+        )
+    }
+
+    /// A 1.19.0 shim sends Claude Code's result object; its usage lands in
+    /// the ledger and its terms in the store, as a local run's do.
+    func testAClaudeResultObjectRecordsTheRunsTokensAndPrice() throws {
+        try hook("SessionStart", session: "s1", project: "quillmark")
+        try dictate(into: "s1")
+        try hook("UserPromptSubmit", session: "s1", project: "quillmark")
+
+        XCTAssertEqual(try answer(session: "s1", body: AgentUsageFixtures.claudeTermsResult).status, 200)
+
+        let project = try XCTUnwrap(store.snapshot().projects.first { $0.key == "remote:quillmark" })
+        XCTAssertEqual(project.terms.map(\.term), ["Quillmark", "Glyph Atlas"])
+        XCTAssertEqual(
+            usage.entries(),
+            [.agentRun(date: clock.now(), feature: .projectTerms, agent: .claude, usage: AgentUsageFixtures.claudeTermsUsage)]
+        )
+        let entry = try XCTUnwrap(usage.entries().first)
+        XCTAssertEqual(entry.promptTokens, 4 + 16017 + 14686)
+        XCTAssertEqual(entry.agentCostUSD, 0.0839732)
+    }
+
+    func testAVibeAnswerCarriesItsCountsInAHeaderAndABadOneIsIgnored() throws {
+        for (session, header, expected) in [
+            ("v1", "13626 10944 16", AgentUsageFixtures.vibeUsage),
+            ("v2", "13626 10944", nil),
+            ("v3", "1 2 3 4", nil),
+            ("v4", "-1 0 0", nil),
+            ("v5", "12345678901 0 0", nil),
+        ] as [(String, String, ProjectTermProposal.Usage?)] {
+            try hook("UserPromptSubmit", session: session, agent: .vibe, project: "quill-\(session)")
+            XCTAssertTrue(try dictate(into: session, agent: .vibe), session)
+            try hook("Stop", session: session, agent: .vibe, project: "quill-\(session)")
+            XCTAssertEqual(
+                try answer(session: session, agent: .vibe, body: #"{"terms":["qmk"]}"#, usage: header).status, 200, session)
+            XCTAssertEqual(
+                usage.entries().last,
+                .agentRun(date: clock.now(), feature: .projectTerms, agent: .vibe, usage: expected), header)
+        }
+    }
+
+    /// The shipped runner, run as the hook shim starts it, against this
+    /// listener: Claude Code's run sends its result object, Vibe's its text
+    /// with the counts from the session log.
+    func testTheShippedRunnerSendsEachAgentsUsage() throws {
+        let host = try AgentUsageFixtures.Host(
+            agents: [
+                "claude": AgentUsageFixtures.fakeClaude(printing: AgentUsageFixtures.claudeTermsResult),
+                "vibe": AgentUsageFixtures.fakeVibe(printing: #"{"terms":["Quillmark"]}"#),
+            ],
+            testCase: self)
+        for (session, agent) in [("s1", ProjectTermProposal.Agent.claude), ("v1", .vibe)] {
+            let project = "quill-\(session)"
+            try hook("UserPromptSubmit", session: session, agent: agent, project: project)
+            XCTAssertTrue(try dictate(into: session, agent: agent))
+            XCTAssertEqual(try hook("Stop", session: session, agent: agent, project: project).headers[termsHeader], wanted)
+            let stamp = host.home.appendingPathComponent("stamp-\(session)", isDirectory: true)
+            try FileManager.default.createDirectory(at: stamp, withIntermediateDirectories: true)
+
+            try host.run(
+                "terms.sh",
+                [agent == .claude ? "claude" : "vibe", "\(port)", session, host.project.path, stamp.path, host.userVibe.path],
+                token: token)
+
+            XCTAssertTrue(FileManager.default.fileExists(atPath: stamp.appendingPathComponent("done").path), "the Mac said 200")
+        }
+        XCTAssertEqual(
+            usage.entries(),
+            [
+                .agentRun(date: clock.now(), feature: .projectTerms, agent: .claude, usage: AgentUsageFixtures.claudeTermsUsage),
+                .agentRun(date: clock.now(), feature: .projectTerms, agent: .vibe, usage: AgentUsageFixtures.vibeUsage),
+            ]
+        )
+    }
+
+    func testAVibeSessionsAnswerIsFiledAsVibes() throws {
+        try hook("UserPromptSubmit", session: "v1", agent: .vibe)
+        XCTAssertTrue(try dictate(into: "v1", agent: .vibe))
+        XCTAssertEqual(try hook("Stop", session: "v1", agent: .vibe).headers[termsHeader], wanted)
+        XCTAssertEqual(try answer(session: "v1", agent: .claude).status, 409, "the agent must match")
+        XCTAssertEqual(try answer(session: "v1", agent: .vibe, body: "```json\n{\"terms\":[\"inkwell\",\"qmk\"]}\n```").status, 200)
+        let project = try XCTUnwrap(store.snapshot().projects.first { $0.key == "remote:quill-fix" })
+        XCTAssertEqual(project.terms.map(\.term), ["qmk"], "a term the user refused is dropped")
+        XCTAssertEqual(project.terms.first?.sources, ["agent:vibe"])
+    }
+
+    func testAnswersTheMacDidNotAskForAreRefused() throws {
+        try hook("SessionStart", session: "s1")
+        try hook("SessionStart", session: "idle")
+        try dictate(into: "s1")
+        try hook("UserPromptSubmit", session: "s1")
+
+        XCTAssertEqual(try answer(session: "s1", token: String(repeating: "A", count: 43)).status, 401)
+        XCTAssertEqual(try answer(session: "idle").status, 409, "a session that was not asked")
+        XCTAssertEqual(try answer(session: "nobody").status, 409, "a session the Mac never saw")
+
+        let other = try hosts.enroll(label: "otherhost")
+        XCTAssertEqual(try answer(session: "s1", token: other.token).status, 409, "another host's session")
+
+        XCTAssertEqual(
+            try answer(session: "s1", body: "", contentLength: RemoteProjectTermRequests.maxAnswerBytes + 1).status, 413
+        )
+        XCTAssertEqual(try answer(session: "s1", body: "Here are the terms: Quillmark").status, 400)
+        XCTAssertTrue(store.snapshot().projects.allSatisfy { $0.terms.isEmpty }, "nothing refused was stored")
+    }
+
+    func testAnAnswerWithoutAValidSessionHeaderIsRefused() throws {
+        let response = try send(
+            path: "/v1/terms",
+            headers: ["Authorization": "Bearer \(token)", "X-Lvx-Terms-Session": "../etc"],
+            body: Data(#"{"terms":["x"]}"#.utf8)
+        )
+        XCTAssertEqual(response.status, 400)
+    }
+
+    func testAnAskThatWasNeverAnsweredExpires() throws {
+        try hook("SessionStart", session: "s1")
+        try dictate(into: "s1")
+        try hook("UserPromptSubmit", session: "s1")
+        clock.advance(RemoteProjectTermRequests.answerLifetime + 1)
+        XCTAssertEqual(try answer(session: "s1").status, 409)
+    }
+
+    // MARK: Trigger
+
+    func testTheProposerHandsARemoteJoinOverOnlyWithTheSettingOn() throws {
+        try hook("SessionStart", session: "s1")
+        let snapshot = try XCTUnwrap(sessions.snapshot(sessionID: key("s1")))
+        let proposer = ProjectTermProposer(
+            store: store,
+            runner: RefusingRunner(),
+            now: { [clock] in clock.now() }
+        )
+        proposer.attachRemote(requests)
+
+        XCTAssertNil(proposer.dictationCommitted(join: snapshot, enabled: false, excluding: []))
+        XCTAssertNil(try hook("Stop", session: "s1").headers[termsHeader], "the setting is off")
+        XCTAssertNil(proposer.dictationCommitted(join: snapshot, enabled: true, excluding: []), "no local run")
+        XCTAssertEqual(try hook("Stop", session: "s1").headers[termsHeader], wanted)
+    }
+
+    private struct RefusingRunner: ProjectTermProposalRunning {
+        func run(_ invocation: ProjectTermProposal.Invocation) async -> ProjectTermProposal.Outcome {
+            XCTFail("a remote join must never run an agent on this machine")
+            return .failed(.launchFailed)
+        }
+    }
+
+    // MARK: Contract with the shipped files
+
+    func testTheShimsReadTheHeaderAndTheRunnerMatchesTheLocalRun() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        func text(_ path: String) throws -> String {
+            try String(contentsOf: root.appendingPathComponent(path), encoding: .utf8)
+        }
+        let claudeShim = try text("integrations/claude-code/plugins/localvoxtral-remote/hooks/post.sh")
+        let vibeShim = try text("integrations/vibe/remote/post.sh")
+        let runner = try text("integrations/claude-code/plugins/localvoxtral-remote/hooks/terms.sh")
+
+        // The shim reports the version it ships, which must be one the Mac
+        // asks for terms.
+        let shipped = ClaudeRemoteEnrollmentService.remotePluginVersion
+        XCTAssertTrue(claudeShim.contains("X-Lvx-Plugin-Version: \(shipped)"))
+        XCTAssertFalse(ClaudeRemotePluginVersionCodec.isVersion(
+            shipped, olderThan: RemoteProjectTermRequests.minimumPluginVersion
+        ))
+        let vibeVersion = try XCTUnwrap(VibeRemoteHooksFiles(
+            postScript: vibeShim, compactScript: "", hooksBlock: "", termsScript: "", captureScript: ""
+        ).version)
+        XCTAssertFalse(ClaudeRemotePluginVersionCodec.isVersion(
+            vibeVersion, olderThan: RemoteProjectTermRequests.minimumVibeHooksVersion
+        ))
+        // The shipped runner asks for the project's sentence (#891).
+        XCTAssertFalse(ClaudeRemotePluginVersionCodec.isVersion(
+            shipped, olderThan: RemoteProjectTermRequests.minimumLinePluginVersion
+        ))
+        XCTAssertFalse(ClaudeRemotePluginVersionCodec.isVersion(
+            vibeVersion, olderThan: RemoteProjectTermRequests.minimumLineVibeHooksVersion
+        ))
+        // And for names people say (#914).
+        XCTAssertFalse(ClaudeRemotePluginVersionCodec.isVersion(
+            shipped, olderThan: RemoteProjectTermRequests.minimumSpokenPluginVersion
+        ))
+        XCTAssertFalse(ClaudeRemotePluginVersionCodec.isVersion(
+            vibeVersion, olderThan: RemoteProjectTermRequests.minimumSpokenVibeHooksVersion
+        ))
+        for shim in [claudeShim, vibeShim] {
+            XCTAssertTrue(shim.contains("[Xx]-[Ll][Vv][Xx]-[Tt][Ee][Rr][Mm][Ss]: \(wanted)$"))
+        }
+        XCTAssertTrue(runner.contains("\(RemoteProjectTermRequests.answerSessionHeaderName): $SESSION_ID"))
+        XCTAssertTrue(runner.contains(RemoteProjectTermRequests.answerPath))
+        XCTAssertTrue(runner.contains("head -c \(RemoteProjectTermRequests.maxAnswerBytes)"))
+
+        // The same run as the app's local one (ProjectTermProposal), but for
+        // Vibe's output mode.
+        XCTAssertTrue(runner.contains("\n" + ProjectTermProposal.prompt + "\n"))
+        let quoted = ProjectTermProposal.claudeSystemPrompt.replacingOccurrences(of: "'", with: "'\"'\"'")
+        XCTAssertTrue(runner.contains("'\(quoted)'"))
+        XCTAssertTrue(runner.contains("'\(ProjectTermProposal.claudeJSONSchema)'"))
+        let claude = ProjectTermProposal.claudeArguments()
+        for (flag, value) in zip(claude, claude.dropFirst()) where flag.hasPrefix("--") && !value.hasPrefix("-") {
+            switch flag {
+            case "--system-prompt", "--json-schema": continue
+            default: XCTAssertTrue(runner.contains("\(flag) \(value)") || runner.contains("\(flag) '\(value)'"), flag)
+            }
+        }
+        let vibe = ProjectTermProposal.vibeArguments(trackedFiles: [])
+        for (flag, value) in zip(vibe, vibe.dropFirst()) where flag.hasPrefix("--") && !value.hasPrefix("-") && flag != "-p" {
+            switch flag {
+            case "--output": XCTAssertTrue(runner.contains("--output text"))
+            default: XCTAssertTrue(runner.contains("\(flag) \(value)") || runner.contains("\(flag) '\(value)'"), flag)
+            }
+        }
+        for flag in ["--experimental-harness", "--auto-approve", "--strict-mcp-config", "--no-session-persistence"] {
+            XCTAssertTrue(runner.contains(flag), flag)
+        }
+        XCTAssertTrue(runner.contains(#"Tracked files (read_file takes these paths):"#))
+        XCTAssertTrue(runner.contains("head -n \(ProjectTermProposal.maxListedFiles)"))
+    }
+}

@@ -2,8 +2,9 @@
 # localvoxtral-remote Claude Code hook shim — strict POSIX sh, needs only curl.
 #
 # Claude Code runs this once per hook event with the event JSON on stdin. Its
-# ONLY job is to POST that JSON, unchanged, to the tunnelled loopback listener
-# on the Mac, authenticated with the enrolled host's bearer token, and to print
+# ONLY job is to POST that JSON (a Notification or a Stop rebuilt, see below)
+# to the tunnelled loopback listener on the Mac, authenticated with the
+# enrolled host's bearer token, and to print
 # the listener's 200 response body on stdout for Claude Code to act on — but
 # only after gating it against the exact allowlisted ClaudeHookOutput grammar
 # (see the stdout gate at the bottom); anything else prints nothing.
@@ -30,8 +31,14 @@
 # publish the credential to every local user. The header therefore reaches
 # curl through a private tempfile (`--header @file`, curl >= 7.55; an older
 # curl treats the argument literally, sends no credential, gets a 401, and
-# fails open). The event JSON body rides stdin (`--data-binary @-`).
+# fails open). The event JSON body uses a second private file.
 set -u
+
+# Out of the environment before the first child starts (#1623): date, cat,
+# awk and curl have no use for the token, and curl reads it from a private
+# header file. The unexported shell variable is all the rest needs.
+TOKEN="${CLAUDE_PLUGIN_OPTION_TOKEN:-}"
+unset CLAUDE_PLUGIN_OPTION_TOKEN
 
 EVENT="${1:-Unknown}"
 
@@ -42,8 +49,184 @@ fail_open() {
   exit 0
 }
 
-TOKEN="${CLAUDE_PLUGIN_OPTION_TOKEN:-}"
-[ -n "$TOKEN" ] || fail_open
+# 0700 directories / 0600 files for EVERYTHING this shim creates — the header
+# tempfile below and both state stamps. Set before the first write, not just
+# before the tempfile.
+umask 077
+
+# --- Private per-user state dir --------------------------------------------
+# Holds host and per-session stamps, all best-effort and harmless to lose:
+#   hook-backoff  — epoch of the last transport failure (see backoff below)
+#   hook-status   — outcome of the last completed dial, for the OPT-IN status
+#                   line (statusline.sh in this directory). One line,
+#                   `<state> <epoch>`, state from a fixed grammar:
+#                   ok | down | unconfigured | http-<3 digits>.
+#   sessions/<id> — whether the Mac joined that session, `<joined|unknown>
+#                   <epoch>`.
+if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+  STAMP_DIR="$XDG_RUNTIME_DIR/localvoxtral"
+elif [ -n "${HOME:-}" ]; then
+  STAMP_DIR="$HOME/.cache/localvoxtral"
+else
+  STAMP_DIR=""
+fi
+STAMP="$STAMP_DIR/hook-backoff"
+STATUS_STAMP="$STAMP_DIR/hook-status"
+NOW="$(date +%s 2>/dev/null)" || NOW=""
+# Digits only, at most 12 of them (epoch seconds are 10 until year 2286): a
+# damaged value must never reach `[` or $(( )), where an oversized constant
+# aborts some shells — with output on stderr.
+case "$NOW" in *[!0-9]* | ?????????????*) NOW="" ;; esac
+
+# Record the last dial's outcome for statusline.sh. Same tempfile + mv -f
+# discipline as the backoff stamp (rename replaces a pre-planted symlink
+# instead of writing through it; a concurrent reader never sees a torn line),
+# and every failure is silent — losing the indicator is nothing next to
+# delivering the hook.
+write_status() {
+  [ -n "$STAMP_DIR" ] && [ -n "$NOW" ] || return 0
+  {
+    mkdir -p "$STAMP_DIR" && chmod 700 "$STAMP_DIR" \
+      && echo "$1 $NOW" >"$STATUS_STAMP.$$" && mv -f "$STATUS_STAMP.$$" "$STATUS_STAMP"
+  } 2>/dev/null || { rm -f "$STATUS_STAMP.$$"; } 2>/dev/null || :
+}
+
+# Private request workspace (0700/0600 under the umask above), removed on
+# every ordinary or trapped exit.
+WORK="$(mktemp -d 2>/dev/null)" || fail_open
+trap 'rm -rf "$WORK"' EXIT
+trap 'rm -rf "$WORK"; exit 0' HUP INT TERM
+
+# Buffer stdin once so the same bytes go to curl and the status stamp can be
+# keyed to Claude Code's session. A malformed or hostile id disables only the
+# per-session indicator.
+cat >"$WORK/event" 2>/dev/null || fail_open
+SESSION_ID="$(LC_ALL=C awk '
+  match($0, /"session_id"[[:space:]]*:[[:space:]]*"[^"]*"/) {
+    value = substr($0, RSTART, RLENGTH)
+    sub(/^"session_id"[[:space:]]*:[[:space:]]*"/, "", value)
+    sub(/"$/, "", value)
+    print value
+    exit
+  }
+' "$WORK/event" 2>/dev/null)" || SESSION_ID=""
+case "$SESSION_ID" in
+"" | *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-]*) SESSION_ID="" ;;
+*) [ "${#SESSION_ID}" -le 64 ] || SESSION_ID="" ;;
+esac
+
+# --- The plugin version this session runs (#1159) -----------------------------
+# `localvoxtral doctor` on this host names the sessions still running an older
+# plugin. Claude Code stopped writing the `.in_use/<pid>` markers it read
+# (none on 2.1.280 to 2.1.286), so every hook records its own version under the
+# session's id, and the doctor joins that to Claude Code's live sessions in
+# ~/.claude/sessions/<pid>.json. A reloaded session records its new version at
+# its next hook. Written when the recorded version differs, and refreshed on
+# SessionStart and UserPromptSubmit so that a live session's record outlasts
+# the age-out below.
+PLUGIN_VERSION=1.45.0
+VERSION_DIR="$STAMP_DIR/plugin-version"
+if [ -n "$STAMP_DIR" ] && [ -n "$SESSION_ID" ]; then
+  if [ "$EVENT" = "SessionEnd" ]; then
+    rm -f "$VERSION_DIR/$SESSION_ID" 2>/dev/null || :
+  else
+    RECORDED=""
+    { IFS= read -r RECORDED <"$VERSION_DIR/$SESSION_ID"; } 2>/dev/null || :
+    if [ "$RECORDED" != "$PLUGIN_VERSION" ] || [ "$EVENT" = "SessionStart" ] \
+      || [ "$EVENT" = "UserPromptSubmit" ]; then
+      {
+        mkdir -p "$VERSION_DIR" && chmod 700 "$STAMP_DIR" "$VERSION_DIR" \
+          && echo "$PLUGIN_VERSION" >"$VERSION_DIR/$SESSION_ID.$$" \
+          && mv -f "$VERSION_DIR/$SESSION_ID.$$" "$VERSION_DIR/$SESSION_ID"
+      } 2>/dev/null || { rm -f "$VERSION_DIR/$SESSION_ID.$$"; } 2>/dev/null || :
+    fi
+  fi
+  if [ "$EVENT" = "SessionStart" ] && [ -d "$VERSION_DIR" ]; then
+    find "$VERSION_DIR" -type f -mtime +6 -exec rm -f {} \; 2>/dev/null || :
+  fi
+fi
+
+# --- Notification: the type and nothing else (#717) ---------------------------
+# A Notification's `message` and `title` quote tool names and command text, so
+# its body is REBUILT here instead of posted as-is: the session id checked
+# above and a `notification_type` from a closed set, nothing more. A payload
+# missing either posts nothing.
+if [ "$EVENT" = "Notification" ]; then
+  NOTIFICATION_TYPE="$(LC_ALL=C awk '
+    match($0, /"notification_type"[[:space:]]*:[[:space:]]*"[^"]*"/) {
+      value = substr($0, RSTART, RLENGTH)
+      sub(/^"notification_type"[[:space:]]*:[[:space:]]*"/, "", value)
+      sub(/"$/, "", value)
+      print value
+      exit
+    }
+  ' "$WORK/event" 2>/dev/null)" || NOTIFICATION_TYPE=""
+  case "$NOTIFICATION_TYPE" in
+  permission_prompt | elicitation_dialog | elicitation_url_dialog | agent_needs_input) ;;
+  *) exit 0 ;;
+  esac
+  [ -n "$SESSION_ID" ] || exit 0
+  cat 2>/dev/null >"$WORK/event" <<EOF || exit 0
+{"hook_event_name":"Notification","session_id":"$SESSION_ID","notification_type":"$NOTIFICATION_TYPE"}
+EOF
+fi
+
+# --- Stop: the session and its cwd, never the reply (#818) ---------------------
+# A Stop carries `last_assistant_message`, the agent's whole reply, and the
+# owner ruling on #717 keeps that text on this host. The body is REBUILT from
+# the fields the Mac reads for a Stop: the session id checked above and the
+# payload's `cwd`. The cwd is copied as the JSON string token it already is,
+# quotes and escapes included, and only when that token matches strict JSON
+# string grammar: no raw quote, backslash or control byte, and only the
+# escapes JSON defines. A token that fails, or is over 4096 bytes, is dropped
+# and the Mac keeps the session's last known workspace. A payload without a
+# usable session id still dials, so the backoff and status stamps stay
+# current, and the Mac drops the record.
+if [ "$EVENT" = "Stop" ]; then
+  STOP_BODY='"hook_event_name":"Stop"'
+  if [ -n "$SESSION_ID" ]; then
+    STOP_BODY="$STOP_BODY,\"session_id\":\"$SESSION_ID\""
+    STOP_CWD="$(LC_ALL=C awk '
+      match($0, /"cwd"[[:space:]]*:[[:space:]]*"([^"\\[:cntrl:]]|\\["\\\/bfnrt]|\\u[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f])*"/) {
+        value = substr($0, RSTART, RLENGTH)
+        sub(/^"cwd"[[:space:]]*:[[:space:]]*/, "", value)
+        if (length(value) <= 4096) print value
+        exit
+      }
+    ' "$WORK/event" 2>/dev/null)" || STOP_CWD=""
+    [ -z "$STOP_CWD" ] || STOP_BODY="$STOP_BODY,\"cwd\":$STOP_CWD"
+  fi
+  cat 2>/dev/null >"$WORK/event" <<EOF || exit 0
+{$STOP_BODY}
+EOF
+fi
+
+SESSION_STAMP_DIR="$STAMP_DIR/sessions"
+if [ "$EVENT" = "SessionEnd" ] && [ -n "$STAMP_DIR" ] && [ -n "$SESSION_ID" ]; then
+  rm -f "$SESSION_STAMP_DIR/$SESSION_ID" 2>/dev/null || :
+fi
+if [ "$EVENT" = "SessionStart" ] && [ -n "$STAMP_DIR" ] \
+  && [ -d "$SESSION_STAMP_DIR" ]; then
+  find "$SESSION_STAMP_DIR" -type f -mtime +0 -exec rm -f {} \; 2>/dev/null || :
+fi
+
+write_session_status() {
+  [ -n "$STAMP_DIR" ] && [ -n "$NOW" ] && [ -n "$SESSION_ID" ] \
+    && [ "$EVENT" != "SessionEnd" ] || return 0
+  {
+    mkdir -p "$SESSION_STAMP_DIR" && chmod 700 "$STAMP_DIR" "$SESSION_STAMP_DIR" \
+      && echo "$1 $NOW" >"$SESSION_STAMP_DIR/$SESSION_ID.$$" \
+      && mv -f "$SESSION_STAMP_DIR/$SESSION_ID.$$" "$SESSION_STAMP_DIR/$SESSION_ID"
+  } 2>/dev/null || { rm -f "$SESSION_STAMP_DIR/$SESSION_ID.$$"; } 2>/dev/null || :
+}
+
+# No token is the one misconfiguration worth naming before failing open: the
+# plugin was installed without `--config token=…`, every future dial would be
+# a guaranteed 401, and nothing else on this host will ever say so.
+[ -n "$TOKEN" ] || {
+  write_status unconfigured
+  fail_open
+}
 command -v curl >/dev/null 2>&1 || fail_open
 
 # --- Listen port -------------------------------------------------------------
@@ -85,25 +268,22 @@ esac
 # the first prompt after the app comes back is grounded immediately — and its
 # completed exchange clears the backoff for every other event.
 #
-# State is one epoch-seconds stamp in a private per-user dir. Anything odd —
-# no usable dir, no epoch from date, garbage content, a clock that jumped
-# backwards — disables the backoff and the shim simply dials: exactly the
-# pre-backoff behavior, fail-open as ever.
+# SessionStart and SessionEnd always dial too: they fire once per session, so
+# they cannot storm either, and the stamp is shared by every session on this
+# host. Backing them off let one failure in any session hide every session
+# started in the next five minutes until its first prompt, and keep every
+# session ended in them joinable until the Mac's TTL.
+#
+# State is one epoch-seconds stamp in the private per-user dir derived above.
+# Anything odd — no usable dir, no epoch from date, garbage content, a clock
+# that jumped backwards — disables the backoff and the shim simply dials:
+# exactly the pre-backoff behavior, fail-open as ever.
 BACKOFF_SECONDS=300
-if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
-  STAMP_DIR="$XDG_RUNTIME_DIR/localvoxtral"
-elif [ -n "${HOME:-}" ]; then
-  STAMP_DIR="$HOME/.cache/localvoxtral"
-else
-  STAMP_DIR=""
-fi
-STAMP="$STAMP_DIR/hook-backoff"
-NOW="$(date +%s 2>/dev/null)" || NOW=""
-# Digits only, at most 12 of them (epoch seconds are 10 until year 2286): a
-# damaged value must never reach `[` or $(( )), where an oversized constant
-# aborts some shells — with output on stderr.
-case "$NOW" in *[!0-9]* | ?????????????*) NOW="" ;; esac
-if [ -n "$STAMP_DIR" ] && [ -n "$NOW" ] && [ "$EVENT" != "UserPromptSubmit" ] \
+case "$EVENT" in
+UserPromptSubmit | SessionStart | SessionEnd) BACKOFF_APPLIES=0 ;;
+*) BACKOFF_APPLIES=1 ;;
+esac
+if [ -n "$STAMP_DIR" ] && [ -n "$NOW" ] && [ "$BACKOFF_APPLIES" = 1 ] \
   && [ -r "$STAMP" ]; then
   LAST="$(cat "$STAMP" 2>/dev/null)" || LAST=""
   case "$LAST" in
@@ -116,20 +296,18 @@ if [ -n "$STAMP_DIR" ] && [ -n "$NOW" ] && [ "$EVENT" != "UserPromptSubmit" ] \
   esac
 fi
 
-# 0700 directory / 0600 files for the header tempfile; removed on every exit.
-# Known, accepted leak: a SIGKILL (Claude Code escalating past the hook
-# timeout) skips the traps and strands one 0700 dir — private to the user,
-# bounded by how often hooks get killed.
-umask 077
-WORK="$(mktemp -d 2>/dev/null)" || fail_open
-trap 'rm -rf "$WORK"' EXIT
-trap 'rm -rf "$WORK"; exit 0' HUP INT TERM
-
 # Heredoc through a redirected `cat`, NOT printf/echo: POSIX does not require
 # printf to be a shell builtin, and an external printf would put the token
 # straight into the argv this file exists to keep it out of.
+#
+# The plugin version line is a CONSTANT — the one place this file knows its
+# own version — so a hook never reads or parses a file to report it. It tells
+# the Mac which plugin generation is dialing, which is how the app can say a
+# host's plugin is outdated before anything breaks (field finding 2026-09-17);
+# the app validates the shape and trusts nothing else about it.
 cat 2>/dev/null >"$WORK/header" <<EOF || fail_open
 Authorization: Bearer $TOKEN
+X-Lvx-Plugin-Version: 1.45.0
 EOF
 
 # --- Allowlisted environment enrichment --------------------------------------
@@ -183,6 +361,140 @@ $_lvx_name: $_lvx_value
 EOF
 }
 
+# --- Project label (#652) ----------------------------------------------------
+# The Mac files what a remote session teaches it under a label. Without this
+# header the label is the last component of the session's cwd, so each
+# worktree of a repository, and each subdirectory a session starts in, learned
+# alone. The label is the basename of the repository's main checkout: the
+# parent of the shared git directory for a linked worktree, the toplevel
+# otherwise (a submodule keeps its own). One git call, from this hook's cwd,
+# which is the session's.
+#
+# A label like every value here, never a path: only the basename leaves, and
+# only when it is a plain name in the charset the Mac's labels use (enumerated,
+# as above), with no leading dot and at most 64 bytes. No git, no repository,
+# a git too old for --path-format (it echoes the option back, which makes four
+# lines) or anything else sends no header, and the Mac falls back to the cwd's
+# last component.
+# A function called through $( ), not a `case` written inside $( ): the
+# bash 3.2 that is macOS's /bin/sh reads a case pattern's `)` as the end
+# of the command substitution. Called in a subshell, so its locale, IFS,
+# `set -f` and positional parameters stay there.
+lvx_project() {
+  LC_ALL=C
+  export LC_ALL
+  command -v git >/dev/null 2>&1 || return 0
+  _lvx_git="$(git rev-parse --path-format=absolute --show-toplevel --git-dir \
+    --git-common-dir 2>/dev/null)" || return 0
+  set -f
+  IFS='
+'
+  # shellcheck disable=SC2086  # one field per line is the point
+  set -- $_lvx_git
+  [ "$#" -eq 3 ] || return 0
+  for _lvx_path in "$1" "$2" "$3"; do
+    case "$_lvx_path" in /*) ;; *) return 0 ;; esac
+  done
+  if [ "$2" = "$3" ]; then
+    _lvx_name="${1##*/}"
+  elif [ "${3##*/}" = ".git" ]; then
+    _lvx_main="${3%/*}"
+    _lvx_name="${_lvx_main##*/}"
+  else
+    # A bare repository's worktree: the shared directory is the repository.
+    _lvx_name="${3##*/}"
+  fi
+  case "$_lvx_name" in
+  "" | .* | *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-]*) return 0 ;;
+  esac
+  [ "${#_lvx_name}" -le 64 ] || return 0
+  echo "$_lvx_name"
+}
+LVX_PROJECT="$(lvx_project 2>/dev/null)" || LVX_PROJECT=""
+
+# --- Repository (#926) --------------------------------------------------------
+# The owner/name of the repository's origin when it is on github.com, else
+# its host/path (#971), from capture.sh's parser, the one the draft run lists
+# issues with. Asked only inside a repository; no origin sends no header. The
+# Mac keeps a GitHub one as the project's filing repository, and merges every
+# checkout of one repository into one project.
+LVX_REPOSITORY=""
+if [ -n "$LVX_PROJECT" ] && [ -r "${0%/*}/capture.sh" ]; then
+  LVX_REPOSITORY="$(sh "${0%/*}/capture.sh" repository </dev/null 2>/dev/null)" || LVX_REPOSITORY=""
+fi
+
+# --- Branch (#1020) -----------------------------------------------------------
+# The branch checked out in the session's cwd. The Mac names a session in a
+# linked worktree by it when a person named it (`fix/overlay-names` reads
+# "overlay-names"), as it does for a local session. A label, never a ref the
+# Mac hands to git: it leaves only under the header charset and length cap
+# above. A detached HEAD, no git or no repository sends no header.
+lvx_branch() {
+  LC_ALL=C
+  export LC_ALL
+  command -v git >/dev/null 2>&1 || return 0
+  git symbolic-ref --quiet --short HEAD 2>/dev/null
+}
+LVX_BRANCH=""
+if [ -n "$LVX_PROJECT" ]; then
+  LVX_BRANCH="$(lvx_branch 2>/dev/null)" || LVX_BRANCH=""
+fi
+
+# --- Claude Desktop session id ------------------------------------------------
+# Claude Desktop runs each Code-tab session it opens on this host as a direct
+# child of its daemon, ~/.claude/remote/srv/<hash>/server, and exports
+# CLAUDE_CODE_HOST_SESSION_ID=local_<uuid> into it. Every process under that
+# session inherits the variable, so a `claude -p` started from inside it
+# reported the same id under its own session id, and the Mac, seeing two
+# reporters for the view the user is looking at, abstained. The id is sent only
+# when the Claude process running this hook is a direct child of the daemon.
+#
+# Measured on Linux (Claude Code 2.1.283): Claude Code runs a hook through
+# `sh -c`, so $PPID is that shell and Claude is its parent. The walk skips at
+# most three shells to reach the first ancestor that is not one, takes it as
+# the Claude process, and checks its parent's executable. Anything unreadable
+# drops the id. A host without /proc (macOS) sends it as before: Desktop's
+# layout there is unmeasured, and dropping it would cost the join there.
+lvx_ppid() {
+  while IFS=' 	' read -r _lvx_key _lvx_val _lvx_rest; do
+    if [ "$_lvx_key" = "PPid:" ]; then
+      case "$_lvx_val" in "" | *[!0-9]*) return 1 ;; esac
+      echo "$_lvx_val"
+      return 0
+    fi
+  done <"/proc/$1/status"
+  return 1
+}
+
+lvx_claude_is_desktop_session() {
+  [ -d /proc/self ] || return 0
+  [ -n "${HOME:-}" ] || return 1
+  # Physical, because the kernel reports the daemon's exe with every symlink
+  # resolved, and a dotfiles setup often links ~ or ~/.claude.
+  _lvx_srv="$(cd "$HOME/.claude/remote/srv" && pwd -P)" || return 1
+  _lvx_pid="${PPID:-}"
+  _lvx_shells=0
+  while :; do
+    case "$_lvx_pid" in "" | *[!0-9]*) return 1 ;; esac
+    _lvx_exe="$(readlink "/proc/$_lvx_pid/exe")" || return 1
+    case "${_lvx_exe##*/}" in
+    sh | dash | bash | zsh | ash | ksh | mksh | busybox) ;;
+    *) break ;;
+    esac
+    _lvx_shells=$((_lvx_shells + 1))
+    [ "$_lvx_shells" -le 3 ] || return 1
+    _lvx_pid="$(lvx_ppid "$_lvx_pid")" || return 1
+  done
+  _lvx_parent="$(lvx_ppid "$_lvx_pid")" || return 1
+  _lvx_parent_exe="$(readlink "/proc/$_lvx_parent/exe")" || return 1
+  # `(deleted)`: the daemon keeps running its sessions after an update
+  # replaces its binary.
+  case "$_lvx_parent_exe" in
+  "$_lvx_srv/"*/server | "$_lvx_srv/"*"/server (deleted)") return 0 ;;
+  esac
+  return 1
+}
+
 (
   LC_ALL=C
   export LC_ALL
@@ -192,23 +504,375 @@ EOF
   lvx_env_header 'X-Lvx-Env-Cmux-Surface-Id' "${CMUX_SURFACE_ID:-}"
   lvx_env_header 'X-Lvx-Env-Cmux-Socket-Path' "${CMUX_SOCKET_PATH:-}"
   lvx_env_header 'X-Lvx-Env-Bridge-Session-Id' "${CLAUDE_CODE_BRIDGE_SESSION_ID:-}"
+  # Claude Desktop's local_<uuid> handle for a Code-tab session it runs on this
+  # host over its own ssh. The Mac matches it against the session the desktop
+  # window shows. Only from the session itself (see above).
+  if [ -n "${CLAUDE_CODE_HOST_SESSION_ID:-}" ] && lvx_claude_is_desktop_session; then
+    lvx_env_header 'X-Lvx-Env-Desktop-Session-Id' "${CLAUDE_CODE_HOST_SESSION_ID:-}"
+  fi
   lvx_env_header 'X-Lvx-Env-Tmux' "${TMUX:-}"
   lvx_env_header 'X-Lvx-Env-Tmux-Pane' "${TMUX_PANE:-}"
+  # GNU screen and zellij, for the same reason as TMUX: both are multiplexer
+  # SERVERS whose windows inherit the $SSH_CONNECTION of whichever connection
+  # started the server, so the Mac has to be able to see that this session is
+  # one of them and refuse to join it on the connection.
+  lvx_env_header 'X-Lvx-Env-Screen-Session' "${STY:-}"
+  lvx_env_header 'X-Lvx-Env-Zellij-Session' "${ZELLIJ:-}"
   lvx_env_header 'X-Lvx-Env-Ssh-Tty' "${SSH_TTY:-}"
+  # The CLIENT terminal's tty, exported by the user's own shell on their Mac
+  # and carried here by ssh's SendEnv/AcceptEnv. `LC_` because sshd's stock
+  # `AcceptEnv LANG LC_*` is what lets it through unmodified on Debian, Ubuntu
+  # and macOS, and libc ignores locale names it does not know — the same trick
+  # iTerm2 uses for LC_TERMINAL. Unlike every other value here it describes the
+  # MAC, which is exactly why the Mac can check it: env travels per session
+  # CHANNEL, so it survives ProxyJump and gives two sessions over one
+  # ControlMaster connection their own value.
+  lvx_env_header 'X-Lvx-Env-Local-Tty' "${LC_LVX_TTY:-}"
+  # $SSH_CONNECTION is the one allowlisted value sshd writes with SPACES in it:
+  # "<client-ip> <client-port> <server-ip> <server-port>". Space is outside the
+  # charset above — deliberately, since that is what makes a value unable to end
+  # this header line — so the four fields are re-joined with commas, which IS in
+  # the charset. Widening the charset for one variable was the alternative and
+  # would have weakened every other one.
+  #
+  # The split is the shell's own field splitting: no fork, no external tool, and
+  # `set -f` first so a value containing a glob character cannot expand against
+  # this host's filesystem. Anything that is not EXACTLY four fields is dropped
+  # rather than guessed at — the Mac refuses a malformed value anyway
+  # (ClaudeRemoteSSHConnectionReport.parse), and a shim that guesses would just
+  # move the refusal.
+  set -f
+  # IFS pinned to a single space, not inherited: a remote profile that exports
+  # its own IFS would otherwise decide how this value splits. sshd writes
+  # spaces, so a space is the whole separator.
+  IFS=' '
+  # shellcheck disable=SC2086  # word splitting is the point
+  set -- ${SSH_CONNECTION:-}
+  if [ "$#" -eq 4 ]; then
+    lvx_env_header 'X-Lvx-Env-Ssh-Connection' "$1,$2,$3,$4"
+  fi
+  set +f
   # Best effort: the shim's parent is the Claude Code process on THIS host. It
   # is a pid in this machine's namespace and the Mac treats it as a label only.
   lvx_env_header 'X-Lvx-Env-Hook-Parent-Pid' "${PPID:-}"
+  lvx_env_header 'X-Lvx-Env-Project' "${LVX_PROJECT:-}"
+  lvx_env_header 'X-Lvx-Env-Repository' "${LVX_REPOSITORY:-}"
+  lvx_env_header 'X-Lvx-Env-Branch' "${LVX_BRANCH:-}"
 ) 2>/dev/null || :
+
+# --- Skill names (#1024) -------------------------------------------------------
+# The names of the skills and commands this host's coding agents can run, so
+# the Mac's polishing can spell them when the user says one. Folder and file
+# NAMES only, never their contents: a skill is a folder holding SKILL.md, a
+# command a Markdown file. The same places as the Mac's own list
+# (AgentSkillDirectories), plus the session's project folder. Each name keeps
+# the Mac's shape (AgentSkillNamesCodec): an enumerated charset, 64 bytes, no
+# leading dot or dash; at most 80 names and 2000 bytes, the Mac's cap being
+# 2048. Run in a subshell under LC_ALL=C, like the env headers above.
+lvx_skills_header() {
+  set +f
+  _lvx_list=""
+  _lvx_count=0
+  for _lvx_file in \
+    "$HOME"/.claude/skills/*/SKILL.md "$HOME"/.codex/skills/*/SKILL.md \
+    "$HOME"/.config/opencode/skills/*/SKILL.md "$HOME"/.config/opencode/skill/*/SKILL.md \
+    "$HOME"/.vibe/skills/*/SKILL.md "$HOME"/.agents/skills/*/SKILL.md \
+    "$HOME"/.claude/plugins/cache/*/*/*/skills/*/SKILL.md \
+    "$HOME"/.claude/commands/*.md "$HOME"/.codex/prompts/*.md \
+    "$HOME"/.config/opencode/commands/*.md "$HOME"/.config/opencode/command/*.md \
+    ./.claude/skills/*/SKILL.md ./.claude/commands/*.md; do
+    [ -f "$_lvx_file" ] || continue
+    case "$_lvx_file" in
+    */SKILL.md) _lvx_skill="${_lvx_file%/SKILL.md}" ;;
+    */README.md | */readme.md) continue ;;
+    *) _lvx_skill="${_lvx_file%.md}" ;;
+    esac
+    _lvx_skill="${_lvx_skill##*/}"
+    case "$_lvx_skill" in
+    "" | .* | -* | *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-]*) continue ;;
+    esac
+    [ "${#_lvx_skill}" -le 64 ] || continue
+    case ",$_lvx_list," in *",$_lvx_skill,"*) continue ;; esac
+    [ $((${#_lvx_list} + ${#_lvx_skill} + 1)) -le 2000 ] || break
+    _lvx_list="${_lvx_list:+$_lvx_list,}$_lvx_skill"
+    _lvx_count=$((_lvx_count + 1))
+    [ "$_lvx_count" -lt 80 ] || break
+  done
+  [ -n "$_lvx_list" ] || return 0
+  cat 2>/dev/null >>"$WORK/header" <<EOF || return 0
+X-Lvx-Skills: $_lvx_list
+EOF
+}
+# Listed once a session, when it starts; the Mac keeps the list per host.
+if [ "$EVENT" = SessionStart ]; then
+  (
+    LC_ALL=C
+    export LC_ALL
+    lvx_skills_header
+  ) 2>/dev/null || :
+fi
+
+# --- Agent projects (#1027) ---------------------------------------------------
+# The repositories a coding agent ran in on this host in the last 30 days, so
+# the Mac's polishing can spell their names. agent-projects.sh, next to this
+# file, builds the value from Claude Code's transcripts; it reads only their
+# `cwd` key, and its header lists names and origins, never a path. The scan
+# takes seconds, more than a hook may spend, so this sends the value cached in
+# $STAMP_DIR/agent-projects (`<scan epoch>` then the value, one line each) and,
+# when that is missing or six hours old, starts a rescan DETACHED for the next
+# session, as lvx_terms_start starts terms.sh, without the token. An atomic
+# mkdir lock keeps it to one scan at a time; a lock 10 minutes old is a scan
+# that died and is taken over. A damaged cache sends nothing and is rescanned.
+lvx_agent_projects_header() {
+  _lvx_cache="$STAMP_DIR/agent-projects"
+  _lvx_scanned=""
+  _lvx_value=""
+  if [ -r "$_lvx_cache" ]; then
+    { IFS= read -r _lvx_scanned && IFS= read -r _lvx_value; } 2>/dev/null <"$_lvx_cache"
+  fi
+  case "$_lvx_value" in
+  "" | *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._/:,-]*) ;;
+  *)
+    if [ "${#_lvx_value}" -le 2000 ]; then
+      cat 2>/dev/null >>"$WORK/header" <<EOF || :
+X-Lvx-Agent-Projects: $_lvx_value
+EOF
+    fi
+    ;;
+  esac
+  [ -n "$NOW" ] && [ -n "${HOME:-}" ] || return 0
+  case "$_lvx_scanned" in
+  "" | *[!0-9]* | ?????????????*) ;;
+  *)
+    if [ "$_lvx_scanned" -le "$NOW" ] && [ $((NOW - _lvx_scanned)) -lt 21600 ]; then
+      return 0
+    fi
+    ;;
+  esac
+  _lvx_runner="${0%/*}/agent-projects.sh"
+  [ -r "$_lvx_runner" ] || return 0
+  { mkdir -p "$STAMP_DIR" && chmod 700 "$STAMP_DIR"; } 2>/dev/null || return 0
+  _lvx_lock="$_lvx_cache-running"
+  if ! mkdir "$_lvx_lock" 2>/dev/null; then
+    [ -n "$(find "$_lvx_lock" -prune -mmin +10 2>/dev/null)" ] || return 0
+    mv "$_lvx_lock" "$_lvx_lock.$$" 2>/dev/null || return 0
+    rm -rf "$_lvx_lock.$$" 2>/dev/null
+    mkdir "$_lvx_lock" 2>/dev/null || return 0
+  fi
+  if command -v setsid >/dev/null 2>&1; then
+    setsid env -i HOME="$HOME" PATH="${PATH:-}" LANG="${LANG:-}" USER="${USER:-}" LOGNAME="${LOGNAME:-}" \
+      sh "$_lvx_runner" refresh "$_lvx_cache" "$_lvx_lock" </dev/null >/dev/null 2>&1 &
+  else
+    (
+      trap '' HUP
+      exec env -i HOME="$HOME" PATH="${PATH:-}" LANG="${LANG:-}" USER="${USER:-}" LOGNAME="${LOGNAME:-}" \
+        sh "$_lvx_runner" refresh "$_lvx_cache" "$_lvx_lock"
+    ) </dev/null >/dev/null 2>&1 &
+  fi
+  return 0
+}
+if [ "$EVENT" = SessionStart ] && [ -n "$STAMP_DIR" ]; then
+  (
+    LC_ALL=C
+    export LC_ALL
+    lvx_agent_projects_header
+  ) 2>/dev/null || :
+fi
+
+# Sets _lvx_dir to the project directory: the git root, else the working
+# directory. Command substitution strips every trailing newline, including
+# ones in the name, which would name a sibling directory (#1727): an `x`
+# after the output keeps them, and a name holding a newline is refused.
+lvx_project_dir() {
+  _lvx_dir="$(git rev-parse --show-toplevel 2>/dev/null && echo x)" || _lvx_dir=""
+  case "$_lvx_dir" in /*) ;; *) _lvx_dir="$(pwd -P 2>/dev/null && echo x)" || return 1 ;; esac
+  _lvx_dir="${_lvx_dir%x}"
+  _lvx_dir="${_lvx_dir%?}"
+  case "$_lvx_dir" in /*) ;; *) return 1 ;; esac
+  case "$_lvx_dir" in *"
+"*) return 1 ;; esac
+}
+
+# --- Project terms (#641) ----------------------------------------------------
+# `X-Lvx-Terms: wanted` on a 200 reply is the Mac asking for this session's
+# project terms, once, after a dictation joined the session. The Mac cannot
+# run the agent itself: the repository is here, and it never holds a path on
+# this host. So this starts terms.sh, next to this file, DETACHED: its own
+# session (setsid, or an ignored HUP where there is none), every descriptor on
+# /dev/null, `env -i HOME PATH LANG USER LOGNAME` so no CLAUDE_* or plugin
+# option reaches the agent (macOS finds a Claude Code login in the keychain
+# only with the user's name set), and the token on stdin, never in an argv or the environment. The
+# hook's own exit, output and timing do not change.
+#
+# One run per project per 24 hours whatever asks, a squatter on the port
+# included: a per-project stamp directory, taken by an atomic mkdir, holds the
+# attempt time, and terms.sh writes `done` there after the Mac accepts the
+# answer. The project is the git toplevel of this hook's cwd, or the cwd
+# outside git; its stamp is named by the cksum of that path. The stamps move
+# to a new directory whenever the prompt asks for something new: `terms-2`
+# for the project's sentence (#891), `terms-3` for names people say (#914).
+# A project answered under an older prompt is asked once more.
+lvx_terms_start() {
+  _lvx_agent="$1"
+  _lvx_session="$2"
+  _lvx_runner="$3"
+  _lvx_vibe="${4:-}"
+  [ -n "$STAMP_DIR" ] && [ -n "$NOW" ] && [ -n "$_lvx_session" ] && [ -n "${HOME:-}" ] || return 0
+  [ -r "$_lvx_runner" ] || return 0
+  lvx_project_dir || return 0
+  _lvx_sum="$(echo "$_lvx_dir" | cksum 2>/dev/null)" || return 0
+  _lvx_crc="${_lvx_sum%% *}"
+  _lvx_len="${_lvx_sum##* }"
+  case "$_lvx_crc$_lvx_len" in "" | *[!0-9]*) return 0 ;; esac
+  _lvx_terms="$STAMP_DIR/terms-3"
+  { mkdir -p "$_lvx_terms" && chmod 700 "$STAMP_DIR" "$_lvx_terms"; } 2>/dev/null || return 0
+  _lvx_stamp="$_lvx_terms/$_lvx_crc-$_lvx_len"
+  if ! mkdir "$_lvx_stamp" 2>/dev/null; then
+    [ ! -e "$_lvx_stamp/done" ] || return 0
+    _lvx_last="$(cat "$_lvx_stamp/attempt" 2>/dev/null)" || _lvx_last=""
+    case "$_lvx_last" in
+    "" | *[!0-9]* | ?????????????*)
+      # No attempt time yet: another hook holds a fresh claim and is about
+      # to write it. Only a directory a day old is a claim that died.
+      [ -z "$(find "$_lvx_stamp" -prune -mmin +1440 2>/dev/null)" ] && return 0
+      _lvx_last=0
+      ;;
+    esac
+    if [ "$_lvx_last" -gt "$NOW" ] || [ $((NOW - _lvx_last)) -lt 86400 ]; then
+      return 0
+    fi
+    # A stale attempt: rename(2) lets exactly one hook take it over.
+    mv "$_lvx_stamp" "$_lvx_stamp.$$" 2>/dev/null || return 0
+    rm -rf "$_lvx_stamp.$$" 2>/dev/null
+    mkdir "$_lvx_stamp" 2>/dev/null || return 0
+  fi
+  echo "$NOW" >"$_lvx_stamp/attempt" 2>/dev/null || return 0
+  if command -v setsid >/dev/null 2>&1; then
+    setsid env -i HOME="$HOME" PATH="${PATH:-}" LANG="${LANG:-}" USER="${USER:-}" LOGNAME="${LOGNAME:-}" sh "$_lvx_runner" \
+      "$_lvx_agent" "$PORT" "$_lvx_session" "$_lvx_dir" "$_lvx_stamp" "$_lvx_vibe" \
+      >/dev/null 2>&1 <<TERMS &
+$TOKEN
+TERMS
+  else
+    (
+      trap '' HUP
+      exec env -i HOME="$HOME" PATH="${PATH:-}" LANG="${LANG:-}" USER="${USER:-}" LOGNAME="${LOGNAME:-}" sh "$_lvx_runner" \
+        "$_lvx_agent" "$PORT" "$_lvx_session" "$_lvx_dir" "$_lvx_stamp" "$_lvx_vibe"
+    ) >/dev/null 2>&1 <<TERMS &
+$TOKEN
+TERMS
+  fi
+  return 0
+}
+
+# --- Quick capture (#745) -----------------------------------------------------
+# Two more asks on a 200 reply, matched as exactly as the terms one:
+# `X-Lvx-Readme: wanted` asks for the project's README opening, and
+# `X-Lvx-Draft: <32 hex digits>` asks this host to draft a dictated idea in
+# the project. Both start capture.sh, next to this file, detached and in the
+# clean environment terms.sh gets, with the token on stdin.
+#
+# Whatever answers on the port can send them, so the shim bounds what it
+# spends: one README per project per 24 hours, by the same kind of mkdir
+# stamp as terms, and one draft at a time (a lock capture.sh removes when it
+# ends, taken over after 10 minutes), at most 20 a day.
+lvx_capture_start() {
+  _lvx_mode="$1"
+  _lvx_agent="$2"
+  _lvx_session="$3"
+  _lvx_runner="$4"
+  _lvx_draft="${5:-}"
+  _lvx_vibe="${6:-}"
+  [ -n "$STAMP_DIR" ] && [ -n "$NOW" ] && [ -n "$_lvx_session" ] && [ -n "${HOME:-}" ] || return 0
+  [ -r "$_lvx_runner" ] || return 0
+  lvx_project_dir || return 0
+  _lvx_base="$STAMP_DIR/capture"
+  { mkdir -p "$_lvx_base" && chmod 700 "$STAMP_DIR" "$_lvx_base"; } 2>/dev/null || return 0
+  _lvx_lock=""
+  if [ "$_lvx_mode" = readme ]; then
+    _lvx_sum="$(echo "$_lvx_dir" | cksum 2>/dev/null)" || return 0
+    _lvx_crc="${_lvx_sum%% *}"
+    _lvx_len="${_lvx_sum##* }"
+    case "$_lvx_crc$_lvx_len" in "" | *[!0-9]*) return 0 ;; esac
+    _lvx_stamp="$_lvx_base/readme-$_lvx_crc-$_lvx_len"
+    _lvx_last="$(cat "$_lvx_stamp" 2>/dev/null)" || _lvx_last=""
+    case "$_lvx_last" in "" | *[!0-9]* | ?????????????*) _lvx_last=0 ;; esac
+    if [ "$_lvx_last" -le "$NOW" ] && [ $((NOW - _lvx_last)) -lt 86400 ]; then
+      return 0
+    fi
+    # rename(2) lets one hook's stamp win; a second one a moment later reads it.
+    { echo "$NOW" >"$_lvx_stamp.$$" && mv -f "$_lvx_stamp.$$" "$_lvx_stamp"; } 2>/dev/null || return 0
+  else
+    case "$_lvx_draft" in "" | *[!0123456789abcdef]*) return 0 ;; esac
+    [ "${#_lvx_draft}" -eq 32 ] || return 0
+    _lvx_lock="$_lvx_base/draft-running"
+    if ! mkdir "$_lvx_lock" 2>/dev/null; then
+      [ -n "$(find "$_lvx_lock" -prune -mmin +10 2>/dev/null)" ] || return 0
+      mv "$_lvx_lock" "$_lvx_lock.$$" 2>/dev/null || return 0
+      rm -rf "$_lvx_lock.$$" 2>/dev/null
+      mkdir "$_lvx_lock" 2>/dev/null || return 0
+    fi
+    # The day's starts, one time per line; the lock serializes this.
+    _lvx_day="$_lvx_base/draft-starts"
+    _lvx_count=0
+    : >"$_lvx_day.$$" 2>/dev/null || { rmdir "$_lvx_lock"; return 0; }
+    if [ -r "$_lvx_day" ]; then
+      while IFS= read -r _lvx_start; do
+        case "$_lvx_start" in "" | *[!0-9]* | ?????????????*) continue ;; esac
+        [ "$_lvx_start" -le "$NOW" ] && [ $((NOW - _lvx_start)) -lt 86400 ] || continue
+        echo "$_lvx_start" >>"$_lvx_day.$$"
+        _lvx_count=$((_lvx_count + 1))
+      done <"$_lvx_day"
+    fi
+    if [ "$_lvx_count" -ge 20 ]; then
+      rm -f "$_lvx_day.$$"
+      rmdir "$_lvx_lock" 2>/dev/null
+      return 0
+    fi
+    { echo "$NOW" >>"$_lvx_day.$$" && mv -f "$_lvx_day.$$" "$_lvx_day"; } 2>/dev/null \
+      || { rm -f "$_lvx_day.$$"; rmdir "$_lvx_lock"; return 0; } 2>/dev/null
+  fi
+  if command -v setsid >/dev/null 2>&1; then
+    setsid env -i HOME="$HOME" PATH="${PATH:-}" LANG="${LANG:-}" USER="${USER:-}" LOGNAME="${LOGNAME:-}" sh "$_lvx_runner" \
+      "$_lvx_mode" "$_lvx_agent" "$PORT" "$_lvx_session" "$_lvx_dir" "$_lvx_draft" "$_lvx_lock" "$_lvx_vibe" \
+      >/dev/null 2>&1 <<CAPTURE &
+$TOKEN
+CAPTURE
+  else
+    (
+      trap '' HUP
+      exec env -i HOME="$HOME" PATH="${PATH:-}" LANG="${LANG:-}" USER="${USER:-}" LOGNAME="${LOGNAME:-}" sh "$_lvx_runner" \
+        "$_lvx_mode" "$_lvx_agent" "$PORT" "$_lvx_session" "$_lvx_dir" "$_lvx_draft" "$_lvx_lock" "$_lvx_vibe"
+    ) >/dev/null 2>&1 <<CAPTURE &
+$TOKEN
+CAPTURE
+  fi
+  return 0
+}
+
+# lvx_capture_asks <response-headers>: prints `readme` and/or `draft <id>`,
+# one per line, for the asks the reply carries.
+lvx_capture_asks() {
+  LC_ALL=C sed -n \
+    -e 's/\r$//' \
+    -e '/^[Xx]-[Ll][Vv][Xx]-[Rr][Ee][Aa][Dd][Mm][Ee]: wanted$/s/.*/readme/p' \
+    -e 's/^[Xx]-[Ll][Vv][Xx]-[Dd][Rr][Aa][Ff][Tt]: \([0123456789abcdef]\{32\}\)$/draft \1/p' \
+    "$1" 2>/dev/null
+}
 
 # --max-time 1 mirrors the old http hooks' one-second fail-open ceiling: a
 # host whose forward silently failed must not stall every turn. --max-filesize
 # (recognized since curl 7.10.8) belts the body the stdout gate below already
-# rejects; when it trips, curl fails and STATUS goes empty.
-STATUS="$(curl --silent --output "$WORK/body" --write-out '%{http_code}' \
+# rejects; when it trips, curl fails and STATUS goes empty. -q (first, or
+# curl ignores it) skips ~/.curlrc and --noproxy '*' any inherited http_proxy
+# or ALL_PROXY: curl proxies even 127.0.0.1, and a proxy would get the token
+# and the prompt outside the tunnel (#1281). Every loopback curl here does both.
+STATUS="$(curl -q --noproxy '*' --silent --output "$WORK/body" --write-out '%{http_code}' \
+  --dump-header "$WORK/response-headers" \
   --max-time 1 --max-filesize 1024 --request POST \
   --header 'Content-Type: application/json' \
   --header @"$WORK/header" \
-  --data-binary @- \
+  --data-binary @"$WORK/event" \
   "http://127.0.0.1:$PORT/v1/hook/$EVENT" 2>/dev/null)" || STATUS=""
 
 # Arm the backoff on a transport-level failure (curl died: refused, reset,
@@ -226,8 +890,37 @@ if [ -n "$STAMP_DIR" ] && [ -n "$NOW" ]; then
       mkdir -p "$STAMP_DIR" && chmod 700 "$STAMP_DIR" \
         && echo "$NOW" >"$STAMP.$$" && mv -f "$STAMP.$$" "$STAMP"
     } 2>/dev/null || { rm -f "$STAMP.$$"; } 2>/dev/null || :
+    write_status down
   else
     rm -f "$STAMP" 2>/dev/null || :
+    # The completed exchange's verdict, for statusline.sh. The code is
+    # embedded only after the exact-3-digits match — curl wrote it, but
+    # nothing that fails the grammar may reach a file another script reads.
+    case "$STATUS" in
+    200)
+      write_status ok
+      SESSION_VERDICT="$(LC_ALL=C sed -n \
+        's/\r$//; /^[Xx]-[Ll][Vv][Xx]-[Ss][Ee][Ss][Ss][Ii][Oo][Nn]: joined$/s/.*: //p; /^[Xx]-[Ll][Vv][Xx]-[Ss][Ee][Ss][Ss][Ii][Oo][Nn]: unknown$/s/.*: //p' \
+        "$WORK/response-headers" 2>/dev/null)" || SESSION_VERDICT=""
+      case "$SESSION_VERDICT" in
+      joined | unknown) write_session_status "$SESSION_VERDICT" ;;
+      esac
+      TERMS_WANTED="$(LC_ALL=C sed -n \
+        's/\r$//; /^[Xx]-[Ll][Vv][Xx]-[Tt][Ee][Rr][Mm][Ss]: wanted$/p' \
+        "$WORK/response-headers" 2>/dev/null)" || TERMS_WANTED=""
+      if [ -n "$TERMS_WANTED" ]; then
+        lvx_terms_start claude "$SESSION_ID" "${0%/*}/terms.sh"
+      fi
+      lvx_capture_asks "$WORK/response-headers" >"$WORK/asks" 2>/dev/null || :
+      while read -r ASK ASK_ID; do
+        case "$ASK" in
+        readme) lvx_capture_start readme claude "$SESSION_ID" "${0%/*}/capture.sh" ;;
+        draft) lvx_capture_start draft claude "$SESSION_ID" "${0%/*}/capture.sh" "$ASK_ID" ;;
+        esac
+      done <"$WORK/asks" 2>/dev/null
+      ;;
+    [0-9][0-9][0-9]) write_status "http-$STATUS" ;;
+    esac
   fi
 fi
 
@@ -239,16 +932,16 @@ fi
 # must never be able to put a byte into the prompt. So printing fails CLOSED,
 # the mirror image of delivery failing open: stdout is either one single small
 # line matching EXACTLY the one body the listener can emit
-# (ClaudeRemoteHTTPCodec.markerResponseBody — sorted keys, suppressOutput
-# always true, optional OSC-2 terminalSequence whose marker obeys
-# ClaudeMarkerSequence's lvx- allowlist) or absolutely nothing. A forged
-# well-formed marker is inert: markers are broker-allocated, so an unknown one
-# joins nothing.
+# (ClaudeRemoteHTTPCodec.hookResponseBody — a CONSTANT: suppressOutput and
+# nothing else) or absolutely nothing. There is no variable part left to allow:
+# the listener answers an accepted record and a discarded one with the same
+# BODY bytes, so no response of any shape can carry a terminal escape sequence, and
+# anything a squatter returns that is not the constant is dropped here.
 # The `{ …; } 2>/dev/null` grouping matters: `wc <file 2>/dev/null` lets the
 # SHELL's own "cannot open" reach stderr, because the input redirection fails
 # before the stderr one is applied — and a body file that never got written IS
 # the tunnel-down path, the one that must be silent (caught live 2026-07-27).
-BODY_GRAMMAR='[{]"suppressOutput":true(,"terminalSequence":"\\u001[bB]]2;lvx-[0-9a-flvx-]{1,28}\\u0007")?[}]'
+BODY_GRAMMAR='[{]"suppressOutput":true[}]'
 if [ "$STATUS" = "200" ] && [ -r "$WORK/body" ]; then
   SIZE="$({ wc -c <"$WORK/body"; } 2>/dev/null | tr -d '[:space:]')"; [ -n "$SIZE" ] || SIZE=9999
   LINES="$({ grep -c '' <"$WORK/body"; } 2>/dev/null)"; [ -n "$LINES" ] || LINES=0

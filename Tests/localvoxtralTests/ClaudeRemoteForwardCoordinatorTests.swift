@@ -40,6 +40,8 @@ private final class FakeForwarding: ClaudeRemoteForwarding {
 
     func retry() { spy.noteRetry(hostID) }
 
+    func recover() { spy.noteRecover(hostID) }
+
     /// Lets a test drive the pane's view of a forward without a supervisor.
     func transition(to newState: ClaudeRemoteForwardSupervisor.State) {
         state = newState
@@ -52,8 +54,11 @@ private final class ForwardSpy {
     private(set) var started: [String] = []
     private(set) var stopped: [String] = []
     private(set) var retried: [String] = []
+    private(set) var recovered: [String] = []
     private(set) var configurations: [ClaudeRemoteForwardSupervisor.Configuration] = []
     private(set) var forwards: [String: FakeForwarding] = [:]
+    /// Every start so far, for a test that waits on one made from a task.
+    let starts = EventCount()
 
     func makeSupervisor(
         _ configuration: ClaudeRemoteForwardSupervisor.Configuration
@@ -64,9 +69,13 @@ private final class ForwardSpy {
         return forwarding
     }
 
-    func noteStart(_ hostID: String) { started.append(hostID) }
+    func noteStart(_ hostID: String) {
+        started.append(hostID)
+        starts.increment()
+    }
     func noteStop(_ hostID: String) { stopped.append(hostID) }
     func noteRetry(_ hostID: String) { retried.append(hostID) }
+    func noteRecover(_ hostID: String) { recovered.append(hostID) }
 }
 
 @MainActor
@@ -83,7 +92,8 @@ final class ClaudeRemoteForwardCoordinatorTests: XCTestCase {
         registry: ClaudeRemoteHostRegistry,
         spy: ForwardSpy,
         isListenerBound: @escaping @MainActor () -> Bool = { true },
-        reapOrphans: (@Sendable () async -> Void)? = nil
+        reapOrphans: (@Sendable () async -> Void)? = nil,
+        reconcileHerdrEnrollment: @escaping @MainActor (Set<String>) -> Void = { _ in }
     ) -> ClaudeRemoteForwardCoordinator {
         ClaudeRemoteForwardCoordinator(
             hosts: registry,
@@ -91,7 +101,8 @@ final class ClaudeRemoteForwardCoordinatorTests: XCTestCase {
             listenerPort: 8473,
             isListenerBound: isListenerBound,
             makeSupervisor: { spy.makeSupervisor($0) },
-            reapOrphans: reapOrphans
+            reapOrphans: reapOrphans,
+            reconcileHerdrEnrollment: reconcileHerdrEnrollment
         )
     }
 
@@ -138,6 +149,23 @@ final class ClaudeRemoteForwardCoordinatorTests: XCTestCase {
         XCTAssertEqual(spy.started, [host.id])
         XCTAssertEqual(spy.stopped, [host.id])
         XCTAssertNil(coordinator.states[host.id])
+    }
+
+    func testRevocationIsAlsoReconciledIntoPersistentHerdrForwards() throws {
+        let registry = try makeRegistry()
+        let host = try registry.enroll(label: "buildhost", sshHostAlias: "builder").host
+        let seen = Mutex<[Set<String>]>([])
+        let coordinator = makeCoordinator(
+            registry: registry,
+            spy: ForwardSpy(),
+            reconcileHerdrEnrollment: { active in seen.withLock { $0.append(active) } }
+        )
+
+        coordinator.reconcile()
+        try registry.revoke(hostID: host.id)
+        coordinator.reconcile()
+
+        XCTAssertEqual(seen.withLock { $0 }, [[host.id], []])
     }
 
     func testTurningTheToggleOffStopsTheForward() throws {
@@ -225,6 +253,28 @@ final class ClaudeRemoteForwardCoordinatorTests: XCTestCase {
         XCTAssertEqual(spy.retried, [second.id])
     }
 
+    /// #659: a wake or a network change reaches every running forward; each
+    /// supervisor decides for itself whether it has anything to redo.
+    func testAWakeOrNetworkChangeReachesEveryRunningForward() throws {
+        let registry = try makeRegistry()
+        let first = try registry.enroll(label: "buildhost", sshHostAlias: "builder").host
+        let second = try registry.enroll(label: "other", sshHostAlias: "other").host
+        _ = try registry.enroll(label: "off", sshHostAlias: "off")
+        try registry.setPersistentForwardEnabled(true, hostID: first.id)
+        try registry.setPersistentForwardEnabled(true, hostID: second.id)
+        let spy = ForwardSpy()
+        let coordinator = makeCoordinator(registry: registry, spy: spy)
+        coordinator.reconcile()
+
+        coordinator.recover(after: .wake)
+        XCTAssertEqual(Set(spy.recovered), [first.id, second.id])
+        XCTAssertEqual(spy.recovered.count, 2)
+
+        coordinator.recover(after: .networkChange)
+        XCTAssertEqual(spy.recovered.count, 4, "a host with the tunnel off has no supervisor to recover")
+        XCTAssertTrue(spy.retried.isEmpty, "recovery is not the user's Retry")
+    }
+
     func testAReplacementForwardWaitsForTheOldOneToFinishDying() async throws {
         // Toggle off, toggle straight back on — the ordinary way a user retries
         // something. The remote port is not free until the first ssh has
@@ -249,7 +299,7 @@ final class ClaudeRemoteForwardCoordinatorTests: XCTestCase {
         // Back on while the old process is still dying.
         try registry.setPersistentForwardEnabled(true, hostID: host.id)
         coordinator.reconcile()
-        for _ in 0..<50 { await Task.yield() }
+        await release.waitUntilHeld()
         XCTAssertEqual(
             spy.started, [host.id],
             "the replacement must not dial a port the old ssh still holds"
@@ -257,7 +307,7 @@ final class ClaudeRemoteForwardCoordinatorTests: XCTestCase {
 
         // Once it is gone, the replacement runs.
         release.open()
-        for _ in 0..<50 { await Task.yield() }
+        await spy.starts.waitFor(2)
         XCTAssertEqual(spy.started, [host.id, host.id])
     }
 
@@ -278,13 +328,13 @@ final class ClaudeRemoteForwardCoordinatorTests: XCTestCase {
             registry: registry, spy: spy, reapOrphans: { await reapGate.wait() }
         )
         coordinator.reconcile()
-        for _ in 0..<50 { await Task.yield() }
+        await reapGate.waitUntilHeld()
         XCTAssertTrue(
             spy.started.isEmpty, "an orphan may still hold the port until the reap finishes"
         )
 
         reapGate.open()
-        for _ in 0..<50 { await Task.yield() }
+        await spy.starts.waitFor(1)
         XCTAssertEqual(spy.started, [host.id])
     }
 
@@ -297,62 +347,84 @@ final class ClaudeRemoteForwardCoordinatorTests: XCTestCase {
         try registry.setPersistentForwardEnabled(true, hostID: host.id)
 
         let spy = ForwardSpy()
-        let reapCount = Mutex(0)
+        let reapCount = EventCount()
         let coordinator = makeCoordinator(
-            registry: registry, spy: spy, reapOrphans: { reapCount.withLock { $0 += 1 } }
+            registry: registry, spy: spy, reapOrphans: { reapCount.increment() }
         )
         coordinator.reconcile()
-        for _ in 0..<50 { await Task.yield() }
+        await spy.starts.waitFor(1)
         XCTAssertEqual(spy.started, [host.id])
 
         try registry.setPersistentForwardEnabled(false, hostID: host.id)
         coordinator.reconcile()
         try registry.setPersistentForwardEnabled(true, hostID: host.id)
         coordinator.reconcile()
-        for _ in 0..<50 { await Task.yield() }
-        XCTAssertEqual(reapCount.withLock { $0 }, 1)
+        // A second reap would run before this start, which waits on it.
+        await spy.starts.waitFor(2)
+        XCTAssertEqual(reapCount.value, 1)
     }
 
-    func testNoReapWhileTheListenerIsUnbound() async throws {
-        // Multi-instance safety. A second app instance cannot bind the
-        // listener while the first lives — and it must not reap either, or it
-        // would kill the first instance's perfectly healthy tunnels.
+    func testTheReapRunsOnceWhileTheListenerIsUnbound() async throws {
+        // A copy that lost the listener runs no `-R` forwards, but its herdr
+        // `-L` forwards wait on this reap (#1368). Another copy's forwards are
+        // safe from it by their recorded owner (#892).
         let registry = try makeRegistry()
         let host = try registry.enroll(label: "buildhost", sshHostAlias: "builder").host
         try registry.setPersistentForwardEnabled(true, hostID: host.id)
 
         let spy = ForwardSpy()
-        let reapCount = Mutex(0)
+        let bound = Mutex(false)
+        let reapCount = EventCount()
         let coordinator = makeCoordinator(
             registry: registry,
             spy: spy,
-            isListenerBound: { false },
-            reapOrphans: { reapCount.withLock { $0 += 1 } }
+            isListenerBound: { bound.withLock { $0 } },
+            reapOrphans: { reapCount.increment() }
         )
         coordinator.reconcile()
-        for _ in 0..<50 { await Task.yield() }
-        XCTAssertEqual(reapCount.withLock { $0 }, 0, "no listener, no reap")
-        XCTAssertTrue(spy.started.isEmpty)
+        await reapCount.waitFor(1)
+        XCTAssertTrue(spy.started.isEmpty, "no listener, no forward")
+
+        bound.withLock { $0 = true }
+        coordinator.reconcile()
+        await spy.starts.waitFor(1)
+        XCTAssertEqual(spy.started, [host.id])
+        XCTAssertEqual(reapCount.value, 1, "a later bind must not reap again")
     }
 }
 
 /// A teardown a test can hold open and then release.
-private final class TeardownGate: @unchecked Sendable {
-    private let state = Mutex<[CheckedContinuation<Void, Never>]>([])
-    private let opened = Mutex(false)
+private final class TeardownGate: Sendable {
+    private struct State {
+        var opened = false
+        var waiters: [CheckedContinuation<Void, Never>] = []
+    }
+
+    private let state = Mutex(State())
+    private let arrivals = EventCount()
 
     func wait() async {
-        if opened.withLock({ $0 }) { return }
         await withCheckedContinuation { continuation in
-            state.withLock { $0.append(continuation) }
+            let held = state.withLock { state -> Bool in
+                guard !state.opened else { return false }
+                state.waiters.append(continuation)
+                return true
+            }
+            arrivals.increment()
+            if !held { continuation.resume() }
         }
     }
 
+    /// Returns once something is waiting at the gate.
+    func waitUntilHeld(file: StaticString = #filePath, line: UInt = #line) async {
+        await arrivals.waitFor(1, file: file, line: line)
+    }
+
     func open() {
-        opened.withLock { $0 = true }
-        let waiters = state.withLock { waiters -> [CheckedContinuation<Void, Never>] in
-            defer { waiters = [] }
-            return waiters
+        let waiters = state.withLock { state -> [CheckedContinuation<Void, Never>] in
+            state.opened = true
+            defer { state.waiters = [] }
+            return state.waiters
         }
         for waiter in waiters { waiter.resume() }
     }

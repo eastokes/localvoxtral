@@ -1,0 +1,76 @@
+import ClaudeContextWire
+#if canImport(CoreGraphics)
+#if canImport(CoreGraphics)
+import CoreGraphics
+#endif
+#endif
+import Foundation
+
+extension ClaudeSessionJoinResolver {
+    /// The Claude Desktop arm: the `local_…` id in the address of the web view
+    /// holding keyboard focus, matched by exact equality against the
+    /// `CLAUDE_CODE_HOST_SESSION_ID` a live session's own hooks published.
+    ///
+    /// The browser arm's shape with a different reader. Claude Desktop hosts
+    /// each Code-tab session in a web view at
+    /// `https://claude.ai/epitaxy/local_<uuid>` and exports the same id into
+    /// the session's environment, whether the session runs on this Mac or on
+    /// an ssh host — so, like a bridge session id, it spans both origins.
+    /// The address names the session in the window's primary pane, so the
+    /// reader returns it only when focus is in that pane's chat panel: focus
+    /// in the second pane of a split view, a terminal panel or the sidebar is
+    /// no join.
+    ///
+    /// Everything abstains rather than guesses, as in the browser arm. An
+    /// abstention AFTER focus was found inside a session's web view says so
+    /// (`focusedSessionUnmatched`): the user is looking at a Claude Code
+    /// session that did not join, which the overlay badge reports even when
+    /// the registry holds no live session at all — the dead-tunnel case.
+    package func resolveViaDesktopSession(target: TerminalScreenTarget) async -> ClaudeJoinResolution {
+        guard let address = await focusedDesktopSessionURL(target.pid) else {
+            Self.abstainedDesktopSessionJoin(outcome: "focused web view address unavailable")
+            return ClaudeJoinResolution(join: nil)
+        }
+        if ClaudeProjectPageURL.isProjectPage(address) {
+            Self.abstainedDesktopSessionJoin(outcome: "focus is in a Claude project, whose page names no session")
+            return ClaudeJoinResolution(join: nil, focusedClaudeProject: true)
+        }
+        guard let desktopSessionID = ClaudeDesktopSessionURL.sessionID(inWebAreaURL: address) else {
+            // Never the address itself: it names what the user is looking at.
+            Self.abstainedDesktopSessionJoin(outcome: "focus is not in a Claude Code session")
+            return ClaudeJoinResolution(join: nil)
+        }
+
+        switch registry.resolve(desktopSessionID: desktopSessionID) {
+        case .resolved(let snapshot):
+            Log.claudeContext.info(
+                "Claude Desktop joined to a live Claude session via its desktop session id"
+            )
+            return ClaudeJoinResolution(join: ClaudeSessionJoin(
+                target: target,
+                snapshot: snapshot,
+                // Nil for the browser arm's reason: a window identity pairs a
+                // SCREEN capture with its join, and this mechanism has none.
+                windowID: nil,
+                mechanism: .desktopSession,
+                desktopSession: ClaudeDesktopSessionBinding(desktopSessionID: desktopSessionID)
+            ))
+        case .unknown:
+            Self.abstainedDesktopSessionJoin(outcome: "no live session reports this desktop session")
+        case .stale:
+            Self.abstainedDesktopSessionJoin(outcome: "stale")
+        case .ambiguous:
+            Self.abstainedDesktopSessionJoin(outcome: "ambiguous")
+        }
+        return ClaudeJoinResolution(join: nil, focusedSessionUnmatched: true)
+    }
+
+    /// Outcome only. The desktop session id is a live handle to a session's
+    /// context; it does not belong in the log.
+    private static func abstainedDesktopSessionJoin(outcome: String) {
+        Log.claudeContext.info(
+            "Claude Desktop matched no session (\(outcome, privacy: .public)); Claude context withheld"
+        )
+        Self.noteAbstention("desktopSession: \(outcome)")
+    }
+}

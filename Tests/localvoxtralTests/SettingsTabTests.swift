@@ -1,0 +1,465 @@
+import XCTest
+
+@testable import localvoxtral
+
+/// The sidebar is data-driven: a pane that is in no sidebar array is
+/// unreachable in the UI, and one in two would render twice. The AX
+/// identifiers are a contract with `scripts/ui-smoke.sh` and
+/// `scripts/capture-readme-assets.sh`, which press and scope by literal string.
+///
+/// `SettingsTab` is a struct, not an enum (owner decision, 2026-09-07): every
+/// TERMINAL gets its own pane and user-added terminals are runtime data. The
+/// fixed pane set the drills can name is `allKnownPanes` — the built-in
+/// terminal panes plus the static sections; user-added terminal panes have no
+/// script-drilled contract.
+final class SettingsTabTests: XCTestCase {
+    /// The pane header is the title only (owner review, 2026-09-07): every
+    /// pane subtitle ("What the polisher and your coding agents may see." and
+    /// siblings) was narration and was deleted so the first group starts
+    /// higher. Pins the deletion at the source, the same way the script-pinning
+    /// tests below hold the AX drills, so a future "helpful" subtitle cannot
+    /// silently return.
+    func testPaneHeaderIsTitleOnly() throws {
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()  // SettingsTabTests.swift
+            .deletingLastPathComponent()  // localvoxtralTests
+            .deletingLastPathComponent()  // Tests
+        let headerSource = try String(
+            contentsOf: repoRoot.appendingPathComponent(
+                "Sources/localvoxtral/Settings/SettingsPaneHeader.swift"
+            ),
+            encoding: .utf8
+        )
+
+        XCTAssertFalse(
+            headerSource.contains("tab.subtitle"),
+            "pane subtitles were deleted by owner review; put new explanations in the docs, not the header"
+        )
+        XCTAssertFalse(
+            headerSource.contains(".subheadline"),
+            "the header renders exactly one line: the tab title"
+        )
+    }
+
+    func testAccessibilityIdentifiersUseTheDrillScheme() {
+        for tab in SettingsTab.allKnownPanes {
+            XCTAssertEqual(tab.accessibilityIdentifier, "settings.tab.\(tab.rawValue)")
+            XCTAssertEqual(tab.paneAccessibilityIdentifier, "settings.pane.\(tab.rawValue)")
+        }
+    }
+
+    /// The automation scripts press and scope by literal `settings.tab.<raw>`
+    /// strings. Reading the scripts here turns a divergence into a unit-test
+    /// failure on every push, instead of an AX drill failure that only surfaces
+    /// in the evening ui-smoke slot on the Mac.
+    func testAutomationScriptsDrillExactlyThePanesTheTabDefines() throws {
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()  // SettingsTabTests.swift
+            .deletingLastPathComponent()  // localvoxtralTests
+            .deletingLastPathComponent()  // Tests
+        let uiSmoke = try String(
+            contentsOf: repoRoot.appendingPathComponent("scripts/ui-smoke.sh"),
+            encoding: .utf8
+        )
+        let capture = try String(
+            contentsOf: repoRoot.appendingPathComponent("scripts/capture-readme-assets.sh"),
+            encoding: .utf8
+        )
+        let rawValues = Set(SettingsTab.allKnownPanes.map(\.rawValue))
+
+        // History, Insights, the Inbox and Projects are drilled by neither script. Both
+        // run on the owner's Mac against his real store, the capture publishes
+        // a picture of the pane and the drill dumps the window's AX tree into a
+        // public CI log when an assertion fails: either would publish what he
+        // dictated.
+        let scriptedRawValues = rawValues.subtracting(["history", "insights", "inbox", "projects"])
+        XCTAssertEqual(
+            Self.firstQuotedArguments(ofCalls: "assert_tab ", in: uiSmoke),
+            scriptedRawValues,
+            "ui-smoke.sh must drill exactly the panes the tab set defines"
+        )
+
+        // About is deliberately not captured for the README; every other
+        // scripted pane must be, and nothing the tab set does not define may
+        // appear.
+        let captureIDs = try Self.shellArrayEntries(named: "TAB_IDS", in: capture)
+        XCTAssertEqual(
+            Set(captureIDs),
+            scriptedRawValues.subtracting(["about"]),
+            "capture-readme-assets.sh TAB_IDS must list every captured pane by raw value"
+        )
+
+        // The script iterates the three arrays in lockstep under `set -u`, so
+        // a TAB_IDS entry without its TAB_NAMES/TAB_FILES sibling only fails
+        // at README-regen time on the Mac. Pin the alignment here instead.
+        let captureNames = try Self.shellArrayEntries(named: "TAB_NAMES", in: capture)
+        let captureFiles = try Self.shellArrayEntries(named: "TAB_FILES", in: capture)
+        XCTAssertEqual(
+            captureNames.count, captureIDs.count,
+            "TAB_NAMES and TAB_IDS must stay index-aligned"
+        )
+        XCTAssertEqual(
+            captureFiles.count, captureIDs.count,
+            "TAB_FILES and TAB_IDS must stay index-aligned"
+        )
+        // The press falls back to the row's AXTitle if SwiftUI ever stops
+        // surfacing identifiers; TAB_NAMES carries that title, so it must
+        // match the pane's real title, not just any string.
+        let idToTitle = Dictionary(
+            uniqueKeysWithValues: SettingsTab.allKnownPanes.map { ($0.rawValue, $0.title) }
+        )
+        for (index, id) in captureIDs.enumerated() {
+            XCTAssertEqual(
+                captureNames[index], idToTitle[id],
+                "TAB_NAMES[\(index)] must be the AXTitle of \(id)"
+            )
+        }
+    }
+
+    /// Every text the drill waits for must still be a string literal in the app
+    /// source. #278 renamed the Engines "Endpoint" rows to "Server URL" and the
+    /// drill kept waiting for "Endpoint"; the TCC preflight was red at the time,
+    /// so the stale needle surfaced two weeks later, on the owner's Mac.
+    func testDrillNeedlesAreStillAppCopy() throws {
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()  // SettingsTabTests.swift
+            .deletingLastPathComponent()  // localvoxtralTests
+            .deletingLastPathComponent()  // Tests
+        let uiSmoke = try String(
+            contentsOf: repoRoot.appendingPathComponent("scripts/ui-smoke.sh"),
+            encoding: .utf8
+        )
+
+        // `assert_tab "<id>" "<title>" "<needle>"` and, anywhere on a line,
+        // `pane_shows_text "settings.pane.<id>" "<needle>"`.
+        var tabNeedles = Set<String>()
+        var paneNeedles = Set<String>()
+        for line in uiSmoke.components(separatedBy: "\n") {
+            let parts = line.components(separatedBy: "\"")
+            if line.hasPrefix("assert_tab "), parts.count > 5 {
+                tabNeedles.insert(parts[5])
+            } else if let call = line.range(of: "pane_shows_text \"settings.pane.") {
+                let arguments = line[call.lowerBound...].components(separatedBy: "\"")
+                // assert_tab's own body passes "$expected_text" through.
+                if arguments.count > 3, !arguments[3].hasPrefix("$") { paneNeedles.insert(arguments[3]) }
+            }
+        }
+        XCTAssertFalse(tabNeedles.isEmpty, "no assert_tab needle parsed from ui-smoke.sh; teach the parser the new shape")
+        XCTAssertFalse(paneNeedles.isEmpty, "no pane_shows_text needle parsed from ui-smoke.sh; teach the parser the new shape")
+        let needles = tabNeedles.union(paneNeedles)
+
+        let sourcesRoot = repoRoot.appendingPathComponent("Sources/localvoxtral")
+        let enumerator = try XCTUnwrap(FileManager.default.enumerator(at: sourcesRoot, includingPropertiesForKeys: nil))
+        var appSource = ""
+        for case let file as URL in enumerator where file.pathExtension == "swift" {
+            appSource += try String(contentsOf: file, encoding: .utf8)
+        }
+
+        for needle in needles.sorted() {
+            XCTAssertTrue(
+                appSource.contains("\"\(needle)\""),
+                "ui-smoke.sh waits for \"\(needle)\", which is no longer a string literal under "
+                    + "Sources/localvoxtral. The copy was renamed, so point the drill at the new text."
+            )
+        }
+    }
+
+    /// The Settings window's source, for the copy/layout pins above.
+    private static func settingsViewSource() throws -> String {
+        try SettingsSourceText.load()
+    }
+
+    /// First double-quoted argument of every top-level `<call> "<arg>" ...`
+    /// line. Skips the function's own definition line (`<call>() {`).
+    private static func firstQuotedArguments(ofCalls call: String, in script: String) -> Set<String> {
+        Set(
+            script.components(separatedBy: "\n")
+                .filter { $0.hasPrefix(call) }
+                .compactMap { line in
+                    let parts = line.components(separatedBy: "\"")
+                    return parts.count > 1 ? parts[1] : nil
+                }
+        )
+    }
+
+    /// Entries of a one-line bash array literal: `NAME=("a" "b" ...)`.
+    private static func shellArrayEntries(named name: String, in script: String) throws -> [String] {
+        let assignment = try XCTUnwrap(
+            script.components(separatedBy: "\n")
+                .first(where: { $0.hasPrefix("\(name)=(") }),
+            "\(name)=( … ) assignment not found"
+        )
+        let entries = assignment.components(separatedBy: "\"")
+            .enumerated()
+            .filter { $0.offset.isMultiple(of: 2) == false }
+            .map(\.element)
+        XCTAssertFalse(
+            entries.isEmpty,
+            "\(name) parsed as empty — this parser expects the whole array on one line; "
+                + "if the script was reformatted, teach the parser the new shape"
+        )
+        return entries
+    }
+
+    /// The clipboard toggle must name the real payload: a capped, sanitized
+    /// EXCERPT of the clipboard attached to the polish prompt
+    /// (`PolishContextClipboardReader`). "Technical terms" understated what
+    /// leaves the machine (an independent review of PR #282 caught it), so the
+    /// title is pinned here against the understatement returning.
+    func testClipboardToggleNamesTheExcerptNotTechnicalTerms() throws {
+        let source = try Self.settingsViewSource()
+        XCTAssertTrue(
+            source.contains("title: \"Send clipboard excerpt\""),
+            "the clipboard toggle must say an excerpt of the clipboard is sent"
+        )
+        XCTAssertFalse(
+            source.localizedCaseInsensitiveContains("clipboard technical terms"),
+            "\"technical terms\" understates the payload — a capped excerpt of the whole "
+                + "clipboard goes to the polisher, not just terms"
+        )
+    }
+
+    /// The Text Processing → Configuration → Files list names LIVE config
+    /// files only. `terminal_apps.toml` is a launch-time import source, not a
+    /// live config file (PR #284 review finding): listing it there told users
+    /// to edit a file the app no longer reads after the first launch. The
+    /// Terminals section is the UI for that list.
+    func testFilesListNamesLiveConfigFilesOnly() throws {
+        let source = try Self.settingsViewSource()
+
+        let filesRow = try XCTUnwrap(
+            source.range(of: "SettingsFieldRow(title: \"Files\", layout: .stacked)"),
+            "the Files list row is gone from the Settings sources — update this pin"
+        )
+        // Up to the next group, or the end of the pane when the Files row is
+        // its last one.
+        let paneEnd = SettingsSourceText.endOfTopLevelDeclaration(in: source, after: filesRow.upperBound)
+        let listEnd = source.range(
+            of: "SettingsGroup(", range: filesRow.upperBound..<paneEnd
+        )?.lowerBound ?? paneEnd
+        let filesList = source[filesRow.lowerBound..<listEnd]
+
+        XCTAssertFalse(
+            filesList.contains("terminal_apps.toml"),
+            "terminal_apps.toml is a launch-time import source, not a live config file; the Terminals section is the UI"
+        )
+        for liveFile in [
+            "replacement_dictionary.toml", "llm_system_prompt.toml", "llm_user_prompt.toml",
+            "llm_system_prompt_agent.toml", "llm_user_prompt_agent.toml",
+        ] {
+            XCTAssertTrue(
+                filesList.contains("SettingsFileNote(name: \"\(liveFile)\")"),
+                "\(liveFile) is a live config file and must stay listed"
+            )
+        }
+    }
+
+    /// Layout rules for the Integrations remote rows (PR #282 review), pinned
+    /// at the source because no render seam exists for them (no `#Preview`,
+    /// no view-inspector dependency):
+    ///
+    /// - the plain-SSH setup status is an INSTRUCTION ("Open a new terminal
+    ///   window for it to take effect.") and must wrap to a second line
+    ///   (`lineLimit(2)` + `fixedSize(horizontal: false, vertical: true)`),
+    ///   never truncate;
+    /// - a host label (up to the registry's 64-character cap) must not squeeze
+    ///   "Last context: …" off its line: the label truncates from the middle
+    ///   at a layout priority below the status's.
+    func testRemoteRowsWrapInstructionsAndCapHostLabels() throws {
+        let source = try Self.settingsViewSource()
+
+        let shellSetup = try XCTUnwrap(
+            source.range(of: "private var shellSetup: some View {"),
+            "the plain-SSH setup row (shellSetup) moved — update this test's anchor"
+        )
+        // Up to the next member (hostList) = the shellSetup body.
+        let nextMember = try XCTUnwrap(
+            source.range(
+                of: "private var hostList",
+                range: shellSetup.upperBound..<source.endIndex
+            ),
+            "hostList no longer follows shellSetup — update this test's anchor"
+        )
+        let row = source[shellSetup.lowerBound..<nextMember.lowerBound]
+        XCTAssertTrue(
+            row.contains(".lineLimit(2)"),
+            "the shell-setup status may wrap to a second line instead of truncating"
+        )
+        XCTAssertTrue(
+            row.contains(".fixedSize(horizontal: false, vertical: true)"),
+            "the shell-setup status needs fixedSize to actually take its second line"
+        )
+
+        let label = try XCTUnwrap(
+            source.range(of: "Text(host.label)"),
+            "the host-row label (Text(host.label)) moved — update this test's anchor"
+        )
+        let labelModifiers = source[label.upperBound...].prefix(300)
+        XCTAssertTrue(
+            labelModifiers.contains(".lineLimit(1)"),
+            "a 64-char host label must be one line, not an unbounded wrap"
+        )
+        XCTAssertTrue(
+            labelModifiers.contains(".truncationMode(.middle)"),
+            "a long host label should truncate from the middle (head and tail stay readable)"
+        )
+        // The row's one status position: the "Last context" age, or — while
+        // the host's plugin is outdated — the fixed update sentence.
+        let status = try XCTUnwrap(
+            source.range(of: ": host.statusText"),
+            "the host-row status Text no longer ends in `: host.statusText` — update this test's anchor"
+        )
+        let statusModifiers = source[status.upperBound...].prefix(300)
+        XCTAssertTrue(
+            statusModifiers.contains(".lineLimit(1)"),
+            "the \"Last context\" status keeps one full line"
+        )
+        XCTAssertTrue(
+            statusModifiers.contains(".layoutPriority(1)"),
+            "the status outranks the label when width runs out"
+        )
+        // The owner misread a bare "Update…" as a truncated label, so the
+        // title names its object ("Update Host…": the run covers the plugin
+        // and the Vibe hooks). The longer label must be FIXED-SIZE so the row
+        // squeezes the label instead of ever truncating the button.
+        let updateButton = try XCTUnwrap(
+            source.range(of: "Button(\"Update Host…\") { model.requestPluginUpdate"),
+            "the host-row update button moved or was renamed — update this test's anchor"
+        )
+        let buttonModifiers = source[updateButton.upperBound...].prefix(300)
+        XCTAssertTrue(
+            buttonModifiers.contains(".fixedSize()"),
+            "\"Update Host…\" must not truncate; the host label absorbs the squeeze"
+        )
+    }
+
+    /// Each pane holds its own subject (owner review, 2026-09-16): herdr rows
+    /// had drifted into Claude Code, the cmux join into Claude Code, and
+    /// harness names into the Context toggles, which gate every agent. Pinned
+    /// at the source, per pane body, so a row cannot quietly move back.
+    func testPanesHoldOnlyTheirOwnSubject() throws {
+        let source = try Self.settingsViewSource()
+
+        func paneBody(_ name: String) throws -> Substring {
+            let start = try XCTUnwrap(
+                source.range(of: "struct \(name): View {"),
+                "\(name) is gone from the Settings sources — update this pin"
+            )
+            let end = SettingsSourceText.endOfTopLevelDeclaration(in: source, after: start.upperBound)
+            return source[start.lowerBound..<end]
+        }
+
+        let claude = try paneBody("ClaudeCodeSettingsPane")
+        for foreign in ["Herdr", "herdr", "cmux", "Remote", "ClaudeRemote"] {
+            XCTAssertFalse(claude.contains(foreign), "Claude Code pane mentions \(foreign)")
+        }
+
+        let context = try paneBody("IntegrationsContextSettingsPane")
+        XCTAssertFalse(
+            context.contains("title: \"Claude Code"),
+            "Context toggles gate every agent session; no row is titled for one harness"
+        )
+
+        let herdr = try paneBody("HerdrSettingsPane")
+        XCTAssertTrue(herdr.contains("HerdrMachinesSettingsList("))
+        XCTAssertTrue(herdr.contains("ClaudeHerdrLocalPanelSettingsRow("))
+
+        let remote = try paneBody("RemoteHostsSettingsPane")
+        XCTAssertTrue(remote.contains("ClaudeRemoteHostsRows("))
+        XCTAssertFalse(remote.contains("Herdr"), "herdr rows belong on the herdr pane")
+
+        let terminal = try paneBody("TerminalSettingsPane")
+        XCTAssertTrue(terminal.contains("$settings.cmuxSurfaceJoinEnabled"))
+        XCTAssertTrue(terminal.contains("ClaudeCmuxPasswordSettingsRow("))
+    }
+
+    /// The window is named after the app (owner decision, 2026-09-22): History
+    /// and Insights live in it, so "Settings" would name a third of it. Both AX
+    /// drills address the window by title, so the three strings are held equal
+    /// here rather than found apart in the evening ui-smoke slot.
+    func testWindowTitleIsTheAppNameAndTheDrillsAddressIt() throws {
+        XCTAssertEqual(SettingsWindowChromeView.windowTitle, "localvoxtral")
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()  // SettingsTabTests.swift
+            .deletingLastPathComponent()  // localvoxtralTests
+            .deletingLastPathComponent()  // Tests
+        for script in ["scripts/ui-smoke.sh", "scripts/capture-readme-assets.sh"] {
+            let source = try String(
+                contentsOf: repoRoot.appendingPathComponent(script), encoding: .utf8)
+            XCTAssertTrue(
+                source.contains("SETTINGS_WINDOW_TITLE=\"\(SettingsWindowChromeView.windowTitle)\""),
+                "\(script) must address the window by its title, \(SettingsWindowChromeView.windowTitle)"
+            )
+        }
+    }
+
+    /// Presentation order is a UX contract of its own: `testRawValuesAreStable`
+    /// compares a Set, so an accidental reorder (an alphabetical sort, a
+    /// careless merge) would pass every other test while moving rows the user
+    /// has already built muscle memory for. A pane listed in two sections would
+    /// render twice, and no Set comparison notices it.
+    func testSidebarOrderIsThePresentationContract() {
+        let panes = SettingsTab.allKnownPanes
+        XCTAssertEqual(Set(panes).count, panes.count, "a pane is listed in two sidebar sections")
+        XCTAssertEqual(SettingsTab.historySidebarItems, [.inbox, .history, .insights, .projects])
+        XCTAssertEqual(
+            SettingsTab.primarySidebarItems,
+            [.general, .dictation, .endpoints, .textProcessing, .integrationsContext, .about]
+        )
+        XCTAssertEqual(
+            SettingsTab.integrationsSidebarItems,
+            [
+                .integrationsClaude, .integrationsOpencode, .integrationsVibe,
+                .integrationsCodex, .integrationsHerdr, .integrationsRemote,
+            ]
+        )
+        // Join-capable terminals first, then the dictation-only list — the
+        // owner-decided order, pinned as slugs so a catalog edit that reorders
+        // rows is a deliberate act.
+        XCTAssertEqual(
+            TerminalAppCatalog.builtIn.map(\.slug),
+            [
+                "ghostty", "iterm2", "apple-terminal", "cmux",
+                "warp", "wezterm", "kitty", "alacritty", "hyper", "tabby", "rio",
+            ]
+        )
+    }
+
+    /// The scripts hardcode these strings; renaming a pane silently breaks the
+    /// AX drills, which is exactly the failure this pins.
+    func testRawValuesAreStable() {
+        XCTAssertEqual(
+            Set(SettingsTab.allKnownPanes.map(\.rawValue)),
+            [
+                "general", "endpoints", "dictation", "textProcessing", "about", "history",
+                "insights", "inbox", "projects",
+                "integrations.context", "integrations.claude", "integrations.opencode",
+                "integrations.vibe", "integrations.codex", "integrations.herdr", "integrations.remote",
+                "terminals.ghostty", "terminals.iterm2", "terminals.apple-terminal",
+                "terminals.cmux", "terminals.warp", "terminals.wezterm", "terminals.kitty",
+                "terminals.alacritty", "terminals.hyper", "terminals.tabby", "terminals.rio",
+            ]
+        )
+    }
+
+    /// The retired single-Integrations-pane raw value must never come back:
+    /// neither as a kind nor as a terminal pane's slug.
+    func testRetiredIntegrationsRawValueStaysRetired() {
+        XCTAssertNil(SettingsTab.Kind(rawValue: "integrations"))
+        for pane in SettingsTab.allKnownPanes {
+            XCTAssertNotEqual(pane.rawValue, "integrations")
+        }
+    }
+
+    /// A terminal pane's raw value is `terminals.<slug>`, and its title is the
+    /// terminal's display name.
+    func testTerminalPaneRawValueIsTerminalsSlug() {
+        let app = TerminalAppDescriptor(
+            slug: "dev-some-app", displayName: "Some App",
+            detectionBundleIDs: ["dev.some.app"], capabilities: .supportsEverything(),
+            isUserAdded: true
+        )
+        XCTAssertEqual(SettingsTab.terminal(app).rawValue, "terminals.dev-some-app")
+        XCTAssertEqual(SettingsTab.terminal(app).title, "Some App")
+    }
+}

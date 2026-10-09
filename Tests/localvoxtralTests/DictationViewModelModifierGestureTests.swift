@@ -6,10 +6,6 @@ import XCTest
 /// adversarial review of the tap-vs-hold rework.
 @MainActor
 final class DictationViewModelModifierGestureTests: XCTestCase {
-    // DictationViewModel owns several app-lifetime services. Retain test instances
-    // for the process duration so teardown does not race service shutdown.
-    private static var retainedViewModels: [DictationViewModel] = []
-
     func testModifierTapTogglesOffEvenInPushToTalkShortcutMode() {
         // A tap has no release event: routing it through push-to-talk press
         // semantics set isPushToTalkShortcutHeld with nothing to ever clear
@@ -18,14 +14,14 @@ final class DictationViewModelModifierGestureTests: XCTestCase {
         settings.dictationShortcutMode = .pushToTalk
         let viewModel = makeViewModel(settings: settings)
 
-        viewModel.sessionOutputMode = .overlayBuffer
+        viewModel.session.sessionOutputMode = .overlayBuffer
         viewModel.isDictating = true
 
-        viewModel.debugHandleModifierOnlyTapForTesting(mode: .overlayBuffer)
+        viewModel.shortcuts.handleModifierOnlyTap(mode: .overlayBuffer)
 
         XCTAssertFalse(viewModel.isDictating, "tap during dictation must stop it")
         XCTAssertFalse(
-            viewModel.debugIsPushToTalkShortcutHeldForTesting,
+            viewModel.shortcuts.isPushToTalkShortcutHeld,
             "a tap must never latch the push-to-talk held flag"
         )
     }
@@ -35,13 +31,13 @@ final class DictationViewModelModifierGestureTests: XCTestCase {
         // finalizes using sessionOutputMode; the tap's mode applies only when
         // it STARTS a session.
         let settings = makeSettings(outputMode: .liveAutoPaste)
-        let coordinator = GestureTestOverlayCoordinator()
+        let coordinator = MockOverlayCoordinator()
         let viewModel = makeViewModel(settings: settings, coordinator: coordinator)
 
-        viewModel.sessionOutputMode = .liveAutoPaste
+        viewModel.session.sessionOutputMode = .liveAutoPaste
         viewModel.isDictating = true
 
-        viewModel.debugHandleModifierOnlyTapForTesting(mode: .overlayBuffer)
+        viewModel.shortcuts.handleModifierOnlyTap(mode: .overlayBuffer)
 
         XCTAssertFalse(viewModel.isDictating)
         XCTAssertEqual(
@@ -57,17 +53,17 @@ final class DictationViewModelModifierGestureTests: XCTestCase {
         let settings = makeSettings(outputMode: .overlayBuffer)
         let viewModel = makeViewModel(settings: settings)
 
-        viewModel.sessionOutputMode = .overlayBuffer
+        viewModel.session.sessionOutputMode = .overlayBuffer
         viewModel.isDictating = true
 
-        viewModel.debugHandleModifierOnlyHoldStartForTesting()
+        viewModel.shortcuts.handleModifierOnlyHoldStart()
 
         XCTAssertEqual(
-            viewModel.sessionOutputMode, .overlayBuffer,
+            viewModel.session.sessionOutputMode, .overlayBuffer,
             "a hold during an active session must not rewrite its output mode"
         )
         XCTAssertFalse(
-            viewModel.debugIsPushToTalkShortcutHeldForTesting,
+            viewModel.shortcuts.isPushToTalkShortcutHeld,
             "no push-to-talk state may latch when the hold is ignored"
         )
     }
@@ -78,10 +74,10 @@ final class DictationViewModelModifierGestureTests: XCTestCase {
 
         viewModel.isAwaitingMicrophonePermission = true
 
-        viewModel.debugHandleModifierOnlyHoldStartForTesting()
+        viewModel.shortcuts.handleModifierOnlyHoldStart()
 
         XCTAssertNil(
-            viewModel.sessionOutputMode,
+            viewModel.session.sessionOutputMode,
             "a gesture whose startDictation request is declined must not latch a shortcut mode"
         )
 
@@ -89,14 +85,14 @@ final class DictationViewModelModifierGestureTests: XCTestCase {
         viewModel.isAwaitingMicrophonePermission = false
         viewModel.textInsertion.debugSetAccessibilityTrusted(true)
 
-        await viewModel.beginDictationSession()
+        await viewModel.session.beginDictationSession()
 
         XCTAssertEqual(
-            viewModel.sessionOutputMode, .overlayBuffer,
+            viewModel.session.sessionOutputMode, .overlayBuffer,
             "the next settings-based session must use the current setting, not a stale failed gesture mode"
         )
 
-        viewModel.abortConnectingSession()
+        viewModel.session.abortConnectingSession()
     }
 
     func testAccessibilityTrustArrivalRetriesFailedModifierOnlyRegistration() {
@@ -116,9 +112,9 @@ final class DictationViewModelModifierGestureTests: XCTestCase {
         let viewModel = makeViewModel(settings: settings)
         viewModel.textInsertion.debugSetAccessibilityTrusted(false)
 
-        viewModel.applyHotKeySettingsChange()
+        viewModel.shortcuts.applyHotKeySettingsChange()
         XCTAssertNotEqual(
-            viewModel.debugCurrentHotKeyRegistrationKindForTesting, .modifierOnly,
+            viewModel.shortcuts.hotKeyManager.debugCurrentRegistrationKind, .modifierOnly,
             "sanity: the launch-time registration attempt must have failed"
         )
 
@@ -126,7 +122,7 @@ final class DictationViewModelModifierGestureTests: XCTestCase {
         viewModel.textInsertion.debugSetAccessibilityTrusted(true)
 
         XCTAssertEqual(
-            viewModel.debugCurrentHotKeyRegistrationKindForTesting, .modifierOnly,
+            viewModel.shortcuts.hotKeyManager.debugCurrentRegistrationKind, .modifierOnly,
             "trust arrival must re-register the modifier-only hotkey"
         )
         XCTAssertNil(
@@ -147,8 +143,8 @@ final class DictationViewModelModifierGestureTests: XCTestCase {
         let viewModel = makeViewModel(settings: settings)
         viewModel.textInsertion.debugSetAccessibilityTrusted(false)
 
-        viewModel.applyHotKeySettingsChange()
-        XCTAssertEqual(viewModel.debugCurrentHotKeyRegistrationKindForTesting, .modifierOnly)
+        viewModel.shortcuts.applyHotKeySettingsChange()
+        XCTAssertEqual(viewModel.shortcuts.hotKeyManager.debugCurrentRegistrationKind, .modifierOnly)
         let startCallsAfterRegistration = ModifierOnlyHotKeyManager.startCallCount
 
         viewModel.textInsertion.debugSetAccessibilityTrusted(true)
@@ -159,74 +155,22 @@ final class DictationViewModelModifierGestureTests: XCTestCase {
         )
     }
 
-    private func makeSettings(outputMode: DictationOutputMode) -> SettingsStore {
-        let suiteName = "localvoxtral.DictationViewModelModifierGestureTests.\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suiteName)!
-        defaults.removePersistentDomain(forName: suiteName)
-        addTeardownBlock {
-            defaults.removePersistentDomain(forName: suiteName)
-        }
-
-        let settings = SettingsStore(defaults: defaults, environment: [:])
-        settings.dictationOutputMode = outputMode
-        return settings
-    }
-
     private func makeViewModel(
         settings: SettingsStore,
-        coordinator: GestureTestOverlayCoordinator = GestureTestOverlayCoordinator()
+        coordinator: MockOverlayCoordinator = MockOverlayCoordinator()
     ) -> DictationViewModel {
+        // The dial opens the microphone (#527): never the host's.
         let viewModel = DictationViewModel(
             settings: settings,
             overlayBufferCoordinator: coordinator,
-            startRuntimeServices: false
+            startRuntimeServices: false,
+            dependencies: .init(microphone: { FakeMicrophoneCaptureService() })
         )
         // Keep tests hermetic: session start reads config (terminal apps,
         // replacement dictionary) through the store — never the real
         // config directory.
-        viewModel.appConfigStore = GestureTestHermeticConfigStore()
-        Self.retainedViewModels.append(viewModel)
+        viewModel.appConfigStore = MockAppConfigStore()
+        retainForTestProcessLifetime(viewModel)
         return viewModel
     }
-}
-
-private final class GestureTestHermeticConfigStore: AppConfigServing {
-    func configDirectoryURL() -> URL {
-        FileManager.default.temporaryDirectory
-    }
-
-    func loadReplacementDictionary() -> ReplacementDictionary {
-        ReplacementDictionary(entries: [])
-    }
-
-    func loadLLMPromptTemplates() -> LLMPromptTemplates {
-        LLMPromptTemplates(systemContent: "system", userContent: "{{input_text}}")
-    }
-
-    func loadTerminalAppBundleIDs() -> [String] {
-        []
-    }
-}
-
-@MainActor
-private final class GestureTestOverlayCoordinator: OverlayBufferSessionCoordinating {
-    var commitTargetAppPID: pid_t? = nil
-    var commitCallCount = 0
-
-    func resolveAnchorNow() -> OverlayAnchor {
-        OverlayAnchor(targetRect: CGRect(x: 0, y: 0, width: 100, height: 24), source: .windowCenter)
-    }
-    func startSession(preResolvedAnchor: OverlayAnchor?) {}
-    func beginFinalizing(displayBufferText: String, commitBufferText: String) {}
-    func refresh(displayBufferText: String, commitBufferText: String) {}
-    func commitIfNeeded(
-        using textCommitter: OverlayTextCommitting,
-        autoCopyEnabled: Bool
-    ) -> OverlayBufferCommitOutcome {
-        commitCallCount += 1
-        return .succeeded
-    }
-    func dismissAfterHold(minimumVisibility: TimeInterval) {}
-    func reset() {}
-    func captureLiveCommitTargetAppPID() {}
 }

@@ -34,7 +34,7 @@ private final class FakeCmuxKeychain: CmuxKeychainBackend, @unchecked Sendable {
     }
 
     func delete(service: String, account: String) -> Bool {
-        _ = items.withLock { $0.removeValue(forKey: Key(service: service, account: account)) }
+        items.withLock { _ = $0.removeValue(forKey: Key(service: service, account: account)) }
         return true
     }
 }
@@ -197,6 +197,7 @@ final class CmuxPasswordSettingsRowTests: XCTestCase {
     private struct InertPluginService: ClaudePluginInstalling {
         func installPlugin() throws {}
         func updatePlugin() throws {}
+        func updateInstalledPlugin() throws {}
         func uninstallPlugin() throws {}
     }
 

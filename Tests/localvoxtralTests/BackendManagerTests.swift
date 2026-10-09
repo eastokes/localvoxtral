@@ -6,29 +6,20 @@ import XCTest
 
 @MainActor
 final class BackendManagerTests: XCTestCase {
-    func testBundledDictationBackendRecordsStartSequence() async throws {
-        let supervisorFactory = FakeSupervisorFactory()
-        supervisorFactory.statesByName[BackendCatalog.speechd.displayName] = [
-            .launching,
-            .waitingForReady,
-            .running,
-        ]
-        let manager = makeManager(supervisorFactory: supervisorFactory)
-        var speechdStatuses: [ManagedBackendStatus] = []
-        manager.debugStatusChangeSink = { spec, status in
-            guard spec.id == BackendCatalog.speechd.id else { return }
-            speechdStatuses.append(status)
+    /// The helpers load weights from the cache the downloader wrote them to,
+    /// however the app's environment names it.
+    func testHelpersLookForModelsInTheCacheTheDownloaderFilled() {
+        let home = URL(fileURLWithPath: "/Users/tester", isDirectory: true)
+        for inherited in [
+            ["HF_HUB_CACHE": "/custom/hub", "HF_HOME": "/ignored"],
+            ["HF_HOME": "/custom/hf"],
+            [:],
+        ] {
+            let downloadedTo = HFModelDownloader.defaultCacheRoot(environment: inherited, home: home).path
+            let helper = BackendManager.helperEnvironment(inherited: inherited, home: home)
+            XCTAssertEqual(helper["HF_HUB_CACHE"], downloadedTo, "app environment: \(inherited)")
+            XCTAssertNil(helper["HF_HOME"], "HF_HUB_CACHE alone names the cache")
         }
-
-        try await manager.ensureReady(dictation: true, polishing: false)
-
-        XCTAssertEqual(manager.speechdStatus, .ready)
-        XCTAssertTrue(speechdStatuses.contains {
-            if case .preparingModel = $0 { return true }
-            return false
-        })
-        XCTAssertTrue(speechdStatuses.contains(.starting))
-        XCTAssertEqual(speechdStatuses.last, .ready)
     }
 
     func testSpeechdConfigurationUsesBundlePathPinnedModelRevisionAndHFFileSet() async throws {
@@ -74,138 +65,200 @@ final class BackendManagerTests: XCTestCase {
             configuration.arguments.firstIndex(of: "--model-revision")
         )
         XCTAssertEqual(configuration.arguments[revisionIndex + 1], option.revision)
-        // Default providers are Auto: the cache-limit and step-cadence flags
-        // are omitted so the helper's built-in defaults apply.
-        XCTAssertFalse(configuration.arguments.contains("--cache-limit-mb"))
+        // The step cadence is the helper's own default, so its flag is omitted.
         XCTAssertFalse(configuration.arguments.contains("--step-ms"))
     }
 
-    func testSpeechdCacheLimitAutoOmitsFlagAndPresetsAppendMegabytes() async throws {
-        let option = SpeechModelCatalog.defaultOption
-        let baseArguments = [
-            "--model", option.repoID,
-            "--model-revision", option.revision,
-            "--port", "8471",
-            "--parent-pid", "\(Darwin.getpid())",
-        ]
-
-        // Auto: identical to the base argument list, no cache-limit flag.
-        let autoConfiguration = try await speechdConfiguration(cacheLimitMB: nil)
-        XCTAssertEqual(autoConfiguration.arguments, baseArguments)
-
-        // Each preset appends exactly `--cache-limit-mb <value>` and leaves the
-        // model / revision / port / parent-pid arguments untouched.
-        for megabytes in [2048, 4096, 6144, 8192] {
-            let configuration = try await speechdConfiguration(cacheLimitMB: megabytes)
-            XCTAssertEqual(
-                configuration.arguments,
-                baseArguments + ["--cache-limit-mb", "\(megabytes)"]
+    func testSpeechdDownloadsAndLaunchesTheSelectedCatalogModel() async throws {
+        let modelPreparer = FakeModelPreparer()
+        let supervisorFactory = FakeSupervisorFactory()
+        supervisorFactory.statesByName[BackendCatalog.speechd.displayName] = [.running]
+        let selected = try XCTUnwrap(
+            SpeechModelCatalog.option(
+                forRepoID: "mlx-community/nemotron-3.5-asr-streaming-0.6b-8bit"
             )
-        }
+        )
+        let manager = makeManager(
+            modelPreparer: modelPreparer,
+            speechModelProvider: { selected },
+            supervisorFactory: supervisorFactory
+        )
+
+        try await manager.ensureReady(dictation: true, polishing: false)
+
+        let request = try XCTUnwrap(modelPreparer.prepareCalls.first)
+        XCTAssertEqual(request.repoID, selected.repoID)
+        XCTAssertEqual(request.revision, selected.revision)
+        let configuration = try XCTUnwrap(supervisorFactory.createdConfigurations.first)
+        let modelIndex = try XCTUnwrap(configuration.arguments.firstIndex(of: "--model"))
+        XCTAssertEqual(configuration.arguments[modelIndex + 1], selected.repoID)
+        let revisionIndex = try XCTUnwrap(
+            configuration.arguments.firstIndex(of: "--model-revision")
+        )
+        XCTAssertEqual(configuration.arguments[revisionIndex + 1], selected.revision)
     }
 
-    func testSpeechdStepCadenceAutoOmitsFlagAndPresetsAppendMilliseconds() async throws {
-        let option = SpeechModelCatalog.defaultOption
-        let baseArguments = [
-            "--model", option.repoID,
-            "--model-revision", option.revision,
-            "--port", "8471",
-            "--parent-pid", "\(Darwin.getpid())",
-        ]
-
-        // Auto: identical to the base argument list, no step-cadence flag.
-        let autoConfiguration = try await speechdConfiguration(stepCadenceMs: nil)
-        XCTAssertEqual(autoConfiguration.arguments, baseArguments)
-
-        // Each preset appends exactly `--step-ms <value>` and leaves the
-        // model / revision / port / parent-pid arguments untouched.
-        for milliseconds in [100, 240, 480] {
-            let configuration = try await speechdConfiguration(stepCadenceMs: milliseconds)
-            XCTAssertEqual(
-                configuration.arguments,
-                baseArguments + ["--step-ms", "\(milliseconds)"]
+    /// A supervisor captures its argv once, so a model change under a running
+    /// helper must stop it and relaunch — otherwise the next dictation attaches
+    /// to the previous checkpoint.
+    func testSpeechdRelaunchesWhenTheSelectedModelChangesUnderARunningHelper() async throws {
+        let modelPreparer = FakeModelPreparer()
+        let supervisorFactory = FakeSupervisorFactory()
+        supervisorFactory.statesByName[BackendCatalog.speechd.displayName] = [.running]
+        let first = SpeechModelCatalog.defaultOption
+        let second = try XCTUnwrap(
+            SpeechModelCatalog.option(
+                forRepoID: "mlx-community/nemotron-3.5-asr-streaming-0.6b-8bit"
             )
+        )
+        let selected = SpeechModelBox(first)
+        let manager = makeManager(
+            modelPreparer: modelPreparer,
+            speechModelProvider: { selected.value },
+            supervisorFactory: supervisorFactory
+        )
+
+        try await manager.ensureReady(dictation: true, polishing: false)
+        selected.value = second
+        try await manager.ensureReady(dictation: true, polishing: false)
+
+        XCTAssertEqual(modelPreparer.prepareCalls.map(\.repoID), [first.repoID, second.repoID])
+        XCTAssertEqual(supervisorFactory.createdConfigurations.count, 2)
+        let relaunch = supervisorFactory.createdConfigurations[1].arguments
+        let modelIndex = try XCTUnwrap(relaunch.firstIndex(of: "--model"))
+        XCTAssertEqual(relaunch[modelIndex + 1], second.repoID)
+    }
+
+    /// A helper that failed to start is kept for a retry, but its argv still
+    /// names the model it was launched for. After a model change the retry
+    /// must launch the new selection, not restart the old supervisor.
+    func testSpeechdRetryAfterAFailedLaunchUsesTheNewlySelectedModel() async throws {
+        let supervisorFactory = FakeSupervisorFactory()
+        supervisorFactory.statesByName[BackendCatalog.speechd.displayName] = [
+            .failed(summary: "crashed", detail: nil),
+        ]
+        let first = SpeechModelCatalog.defaultOption
+        let second = try XCTUnwrap(
+            SpeechModelCatalog.option(
+                forRepoID: "mlx-community/nemotron-3.5-asr-streaming-0.6b-8bit"
+            )
+        )
+        let selected = SpeechModelBox(first)
+        let manager = makeManager(
+            speechModelProvider: { selected.value },
+            supervisorFactory: supervisorFactory
+        )
+
+        _ = try? await manager.ensureReady(dictation: true, polishing: false)
+        selected.value = second
+        supervisorFactory.statesByName[BackendCatalog.speechd.displayName] = [.running]
+        try await manager.ensureReady(dictation: true, polishing: false)
+
+        XCTAssertEqual(supervisorFactory.createdConfigurations.count, 2)
+        let retry = try XCTUnwrap(supervisorFactory.createdConfigurations.last).arguments
+        let modelIndex = try XCTUnwrap(retry.firstIndex(of: "--model"))
+        XCTAssertEqual(retry[modelIndex + 1], second.repoID)
+    }
+
+    /// Cancel discards the download it interrupts. If the selection changed
+    /// while that download ran, the selected model is not the one whose
+    /// partial bytes are on disk.
+    func testCancelDiscardsTheInFlightModelNotTheNewSelection() async throws {
+        let modelPreparer = FakeModelPreparer(suspendBackendIDs: [BackendCatalog.speechd.id])
+        let first = SpeechModelCatalog.defaultOption
+        let second = try XCTUnwrap(
+            SpeechModelCatalog.option(
+                forRepoID: "mlx-community/nemotron-3.5-asr-streaming-0.6b-8bit"
+            )
+        )
+        let selected = SpeechModelBox(first)
+        let manager = makeManager(
+            modelPreparer: modelPreparer,
+            speechModelProvider: { selected.value },
+            supervisorFactory: FakeSupervisorFactory()
+        )
+
+        let ensure = Task { @MainActor in
+            try await manager.ensureReady(dictation: true, polishing: false)
         }
+        await modelPreparer.waitUntilPrepareStarted()
+        selected.value = second
+
+        await manager.cancelModelDownload(for: BackendCatalog.speechd)
+
+        XCTAssertEqual(modelPreparer.discardedRepoIDs, [first.repoID])
+        XCTAssertEqual(manager.speechdStatus, .stopped)
+        _ = try? await ensure.value
+    }
+
+    /// The counterpart: an unchanged selection must not restart anything.
+    func testSpeechdKeepsRunningWhenTheSelectedModelIsUnchanged() async throws {
+        let supervisorFactory = FakeSupervisorFactory()
+        supervisorFactory.statesByName[BackendCatalog.speechd.displayName] = [.running]
+        let manager = makeManager(supervisorFactory: supervisorFactory)
+
+        try await manager.ensureReady(dictation: true, polishing: false)
+        try await manager.ensureReady(dictation: true, polishing: false)
+
+        XCTAssertEqual(supervisorFactory.createdConfigurations.count, 1)
+    }
+
+    /// The cap is fixed (#690): no setting feeds it, so every launch passes the
+    /// same `--cache-limit-mb` after the model / revision / port / parent-pid.
+    func testSpeechdLaunchesWithTheFixedCacheLimit() async throws {
+        let option = SpeechModelCatalog.defaultOption
+        let supervisorFactory = FakeSupervisorFactory()
+        supervisorFactory.statesByName[BackendCatalog.speechd.displayName] = [.running]
+        let manager = makeManager(supervisorFactory: supervisorFactory)
+
+        try await manager.ensureReady(dictation: true, polishing: false)
+
+        let configuration = try XCTUnwrap(
+            supervisorFactory.createdConfigurations
+                .first { $0.name == BackendCatalog.speechd.displayName }
+        )
+        XCTAssertEqual(
+            configuration.arguments,
+            [
+                "--model", option.repoID,
+                "--model-revision", option.revision,
+                "--engine", option.engine.rawValue,
+                "--port", "8471",
+                "--parent-pid", "\(Darwin.getpid())",
+                "--cache-limit-mb", "\(BackendManager.speechdCacheLimitMB)",
+            ]
+        )
     }
 
     /// Regression: launch arguments are captured at supervisor creation, so a
     /// stop must DROP the supervisor — a kept one would relaunch with stale
-    /// settings (field-hit 2026-07-17: changing the memory limit and toggling
-    /// Managed → External → Managed silently kept the old argv).
-    func testStopDictationDropsSupervisorSoNextEnsureRebuildsArguments() async throws {
-        let supervisorFactory = FakeSupervisorFactory()
-        supervisorFactory.statesByName[BackendCatalog.speechd.displayName] = [.running]
-        let stepCadenceMs = ProvidedValueBox()
-        let manager = makeManager(
-            speechdStepCadenceProvider: { stepCadenceMs.value },
-            supervisorFactory: supervisorFactory
-        )
-
-        try await manager.ensureReady(dictation: true, polishing: false)
-        await manager.stopDictation()
-        stepCadenceMs.value = 100
-        try await manager.ensureReady(dictation: true, polishing: false)
-
-        let configurations = supervisorFactory.createdConfigurations
-            .filter { $0.name == BackendCatalog.speechd.displayName }
-        XCTAssertEqual(
-            configurations.count, 2,
-            "stopDictation must drop the supervisor so the next ensure rebuilds it"
-        )
-        XCTAssertFalse(try XCTUnwrap(configurations.first).arguments.contains("--step-ms"))
-        XCTAssertEqual(
-            Array(try XCTUnwrap(configurations.last).arguments.suffix(2)),
-            ["--step-ms", "100"]
-        )
-    }
-
-    /// Same contract for the full-stop path used when the app switches the
-    /// dictation backend mode away from Managed.
+    /// settings (field-hit 2026-07-17: changing a launch setting and toggling
+    /// Managed → External → Managed silently kept the old argv). Speechd's only
+    /// setting in its argv is the model, which `ensureReady` compares on its
+    /// own, so polishd's model carries the check.
     func testStopAllDropsSupervisorsSoNextEnsureRebuildsArguments() async throws {
         let supervisorFactory = FakeSupervisorFactory()
-        supervisorFactory.statesByName[BackendCatalog.speechd.displayName] = [.running]
-        let cacheLimitMB = ProvidedValueBox()
+        supervisorFactory.statesByName[BackendCatalog.polishd.displayName] = [.running]
+        let polishingModel = PolishingModelBox(SettingsStore.defaultLLMPolishingModel)
         let manager = makeManager(
-            speechdCacheLimitProvider: { cacheLimitMB.value },
+            polishingModelProvider: { polishingModel.value },
             supervisorFactory: supervisorFactory
         )
 
-        try await manager.ensureReady(dictation: true, polishing: false)
+        try await manager.ensureReady(dictation: false, polishing: true)
         await manager.stopAll()
-        cacheLimitMB.value = 2048
-        try await manager.ensureReady(dictation: true, polishing: false)
+        polishingModel.value = "example/new-polishing-model"
+        try await manager.ensureReady(dictation: false, polishing: true)
 
         let configurations = supervisorFactory.createdConfigurations
-            .filter { $0.name == BackendCatalog.speechd.displayName }
+            .filter { $0.name == BackendCatalog.polishd.displayName }
         XCTAssertEqual(
             configurations.count, 2,
             "stopAll must drop the supervisors so the next ensure rebuilds them"
         )
         XCTAssertEqual(
-            Array(try XCTUnwrap(configurations.last).arguments.suffix(2)),
-            ["--cache-limit-mb", "2048"]
-        )
-    }
-
-    /// Starts speechd with the given cache-limit / step-cadence providers and
-    /// returns the supervisor configuration it was launched with.
-    private func speechdConfiguration(
-        cacheLimitMB: Int? = nil,
-        stepCadenceMs: Int? = nil
-    ) async throws -> BackendProcessConfiguration {
-        let supervisorFactory = FakeSupervisorFactory()
-        supervisorFactory.statesByName[BackendCatalog.speechd.displayName] = [.running]
-        let manager = makeManager(
-            speechdCacheLimitProvider: { cacheLimitMB },
-            speechdStepCadenceProvider: { stepCadenceMs },
-            supervisorFactory: supervisorFactory
-        )
-
-        try await manager.ensureReady(dictation: true, polishing: false)
-
-        return try XCTUnwrap(
-            supervisorFactory.createdConfigurations
-                .first { $0.name == BackendCatalog.speechd.displayName }
+            Array(try XCTUnwrap(configurations.last).arguments.prefix(2)),
+            ["--model", "example/new-polishing-model"]
         )
     }
 
@@ -222,6 +275,8 @@ final class BackendManagerTests: XCTestCase {
         try await manager.ensureReady(dictation: true, polishing: false)
         XCTAssertEqual(supervisorFactory.createdConfigurations.map(\.name), [BackendCatalog.speechd.displayName])
         XCTAssertEqual(modelPreparer.prepareCalls.map(\.backendID), [BackendCatalog.speechd.id])
+        XCTAssertEqual(manager.speechdStatus, .ready)
+        XCTAssertEqual(manager.polishdStatus, .stopped)
 
         try await manager.ensureReady(dictation: true, polishing: true)
         // Set + count, not positional (concurrent ensure tasks): exactly one
@@ -237,6 +292,7 @@ final class BackendManagerTests: XCTestCase {
         )
         XCTAssertEqual(modelPreparer.prepareCalls.count, 2)
         XCTAssertEqual(manager.polishdStatus, .ready)
+        XCTAssertEqual(supervisorFactory.supervisors[BackendCatalog.polishd.displayName]?.startCallCount, 1)
 
         let polishdConfiguration = try XCTUnwrap(
             supervisorFactory.createdConfigurations
@@ -325,7 +381,9 @@ final class BackendManagerTests: XCTestCase {
         let second = Task { @MainActor in
             try await manager.ensureReady(dictation: true, polishing: false)
         }
-        await Task.yield()
+        // The second ensure was queued on the main actor ahead of this
+        // barrier, so it has joined or started a flight when the barrier runs.
+        await Task { @MainActor in }.value
 
         XCTAssertEqual(modelPreparer.prepareCalls.map(\.backendID), [BackendCatalog.speechd.id])
         XCTAssertTrue(supervisorFactory.createdConfigurations.isEmpty)
@@ -333,43 +391,102 @@ final class BackendManagerTests: XCTestCase {
         modelPreparer.resumePrepare()
         try await first.value
         try await second.value
+        // Only the first prepare parks, so a second flight would have
+        // prepared again by now.
+        XCTAssertEqual(modelPreparer.prepareCalls.map(\.backendID), [BackendCatalog.speechd.id])
         XCTAssertEqual(
             supervisorFactory.supervisors[BackendCatalog.speechd.displayName]?.startCallCount,
             1
         )
     }
 
-    func testStopAllStopsBothSupervisors() async throws {
+    /// A voice memo and a dictation share one cold speechd start. Turning memos
+    /// off cancels only the memo's wait: it returns at once, and the dictation
+    /// still reaches ready (#1511).
+    func testCancellingMemoWaiterPreservesDictationWaiter() async throws {
+        let modelPreparer = FakeModelPreparer(suspendBackendIDs: [BackendCatalog.speechd.id])
         let supervisorFactory = FakeSupervisorFactory()
         supervisorFactory.statesByName[BackendCatalog.speechd.displayName] = [.running]
-        supervisorFactory.statesByName[BackendCatalog.polishd.displayName] = [.running]
-        let manager = makeManager(supervisorFactory: supervisorFactory)
+        let manager = makeManager(
+            modelPreparer: modelPreparer,
+            supervisorFactory: supervisorFactory
+        )
 
-        try await manager.ensureReady(dictation: true, polishing: true)
-        await manager.stopAll()
+        let dictation = Task { @MainActor in
+            try await manager.ensureReady(dictation: true, polishing: false)
+        }
+        await modelPreparer.waitUntilPrepareStarted()
+        let memo = Task { @MainActor in
+            try await manager.ensureReady(dictation: true, polishing: false)
+        }
+        // The memo's ensure was queued ahead of this barrier, so it waits on
+        // the shared flight before the cancel lands.
+        await Task { @MainActor in }.value
 
-        XCTAssertEqual(supervisorFactory.supervisors[BackendCatalog.speechd.displayName]?.stopCallCount, 1)
-        XCTAssertEqual(supervisorFactory.supervisors[BackendCatalog.polishd.displayName]?.stopCallCount, 1)
-        XCTAssertEqual(manager.speechdStatus, .stopped)
-        XCTAssertEqual(manager.polishdStatus, .stopped)
+        memo.cancel()
+        do {
+            try await memo.value
+            XCTFail("expected the cancelled memo wait to throw")
+        } catch is CancellationError {
+        } catch {
+            XCTFail("expected CancellationError, got \(error)")
+        }
+        XCTAssertTrue(modelPreparer.terminatedBackendIDs.isEmpty)
+
+        modelPreparer.resumePrepare()
+        try await dictation.value
+        XCTAssertEqual(manager.speechdStatus, .ready)
+        XCTAssertEqual(
+            supervisorFactory.supervisors[BackendCatalog.speechd.displayName]?.startCallCount,
+            1
+        )
     }
 
-    func testStopPolishingStopsOnlyPolishd() async throws {
-        let supervisorFactory = FakeSupervisorFactory()
-        supervisorFactory.statesByName[BackendCatalog.speechd.displayName] = [.running]
-        supervisorFactory.statesByName[BackendCatalog.polishd.displayName] = [.running]
-        let manager = makeManager(supervisorFactory: supervisorFactory)
+    /// Each stop scope tears down exactly its own supervisors and leaves the
+    /// other backend running.
+    func testStopScopeStopsExactlyItsOwnSupervisors() async throws {
+        let cases: [
+            (label: String, stopsSpeechd: Bool, stopsPolishd: Bool,
+             stop: (BackendManager) async -> Void)
+        ] = [
+            ("stopAll stops both supervisors", true, true, { await $0.stopAll() }),
+            ("stopPolishing stops only polishd", false, true, { await $0.stopPolishing() }),
+            ("stopDictation stops only speechd", true, false, { await $0.stopDictation() }),
+        ]
 
-        try await manager.ensureReady(dictation: true, polishing: true)
-        XCTAssertEqual(manager.speechdStatus, .ready)
-        XCTAssertEqual(manager.polishdStatus, .ready)
+        for row in cases {
+            let supervisorFactory = FakeSupervisorFactory()
+            supervisorFactory.statesByName[BackendCatalog.speechd.displayName] = [.running]
+            supervisorFactory.statesByName[BackendCatalog.polishd.displayName] = [.running]
+            let manager = makeManager(supervisorFactory: supervisorFactory)
 
-        await manager.stopPolishing()
+            try await manager.ensureReady(dictation: true, polishing: true)
+            XCTAssertEqual(manager.speechdStatus, .ready, row.label)
+            XCTAssertEqual(manager.polishdStatus, .ready, row.label)
 
-        XCTAssertEqual(supervisorFactory.supervisors[BackendCatalog.polishd.displayName]?.stopCallCount, 1)
-        XCTAssertEqual(manager.polishdStatus, .stopped)
-        XCTAssertEqual(supervisorFactory.supervisors[BackendCatalog.speechd.displayName]?.stopCallCount, 0)
-        XCTAssertEqual(manager.speechdStatus, .ready)
+            await row.stop(manager)
+
+            XCTAssertEqual(
+                supervisorFactory.supervisors[BackendCatalog.speechd.displayName]?.stopCallCount,
+                row.stopsSpeechd ? 1 : 0,
+                row.label
+            )
+            XCTAssertEqual(
+                supervisorFactory.supervisors[BackendCatalog.polishd.displayName]?.stopCallCount,
+                row.stopsPolishd ? 1 : 0,
+                row.label
+            )
+            XCTAssertEqual(
+                manager.speechdStatus,
+                row.stopsSpeechd ? ManagedBackendStatus.stopped : ManagedBackendStatus.ready,
+                row.label
+            )
+            XCTAssertEqual(
+                manager.polishdStatus,
+                row.stopsPolishd ? ManagedBackendStatus.stopped : ManagedBackendStatus.ready,
+                row.label
+            )
+        }
     }
 
     func testModelChangeStopsSupervisorAndNextEnsureUsesNewModel() async throws {
@@ -377,7 +494,8 @@ final class BackendManagerTests: XCTestCase {
         let supervisorFactory = FakeSupervisorFactory()
         supervisorFactory.statesByName[BackendCatalog.polishd.displayName] = [.running]
         let settings = SettingsStore(
-            defaults: UserDefaults(suiteName: UUID().uuidString)!
+            defaults: UserDefaults(suiteName: UUID().uuidString)!,
+            secretStore: InMemorySecretStore()
         )
         let manager = makeManager(
             modelPreparer: modelPreparer,
@@ -414,6 +532,36 @@ final class BackendManagerTests: XCTestCase {
         XCTAssertNil(modelPreparer.prepareCalls.last?.revision)
     }
 
+    func testFakePreparerCancelledBeforeSuspendingThrowsInsteadOfParking() async {
+        // Hosted unit-suite hang (run 34163270101, 2026-09-07): the test above
+        // cancels the ensure the instant it sees the prepare start, and on a
+        // loaded 3-core VM that cancellation reached the fake BEFORE it parked
+        // its resume continuation. The cancellation handler then found nothing,
+        // the continuation parked afterwards was never resumed, and the async
+        // test wrapper waited forever. A task that is already cancelled when
+        // prepare suspends must observe the termination and throw, never park.
+        let preparer = FakeModelPreparer(suspendBackendIDs: [BackendCatalog.polishd.id])
+        let request = ModelPreparationRequest(
+            backendID: BackendCatalog.polishd.id,
+            displayName: "Polish engine",
+            repoID: "org/model",
+            revision: "0000000000000000000000000000000000000000",
+            includePatterns: ["config.json"]
+        )
+        let task = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            try await preparer.prepare(request) { _ in }
+        }
+        // Red before the fix: this await never returns (the suite is killed at
+        // the supervisor's 900 s bound with the runner parked in XCTWaiter).
+        let result = await task.result
+        guard case let .failure(error) = result else {
+            return XCTFail("prepare returned normally in a cancelled task")
+        }
+        XCTAssertTrue(error is CancellationError, "expected CancellationError, got \(error)")
+        XCTAssertEqual(preparer.terminatedBackendIDs, [BackendCatalog.polishd.id])
+    }
+
     func testStopPolishingAwaitsCancelledEnsureSoASubsequentEnsureStartsFresh() async throws {
         // Field regression (PR #99): stop cancelled the in-flight ensure but
         // returned without awaiting it, so a model switch mid-download started
@@ -445,24 +593,6 @@ final class BackendManagerTests: XCTestCase {
         _ = await firstEnsure.result
     }
 
-    func testStopDictationStopsOnlySpeechd() async throws {
-        let supervisorFactory = FakeSupervisorFactory()
-        supervisorFactory.statesByName[BackendCatalog.speechd.displayName] = [.running]
-        supervisorFactory.statesByName[BackendCatalog.polishd.displayName] = [.running]
-        let manager = makeManager(supervisorFactory: supervisorFactory)
-
-        try await manager.ensureReady(dictation: true, polishing: true)
-        XCTAssertEqual(manager.speechdStatus, .ready)
-        XCTAssertEqual(manager.polishdStatus, .ready)
-
-        await manager.stopDictation()
-
-        XCTAssertEqual(supervisorFactory.supervisors[BackendCatalog.speechd.displayName]?.stopCallCount, 1)
-        XCTAssertEqual(manager.speechdStatus, .stopped)
-        XCTAssertEqual(supervisorFactory.supervisors[BackendCatalog.polishd.displayName]?.stopCallCount, 0)
-        XCTAssertEqual(manager.polishdStatus, .ready)
-    }
-
     func testSupervisorStateMirrorMarksLaterFailureAndNextEnsureDoesNotShortCircuit() async throws {
         let supervisorFactory = FakeSupervisorFactory()
         supervisorFactory.statesByName[BackendCatalog.speechd.displayName] = [.running]
@@ -492,6 +622,75 @@ final class BackendManagerTests: XCTestCase {
         try await manager.ensureReady(dictation: true, polishing: false)
 
         XCTAssertEqual(supervisor.startCallCount, 2)
+        XCTAssertEqual(manager.speechdStatus, .ready)
+    }
+
+    /// #1305: the retry found the helper restarting, and it became ready while
+    /// the retry was checking the model. The supervisor reports only later
+    /// transitions and ignores `start()` while active, so a retry that waits
+    /// for the next state event waits until the helper changes state again.
+    func testHelperBecomingReadyWhileItsModelIsCheckedDoesNotHangTheRetry() async throws {
+        let modelPreparer = FakeModelPreparer()
+        let supervisorFactory = FakeSupervisorFactory()
+        supervisorFactory.statesByName[BackendCatalog.polishd.displayName] = [.running]
+        let manager = makeManager(
+            modelPreparer: modelPreparer,
+            supervisorFactory: supervisorFactory
+        )
+        try await manager.ensureReady(dictation: false, polishing: true)
+        let supervisor = try XCTUnwrap(supervisorFactory.supervisors[BackendCatalog.polishd.displayName])
+
+        supervisor.emit(.restarting(attempt: 1))
+        modelPreparer.holdNextPrepare()
+        let finished = BoundedWait()
+        let retry = Task { @MainActor in
+            defer { finished.resolve() }
+            try await manager.ensureReady(dictation: false, polishing: true)
+        }
+        await modelPreparer.waitUntilPrepareStarted(calls: 2)
+        supervisor.emit(.running)
+        modelPreparer.resumePrepare()
+
+        let completed = await finished.value(failAfter: 10)
+        if !completed {
+            // Unblocks the hung retry so the failure is reported, not a hang.
+            await manager.stopPolishing()
+        }
+        XCTAssertTrue(completed, "the retry kept waiting for a state event after the helper was ready")
+        try await retry.value
+        XCTAssertEqual(manager.polishdStatus, .ready)
+    }
+
+    /// The retry ran the port defense after the model check, by which time
+    /// the restarting helper had bound its port; the defense knows only the
+    /// retired voxmlx paths, so it called the app's own speechd foreign.
+    func testRetryDoesNotTreatItsOwnRestartingSpeechdAsAPortConflict() async throws {
+        let modelPreparer = FakeModelPreparer()
+        let supervisorFactory = FakeSupervisorFactory()
+        supervisorFactory.statesByName[BackendCatalog.speechd.displayName] = [.running]
+        let portDefense = SwitchableLegacyPortDefense()
+        let manager = makeManager(
+            modelPreparer: modelPreparer,
+            legacyPortDefense: portDefense,
+            supervisorFactory: supervisorFactory
+        )
+        try await manager.ensureReady(dictation: true, polishing: false)
+        let supervisor = try XCTUnwrap(supervisorFactory.supervisors[BackendCatalog.speechd.displayName])
+
+        supervisor.emit(.restarting(attempt: 1))
+        portDefense.outcome = .occupiedByOther(ListeningProcess(
+            pid: 4242,
+            executableURL: URL(fileURLWithPath: "/Applications/localvoxtral.app/Contents/Helpers/localvoxtral-speechd")
+        ))
+        modelPreparer.holdNextPrepare()
+        let retry = Task { @MainActor in
+            try await manager.ensureReady(dictation: true, polishing: false)
+        }
+        await modelPreparer.waitUntilPrepareStarted(calls: 2)
+        supervisor.emit(.running)
+        modelPreparer.resumePrepare()
+
+        try await retry.value
         XCTAssertEqual(manager.speechdStatus, .ready)
     }
 
@@ -579,22 +778,6 @@ final class BackendManagerTests: XCTestCase {
         )
     }
 
-    func testEnsureReadyWithoutPolishingPreparesOnlySpeechd() async throws {
-        let modelPreparer = FakeModelPreparer()
-        let supervisorFactory = FakeSupervisorFactory()
-        supervisorFactory.statesByName[BackendCatalog.speechd.displayName] = [.running]
-        supervisorFactory.statesByName[BackendCatalog.polishd.displayName] = [.running]
-        let manager = makeManager(
-            modelPreparer: modelPreparer,
-            supervisorFactory: supervisorFactory
-        )
-
-        try await manager.ensureReady(dictation: true, polishing: false)
-
-        XCTAssertEqual(modelPreparer.prepareCalls.map(\.backendID), [BackendCatalog.speechd.id])
-        XCTAssertEqual(supervisorFactory.createdConfigurations.map(\.name), [BackendCatalog.speechd.displayName])
-    }
-
     func testCancellingEnsureReadyDuringModelPreparationTerminatesAndDoesNotMarkReady() async throws {
         let modelPreparer = FakeModelPreparer(suspendBackendIDs: [BackendCatalog.speechd.id])
         let supervisorFactory = FakeSupervisorFactory()
@@ -624,6 +807,100 @@ final class BackendManagerTests: XCTestCase {
         XCTAssertEqual(manager.speechdStatus, .stopped)
     }
 
+    /// A cancelled caller that was the ensure's only waiter throws only after
+    /// the ensure has unwound, so it reads `.stopped`. The fake parks the
+    /// cancelled prepare; before the fix the caller threw while the status
+    /// still read `.preparingModel` (#1611).
+    func testCancelledLastWaiterThrowsOnlyAfterTheEnsureUnwinds() async throws {
+        let modelPreparer = FakeModelPreparer(suspendBackendIDs: [BackendCatalog.speechd.id])
+        modelPreparer.holdCancelledPrepare()
+        let manager = makeManager(
+            modelPreparer: modelPreparer,
+            supervisorFactory: FakeSupervisorFactory()
+        )
+
+        let ensure = Task { @MainActor () -> ManagedBackendStatus? in
+            do {
+                try await manager.ensureReady(dictation: true, polishing: false)
+                return nil
+            } catch {
+                XCTAssertTrue(error is CancellationError, "expected CancellationError, got \(error)")
+                return manager.speechdStatus
+            }
+        }
+        await modelPreparer.waitUntilPrepareStarted()
+
+        ensure.cancel()
+        await modelPreparer.waitUntilCancelledPrepareParked()
+        modelPreparer.releaseCancelledPrepare()
+
+        let statusWhenCallerThrew = await ensure.value
+        XCTAssertEqual(statusWhenCallerThrew, ManagedBackendStatus.stopped)
+    }
+
+    /// A cancel that lands just as the download finishes leaves `.stopped`,
+    /// not the `.preparingModel` the last progress reading set (#1614). The
+    /// fake's prepare returns normally once cancelled, as a download that
+    /// completed under the cancel does.
+    func testACancelAfterThePrepareFinishesLeavesStopped() async throws {
+        let modelPreparer = FakeModelPreparer(suspendBackendIDs: [BackendCatalog.speechd.id])
+        modelPreparer.completeSuspendedPrepareOnCancel()
+        let supervisorFactory = FakeSupervisorFactory()
+        let manager = makeManager(modelPreparer: modelPreparer, supervisorFactory: supervisorFactory)
+
+        let ensure = Task { @MainActor () -> ManagedBackendStatus? in
+            do {
+                try await manager.ensureReady(dictation: true, polishing: false)
+                return nil
+            } catch {
+                XCTAssertTrue(error is CancellationError, "expected CancellationError, got \(error)")
+                return manager.speechdStatus
+            }
+        }
+        await modelPreparer.waitUntilPrepareStarted()
+
+        ensure.cancel()
+
+        let statusWhenCallerThrew = await ensure.value
+        XCTAssertEqual(statusWhenCallerThrew, ManagedBackendStatus.stopped)
+        XCTAssertTrue(supervisorFactory.createdConfigurations.isEmpty, "no helper starts after the cancel")
+    }
+
+    /// A cancel while the helper starts stops it and leaves `.stopped`, not
+    /// the `.failed` an ended state stream used to report (#1614).
+    func testACancelDuringTheSupervisorStartStopsTheHelperAndLeavesStopped() async throws {
+        let supervisorFactory = FakeSupervisorFactory()
+        supervisorFactory.statesByName[BackendCatalog.speechd.displayName] = [.launching]
+        let manager = makeManager(supervisorFactory: supervisorFactory)
+        var updates = manager.statusUpdates.makeAsyncIterator()
+
+        let ensure = Task { @MainActor () -> ManagedBackendStatus? in
+            do {
+                try await manager.ensureReady(dictation: true, polishing: false)
+                return nil
+            } catch {
+                XCTAssertTrue(error is CancellationError, "expected CancellationError, got \(error)")
+                return manager.speechdStatus
+            }
+        }
+        // The ensure's own `.starting`, then the launching supervisor's.
+        var startingUpdates = 0
+        while startingUpdates < 2, let update = await updates.next() {
+            if update.spec.id == BackendCatalog.speechd.id, update.status == .starting {
+                startingUpdates += 1
+            }
+        }
+
+        ensure.cancel()
+
+        let statusWhenCallerThrew = await ensure.value
+        XCTAssertEqual(statusWhenCallerThrew, ManagedBackendStatus.stopped)
+        XCTAssertEqual(
+            supervisorFactory.supervisors[BackendCatalog.speechd.displayName]?.stopCallCount, 1,
+            "the half-started helper is stopped"
+        )
+    }
+
     func testStopPolishingCancelsInFlightEnsureBeforeSupervisorCanStart() async throws {
         let modelPreparer = FakeModelPreparer(suspendBackendIDs: [BackendCatalog.polishd.id])
         let supervisorFactory = FakeSupervisorFactory()
@@ -651,6 +928,248 @@ final class BackendManagerTests: XCTestCase {
         XCTAssertEqual(modelPreparer.terminatedBackendIDs, [BackendCatalog.polishd.id])
         XCTAssertTrue(supervisorFactory.createdConfigurations.isEmpty)
         XCTAssertEqual(manager.polishdStatus, .stopped)
+    }
+
+    // MARK: - Model download pause / resume / cancel
+
+    /// Pause keeps the download's last reading (the row keeps its bar) and, like
+    /// every other ensure teardown, does not return until the cancelled ensure
+    /// has finished unwinding — two live downloaders would corrupt the same HF
+    /// blob (PR #99).
+    func testPauseKeepsLastProgressAndAwaitsTheCancelledEnsure() async throws {
+        let inFlight = ModelDownloadProgress(downloadedBytes: 40, totalBytes: 100)
+        let modelPreparer = FakeModelPreparer(
+            scriptedProgress: [BackendCatalog.speechd.id: [inFlight]],
+            suspendBackendIDs: [BackendCatalog.speechd.id]
+        )
+        let supervisorFactory = FakeSupervisorFactory()
+        supervisorFactory.statesByName[BackendCatalog.speechd.displayName] = [.running]
+        let manager = makeManager(
+            modelPreparer: modelPreparer,
+            supervisorFactory: supervisorFactory
+        )
+        var speechdStatuses: [ManagedBackendStatus] = []
+        manager.debugStatusChangeSink = { spec, status in
+            guard spec.id == BackendCatalog.speechd.id else { return }
+            speechdStatuses.append(status)
+        }
+
+        let ensure = Task { @MainActor in
+            try await manager.ensureReady(dictation: true, polishing: false)
+        }
+        await modelPreparer.waitUntilPrepareStarted()
+        await waitUntilStatus(of: BackendCatalog.speechd, on: manager) {
+            $0 == .preparingModel(progress: inFlight)
+        }
+
+        await manager.pauseModelDownload(for: BackendCatalog.speechd)
+
+        // The preparer saw the cancellation, and the pause waited for it.
+        XCTAssertEqual(modelPreparer.terminatedBackendIDs, [BackendCatalog.speechd.id])
+        XCTAssertEqual(manager.speechdStatus, .pausedModelDownload(progress: inFlight))
+        // Paused, not stopped: nothing was launched and nothing flickered
+        // through `.stopped` on the way (the Settings row mirrors this stream).
+        XCTAssertTrue(supervisorFactory.createdConfigurations.isEmpty)
+        XCTAssertFalse(speechdStatuses.contains(.stopped))
+        XCTAssertEqual(speechdStatuses.last, .pausedModelDownload(progress: inFlight))
+        // Pause keeps the bytes: nothing is discarded.
+        XCTAssertTrue(modelPreparer.discardedRepoIDs.isEmpty)
+
+        do {
+            try await ensure.value
+            XCTFail("expected the paused ensure to cancel")
+        } catch is CancellationError {
+        } catch {
+            XCTFail("expected CancellationError, got \(error)")
+        }
+    }
+
+    /// Resume is an ordinary ensure: it runs a fresh prepare for the same
+    /// backend and carries it through to ready.
+    func testResumeAfterPauseRunsANewEnsureThroughToReady() async throws {
+        let inFlight = ModelDownloadProgress(downloadedBytes: 40, totalBytes: 100)
+        let modelPreparer = FakeModelPreparer(
+            scriptedProgress: [BackendCatalog.polishd.id: [inFlight]],
+            suspendBackendIDs: [BackendCatalog.polishd.id]
+        )
+        let supervisorFactory = FakeSupervisorFactory()
+        supervisorFactory.statesByName[BackendCatalog.polishd.displayName] = [.running]
+        let manager = makeManager(
+            modelPreparer: modelPreparer,
+            supervisorFactory: supervisorFactory
+        )
+
+        let ensure = Task { @MainActor in
+            try await manager.ensureReady(dictation: false, polishing: true)
+        }
+        await modelPreparer.waitUntilPrepareStarted()
+        await waitUntilStatus(of: BackendCatalog.polishd, on: manager) {
+            $0 == .preparingModel(progress: inFlight)
+        }
+        await manager.pauseModelDownload(for: BackendCatalog.polishd)
+        _ = try? await ensure.value
+        XCTAssertEqual(manager.polishdStatus, .pausedModelDownload(progress: inFlight))
+
+        // What the Resume button reaches, through the view model's warmup path.
+        try await manager.ensureReady(dictation: false, polishing: true)
+
+        XCTAssertEqual(manager.polishdStatus, .ready)
+        XCTAssertEqual(modelPreparer.prepareCalls.count, 2)
+        XCTAssertEqual(
+            supervisorFactory.supervisors[BackendCatalog.polishd.displayName]?.startCallCount,
+            1
+        )
+    }
+
+    /// A dictation that needs the paused engine resumes it on its own: the
+    /// paused status holds no lock on the ensure slot.
+    func testDictationEnsureResumesAPausedPolishingDownload() async throws {
+        let inFlight = ModelDownloadProgress(downloadedBytes: 1, totalBytes: 4)
+        let modelPreparer = FakeModelPreparer(
+            scriptedProgress: [BackendCatalog.polishd.id: [inFlight]],
+            suspendBackendIDs: [BackendCatalog.polishd.id]
+        )
+        let supervisorFactory = FakeSupervisorFactory()
+        supervisorFactory.statesByName[BackendCatalog.speechd.displayName] = [.running]
+        supervisorFactory.statesByName[BackendCatalog.polishd.displayName] = [.running]
+        let manager = makeManager(
+            modelPreparer: modelPreparer,
+            supervisorFactory: supervisorFactory
+        )
+
+        let ensure = Task { @MainActor in
+            try await manager.ensureReady(dictation: false, polishing: true)
+        }
+        await modelPreparer.waitUntilPrepareStarted()
+        await waitUntilStatus(of: BackendCatalog.polishd, on: manager) {
+            $0 == .preparingModel(progress: inFlight)
+        }
+        await manager.pauseModelDownload(for: BackendCatalog.polishd)
+        _ = try? await ensure.value
+
+        // The dictation-time backstop, exactly as a session start calls it.
+        try await manager.ensureReady(dictation: true, polishing: true)
+
+        XCTAssertEqual(manager.speechdStatus, .ready)
+        XCTAssertEqual(manager.polishdStatus, .ready)
+    }
+
+    /// Cancel drops the in-flight file's bytes and leaves the backend stopped.
+    func testCancelStopsTheBackendAndDiscardsThePartialDownload() async throws {
+        let modelPreparer = FakeModelPreparer(
+            suspendBackendIDs: [BackendCatalog.polishd.id]
+        )
+        let supervisorFactory = FakeSupervisorFactory()
+        supervisorFactory.statesByName[BackendCatalog.polishd.displayName] = [.running]
+        let manager = makeManager(
+            modelPreparer: modelPreparer,
+            supervisorFactory: supervisorFactory
+        )
+
+        let ensure = Task { @MainActor in
+            try await manager.ensureReady(dictation: false, polishing: true)
+        }
+        await modelPreparer.waitUntilPrepareStarted()
+
+        await manager.cancelModelDownload(for: BackendCatalog.polishd)
+
+        XCTAssertEqual(modelPreparer.terminatedBackendIDs, [BackendCatalog.polishd.id])
+        XCTAssertEqual(manager.polishdStatus, .stopped)
+        XCTAssertTrue(supervisorFactory.createdConfigurations.isEmpty)
+        XCTAssertEqual(
+            modelPreparer.discardedRepoIDs,
+            [SettingsStore.defaultLLMPolishingModel]
+        )
+        _ = try? await ensure.value
+    }
+
+    /// Cancel from the paused state has no ensure left to tear down, but must
+    /// still drop the retained bytes and land on `.stopped`.
+    func testCancelFromPausedDiscardsRetainedBytesAndReportsStopped() async throws {
+        let inFlight = ModelDownloadProgress(downloadedBytes: 40, totalBytes: 100)
+        let modelPreparer = FakeModelPreparer(
+            scriptedProgress: [BackendCatalog.polishd.id: [inFlight]],
+            suspendBackendIDs: [BackendCatalog.polishd.id]
+        )
+        let supervisorFactory = FakeSupervisorFactory()
+        supervisorFactory.statesByName[BackendCatalog.polishd.displayName] = [.running]
+        let manager = makeManager(
+            modelPreparer: modelPreparer,
+            supervisorFactory: supervisorFactory
+        )
+
+        let ensure = Task { @MainActor in
+            try await manager.ensureReady(dictation: false, polishing: true)
+        }
+        await modelPreparer.waitUntilPrepareStarted()
+        await waitUntilStatus(of: BackendCatalog.polishd, on: manager) {
+            $0 == .preparingModel(progress: inFlight)
+        }
+        await manager.pauseModelDownload(for: BackendCatalog.polishd)
+        _ = try? await ensure.value
+
+        await manager.cancelModelDownload(for: BackendCatalog.polishd)
+
+        XCTAssertEqual(manager.polishdStatus, .stopped)
+        XCTAssertEqual(
+            modelPreparer.discardedRepoIDs,
+            [SettingsStore.defaultLLMPolishingModel]
+        )
+    }
+
+    /// Pause on an engine that is not downloading must not tear down a running
+    /// backend — the buttons are hidden then, but the API is reachable.
+    func testPauseIsANoOpWhenNoDownloadIsInFlight() async throws {
+        let supervisorFactory = FakeSupervisorFactory()
+        supervisorFactory.statesByName[BackendCatalog.polishd.displayName] = [.running]
+        let manager = makeManager(supervisorFactory: supervisorFactory)
+        try await manager.ensureReady(dictation: false, polishing: true)
+
+        await manager.pauseModelDownload(for: BackendCatalog.polishd)
+
+        XCTAssertEqual(manager.polishdStatus, .ready)
+        XCTAssertEqual(
+            supervisorFactory.supervisors[BackendCatalog.polishd.displayName]?.stopCallCount,
+            0
+        )
+    }
+
+    /// A transport failure that is NOT a cancellation must still land on
+    /// `.failed` — the pause mapping in `HFModelDownloader` has to stay narrow
+    /// enough that a dead network is still reported as a failure.
+    func testNonCancellationPrepareFailureStillMarksTheBackendFailed() async {
+        let modelPreparer = FakeModelPreparer(
+            failures: [BackendCatalog.polishd.id: URLError(.timedOut)]
+        )
+        let manager = makeManager(
+            modelPreparer: modelPreparer,
+            supervisorFactory: FakeSupervisorFactory()
+        )
+
+        do {
+            try await manager.ensureReady(dictation: false, polishing: true)
+            XCTFail("expected ensureReady to throw")
+        } catch is CancellationError {
+            XCTFail("a timeout must not be reported as a cancellation")
+        } catch {}
+
+        guard case .failed = manager.polishdStatus else {
+            return XCTFail("expected .failed, got \(manager.polishdStatus)")
+        }
+        XCTAssertTrue(modelPreparer.discardedRepoIDs.isEmpty)
+    }
+
+    /// Returns once the backend reaches the wanted status, re-reading it after
+    /// each write: the preparer's scripted progress arrives through a
+    /// `@MainActor` hop.
+    private func waitUntilStatus(
+        of spec: ManagedBackendSpec,
+        on manager: BackendManager,
+        matching predicate: @escaping (ManagedBackendStatus) -> Bool,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        await awaitCondition(file: file, line: line) { predicate(manager.status(for: spec)) }
     }
 
     func testModelPreparationFailureMarksBackendFailedWithDetails() async {
@@ -747,23 +1266,6 @@ final class BackendManagerTests: XCTestCase {
         _ = try? await stuckDictation.value
     }
 
-    func testSecondEnsureReadyAddsPolishingAfterDictationOnlyRun() async throws {
-        let supervisorFactory = FakeSupervisorFactory()
-        supervisorFactory.statesByName[BackendCatalog.speechd.displayName] = [.running]
-        supervisorFactory.statesByName[BackendCatalog.polishd.displayName] = [.running]
-        let manager = makeManager(supervisorFactory: supervisorFactory)
-
-        // First dictation: polishing disabled at the time.
-        try await manager.ensureReady(dictation: true, polishing: false)
-        XCTAssertEqual(manager.speechdStatus, .ready)
-        XCTAssertEqual(manager.polishdStatus, .stopped)
-
-        // User enables polishing, dictates again: polishd must come up now.
-        try await manager.ensureReady(dictation: true, polishing: true)
-        XCTAssertEqual(manager.polishdStatus, .ready)
-        XCTAssertEqual(supervisorFactory.supervisors[BackendCatalog.polishd.displayName]?.startCallCount, 1)
-    }
-
     func testUnownedSpeechdPortOccupantSurfacesNormalConflictWithoutStarting() async {
         let supervisorFactory = FakeSupervisorFactory()
         let occupant = ListeningProcess(
@@ -792,8 +1294,9 @@ final class BackendManagerTests: XCTestCase {
         polishingModelProvider: @escaping BackendManager.PolishingModelProvider = {
             SettingsStore.defaultLLMPolishingModel
         },
-        speechdCacheLimitProvider: @escaping BackendManager.SpeechdCacheLimitProvider = { nil },
-        speechdStepCadenceProvider: @escaping BackendManager.SpeechdStepCadenceProvider = { nil },
+        speechModelProvider: @escaping BackendManager.SpeechModelProvider = {
+            SpeechModelCatalog.defaultOption
+        },
         supervisorFactory: FakeSupervisorFactory
     ) -> BackendManager {
         BackendManager(
@@ -801,8 +1304,7 @@ final class BackendManagerTests: XCTestCase {
             layout: BackendInstallLayout(root: URL(fileURLWithPath: "/tmp/localvoxtral-backend-manager-tests")),
             legacyPortDefense: legacyPortDefense,
             polishingModelProvider: polishingModelProvider,
-            speechdCacheLimitProvider: speechdCacheLimitProvider,
-            speechdStepCadenceProvider: speechdStepCadenceProvider,
+            speechModelProvider: speechModelProvider,
             supervisorFactory: { configuration in
                 supervisorFactory.makeSupervisor(configuration: configuration)
             }
@@ -813,12 +1315,40 @@ final class BackendManagerTests: XCTestCase {
 /// Mutable value for settings-provider closures in tests. The providers are
 /// `@MainActor` and the tests mutate on the main actor too, but a captured
 /// `var` still trips the sendable-capture warning — box it instead.
-private final class ProvidedValueBox: @unchecked Sendable {
-    var value: Int?
+@MainActor
+private final class PolishingModelBox {
+    var value: String
+
+    init(_ value: String) {
+        self.value = value
+    }
+}
+
+/// Same idea for the speech-model provider.
+@MainActor
+private final class SpeechModelBox {
+    var value: SpeechModelOption
+
+    init(_ value: SpeechModelOption) {
+        self.value = value
+    }
 }
 
 private struct FixedLegacyPortDefense: LegacyVoxmlxPortDefending {
     let outcome: LegacyVoxmlxPortOutcome
+
+    func clearLegacyOccupantIfNeeded(port: Int) async -> LegacyVoxmlxPortOutcome {
+        outcome
+    }
+}
+
+private final class SwitchableLegacyPortDefense: LegacyVoxmlxPortDefending, @unchecked Sendable {
+    private let state = Mutex<LegacyVoxmlxPortOutcome>(.available)
+
+    var outcome: LegacyVoxmlxPortOutcome {
+        get { state.withLock { $0 } }
+        set { state.withLock { $0 = newValue } }
+    }
 
     func clearLegacyOccupantIfNeeded(port: Int) async -> LegacyVoxmlxPortOutcome {
         outcome
@@ -833,9 +1363,19 @@ private final class FakeModelPreparer: ModelPreparing, @unchecked Sendable {
     private struct State {
         var prepareCalls: [ModelPreparationRequest] = []
         var terminatedBackendIDs: [String] = []
+        var discardedRepoIDs: [String] = []
         var alreadySuspendedBackendIDs: Set<String> = []
-        var prepareStartedContinuation: CheckedContinuation<Void, Never>?
+        var prepareStartedWaiter: (calls: Int, continuation: CheckedContinuation<Void, Never>)?
         var prepareResumeContinuation: CheckedContinuation<Void, Error>?
+        var holdNextPrepare = false
+        /// A `resumePrepare` that came before the held prepare parked.
+        var resumeRequested = false
+        var holdCancelledPrepare = false
+        var cancelledPrepareWaiter: CheckedContinuation<Void, Never>?
+        var cancelledPrepareParked = false
+        var cancelledPrepareRelease: CheckedContinuation<Void, Never>?
+        var cancelledPrepareReleaseRequested = false
+        var completeSuspendedPrepareOnCancel = false
     }
 
     private let scriptedProgress: [String: [ModelDownloadProgress]]
@@ -845,6 +1385,7 @@ private final class FakeModelPreparer: ModelPreparing, @unchecked Sendable {
 
     var prepareCalls: [ModelPreparationRequest] { state.withLock { $0.prepareCalls } }
     var terminatedBackendIDs: [String] { state.withLock { $0.terminatedBackendIDs } }
+    var discardedRepoIDs: [String] { state.withLock { $0.discardedRepoIDs } }
 
     init(
         scriptedProgress: [String: [ModelDownloadProgress]] = [:],
@@ -860,13 +1401,30 @@ private final class FakeModelPreparer: ModelPreparing, @unchecked Sendable {
         _ request: ModelPreparationRequest,
         progress: @MainActor @Sendable @escaping (ModelDownloadProgress) -> Void
     ) async throws {
-        let started: CheckedContinuation<Void, Never>? = state.withLock {
+        let (started, held): (CheckedContinuation<Void, Never>?, Bool) = state.withLock {
             $0.prepareCalls.append(request)
-            let continuation = $0.prepareStartedContinuation
-            $0.prepareStartedContinuation = nil
-            return continuation
+            let held = $0.holdNextPrepare
+            $0.holdNextPrepare = false
+            guard let waiter = $0.prepareStartedWaiter, $0.prepareCalls.count >= waiter.calls else {
+                return (nil, held)
+            }
+            $0.prepareStartedWaiter = nil
+            return (waiter.continuation, held)
         }
         started?.resume()
+        if held {
+            try await withCheckedThrowingContinuation { continuation in
+                let released: Bool = state.withLock {
+                    if $0.resumeRequested {
+                        $0.resumeRequested = false
+                        return true
+                    }
+                    $0.prepareResumeContinuation = continuation
+                    return false
+                }
+                if released { continuation.resume() }
+            }
+        }
 
         for event in scriptedProgress[request.backendID] ?? [] {
             await progress(event)
@@ -877,18 +1435,13 @@ private final class FakeModelPreparer: ModelPreparing, @unchecked Sendable {
         let shouldSuspend = suspendBackendIDs.contains(request.backendID)
             && state.withLock { $0.alreadySuspendedBackendIDs.insert(request.backendID).inserted }
         if shouldSuspend {
-            try await withTaskCancellationHandler {
-                try await withCheckedThrowingContinuation { continuation in
-                    state.withLock { $0.prepareResumeContinuation = continuation }
-                }
-            } onCancel: {
-                let continuation: CheckedContinuation<Void, Error>? = self.state.withLock {
-                    $0.terminatedBackendIDs.append(request.backendID)
-                    let continuation = $0.prepareResumeContinuation
-                    $0.prepareResumeContinuation = nil
-                    return continuation
-                }
-                continuation?.resume(throwing: CancellationError())
+            do {
+                try await suspendUntilCancelled(request)
+            } catch is CancellationError where state.withLock({ $0.holdCancelledPrepare }) {
+                await parkCancelledPrepare()
+                throw CancellationError()
+            } catch is CancellationError where state.withLock({ $0.completeSuspendedPrepareOnCancel }) {
+                return
             }
         }
 
@@ -897,11 +1450,102 @@ private final class FakeModelPreparer: ModelPreparing, @unchecked Sendable {
         }
     }
 
-    func waitUntilPrepareStarted() async {
+    private func suspendUntilCancelled(_ request: ModelPreparationRequest) async throws {
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                // Cancellation can land BEFORE this continuation exists:
+                // `stop` cancels the ensure the moment the test sees the
+                // prepare start, and on a loaded host the handler above
+                // then runs first, finds nothing to resume, and the
+                // continuation parked here would never be resumed (the
+                // hosted unit-suite hang, run 34163270101). Park it only
+                // when the task is still live; the check and the store
+                // share the lock with the handler, so no interleaving
+                // resumes twice or not at all.
+                let orphaned: CheckedContinuation<Void, Error>? = state.withLock {
+                    if Task.isCancelled { return continuation }
+                    $0.prepareResumeContinuation = continuation
+                    return nil
+                }
+                orphaned?.resume(throwing: CancellationError())
+            }
+        } onCancel: {
+            let continuation: CheckedContinuation<Void, Error>? = self.state.withLock {
+                $0.terminatedBackendIDs.append(request.backendID)
+                let continuation = $0.prepareResumeContinuation
+                $0.prepareResumeContinuation = nil
+                return continuation
+            }
+            continuation?.resume(throwing: CancellationError())
+        }
+    }
+
+    /// Parks a cancelled prepare before it throws, until
+    /// `releaseCancelledPrepare`, so a test can look at the manager while the
+    /// ensure task has not unwound yet.
+    private func parkCancelledPrepare() async {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            let (waiter, released): (CheckedContinuation<Void, Never>?, Bool) = state.withLock {
+                $0.cancelledPrepareParked = true
+                let waiter = $0.cancelledPrepareWaiter
+                $0.cancelledPrepareWaiter = nil
+                if $0.cancelledPrepareReleaseRequested { return (waiter, true) }
+                $0.cancelledPrepareRelease = continuation
+                return (waiter, false)
+            }
+            waiter?.resume()
+            if released { continuation.resume() }
+        }
+    }
+
+    /// Makes the suspended prepare return normally once cancelled: the
+    /// download finished as the cancel landed.
+    func completeSuspendedPrepareOnCancel() {
+        state.withLock { $0.completeSuspendedPrepareOnCancel = true }
+    }
+
+    /// Makes the suspended prepare park once cancelled instead of throwing.
+    func holdCancelledPrepare() {
+        state.withLock { $0.holdCancelledPrepare = true }
+    }
+
+    /// Returns once a cancelled prepare has parked.
+    func waitUntilCancelledPrepareParked() async {
+        await withCheckedContinuation { continuation in
+            let parked: Bool = state.withLock {
+                if $0.cancelledPrepareParked { return true }
+                $0.cancelledPrepareWaiter = continuation
+                return false
+            }
+            if parked { continuation.resume() }
+        }
+    }
+
+    func releaseCancelledPrepare() {
+        let continuation: CheckedContinuation<Void, Never>? = state.withLock {
+            let continuation = $0.cancelledPrepareRelease
+            $0.cancelledPrepareRelease = nil
+            if continuation == nil { $0.cancelledPrepareReleaseRequested = true }
+            return continuation
+        }
+        continuation?.resume()
+    }
+
+    func discardPartialDownloads(for request: ModelPreparationRequest) {
+        state.withLock { $0.discardedRepoIDs.append(request.repoID) }
+    }
+
+    /// Holds the next `prepare` until `resumePrepare`, whichever call it is.
+    func holdNextPrepare() {
+        state.withLock { $0.holdNextPrepare = true }
+    }
+
+    /// Returns once `calls` prepares have started.
+    func waitUntilPrepareStarted(calls: Int = 1) async {
         await withCheckedContinuation { continuation in
             let alreadyStarted: Bool = state.withLock {
-                if $0.prepareCalls.isEmpty {
-                    $0.prepareStartedContinuation = continuation
+                if $0.prepareCalls.count < calls {
+                    $0.prepareStartedWaiter = (calls, continuation)
                     return false
                 }
                 return true
@@ -916,6 +1560,7 @@ private final class FakeModelPreparer: ModelPreparing, @unchecked Sendable {
         let continuation: CheckedContinuation<Void, Error>? = state.withLock {
             let continuation = $0.prepareResumeContinuation
             $0.prepareResumeContinuation = nil
+            if continuation == nil { $0.resumeRequested = true }
             return continuation
         }
         continuation?.resume()
@@ -965,6 +1610,13 @@ private final class FakeBackendSupervisor: ManagedBackendSupervising {
 
     func start() async {
         startCallCount += 1
+        // As the real supervisor: an active one ignores a second start.
+        switch state {
+        case .launching, .waitingForReady, .running, .restarting:
+            return
+        case .idle, .stopped, .failed:
+            break
+        }
         for state in statesOnStart {
             emit(state)
         }

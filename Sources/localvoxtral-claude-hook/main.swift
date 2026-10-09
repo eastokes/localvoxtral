@@ -9,10 +9,11 @@ import Foundation
 // metadata, and fires one NDJSON line at the app's socket under a ~250ms
 // deadline.
 //
-// It exits 0 on every path and prints nothing, ever. Claude Code interprets a
-// hook's stdout and surfaces its failures; a dictation nicety must never be
-// able to interfere with the user's turn. All error handling above is
-// "return a reason no one reads".
+// It exits 0 on every path and prints nothing, ever (the `--statusline` mode
+// below is a different verb with the opposite contract: it EXISTS to render
+// one fixed line). Claude Code interprets a hook's stdout and surfaces its
+// failures; a dictation nicety must never be able to interfere with the user's
+// turn. All error handling above is "return a reason no one reads".
 //
 // The target is named for the binary because SwiftPM names the built
 // executable after the TARGET, not the product — same reason
@@ -25,18 +26,99 @@ func parsedEvent(from arguments: [String]) -> String? {
     return arguments[index + 1]
 }
 
-let event = parsedEvent(from: Array(CommandLine.arguments.dropFirst()))
-let stdin = ClaudeHookPublisher.readBoundedStdin()
-let outcome = ClaudeHookPublisher().run(stdin: stdin, fallbackEvent: event)
+let arguments = Array(CommandLine.arguments.dropFirst())
 
-// The ONLY thing this process ever prints: a complete, valid hook JSON object
-// carrying the marker's terminal sequence. `stdout` is nil on every other path,
-// and nil means print nothing — not an empty object, not a newline.
+// Status-line mode: `localvoxtral-claude-hook --statusline`, wired into Claude
+// Code's `statusLine` setting after the user confirms the Settings action.
+// Reads the status-line payload, asks the broker whether this session is live,
+// and prints ONE fixed indicator line. The strings are compile-time constants
+// chosen by outcome — nothing read off the socket is ever echoed — and a
+// payload we cannot attribute prints nothing rather than guessing.
+if arguments.contains("--statusline") {
+    let payload = ClaudeHookPublisher.readBoundedStdin()
+    let outcome = ClaudeHookPublisher().runStatusQuery(stdin: payload)
+    let useColor = ClaudeHookPublisher.statusLineUsesColor(
+        environment: ProcessInfo.processInfo.environment
+    )
+    if let text = ClaudeHookPublisher.statusLineText(for: outcome, useColor: useColor) {
+        ClaudeHookPublisher.writeStdout(Data((text + "\n").utf8))
+    }
+    exit(0)
+}
+
+// Mod channel (#1408): `--attach --session <id>` runs for the session's life
+// under the localvoxtral-mod plugin and prints the app's messages to it, one
+// JSON line each; `--mod-reply` sends the mod's answer back. Neither runs as
+// a Claude Code hook, so neither prints anywhere Claude reads.
+if arguments.contains("--attach") {
+    guard let index = arguments.firstIndex(of: "--session"), index + 1 < arguments.count,
+          let socketPath = ClaudeHookSocketPath.resolve()
+    else { exit(0) }
+    let parent = getppid()
+    ClaudeModAttachClient(
+        socketPath: socketPath,
+        sessionID: arguments[index + 1],
+        claudePID: parent,
+        output: { ClaudeHookPublisher.writeStdout($0) },
+        isParentAlive: { getppid() == parent },
+        sleep: { Thread.sleep(forTimeInterval: $0) }
+    ).run()
+    exit(0)
+}
+if arguments.contains("--mod-reply") {
+    if let socketPath = ClaudeHookSocketPath.resolve() {
+        ClaudeModAttachClient.sendReply(
+            ClaudeHookPublisher.readBoundedStdin(
+                limits: ClaudeHookLimits(maxLineBytes: ClaudeModChannelWire.maxLineBytes)
+            ),
+            to: socketPath
+        )
+    }
+    exit(0)
+}
+
+// Vibe mode: `localvoxtral-claude-hook --agent vibe`, run by the shim that
+// `~/.vibe/hooks.toml` names. Vibe's payload carries its own event name, so
+// there is no `--event`. Same contract as below: exit 0, print nothing — Vibe
+// reports a hook's non-JSON stdout as a hook failure on the user's turn.
+if let index = arguments.firstIndex(of: "--agent"), index + 1 < arguments.count,
+   arguments[index + 1] == "vibe" {
+    // A longer deadline than Claude Code's 0.25 s: that one was sized for a
+    // few kilobytes, and this pipe can carry megabytes. Still far inside the
+    // five seconds `hooks.toml` gives the hook.
+    let payload = ClaudeHookPublisher.readBoundedStdin(
+        limits: ClaudeHookLimits(maxLineBytes: VibeHookInputParser.maxPayloadBytes),
+        timeout: ClaudeHookPublisher.vibeStdinReadTimeout,
+        drainsExcess: true
+    )
+    ClaudeHookPublisher().runVibe(stdin: payload)
+    exit(0)
+}
+
+// Codex mode: `localvoxtral-claude-hook --agent codex`, run by the shim the
+// Codex plugin's `hooks/hooks.json` names. Same contract: exit 0, print
+// nothing — Codex reads a hook's stdout as a decision.
+if let index = arguments.firstIndex(of: "--agent"), index + 1 < arguments.count,
+   arguments[index + 1] == "codex" {
+    let payload = ClaudeHookPublisher.readBoundedStdin(
+        limits: ClaudeHookLimits(maxLineBytes: CodexHookInputParser.maxPayloadBytes),
+        timeout: ClaudeHookPublisher.codexStdinReadTimeout,
+        drainsExcess: true
+    )
+    ClaudeHookPublisher().runCodex(stdin: payload)
+    exit(0)
+}
+
+let event = parsedEvent(from: arguments)
+let stdin = ClaudeHookPublisher.readBoundedStdin()
+ClaudeHookPublisher().run(stdin: stdin, fallbackEvent: event)
+
+// A hook run prints NOTHING — not an object, not a newline, on any path. The
+// app learns about the session over the socket; there is nothing left for this
+// process to say, and no reply shape that could give it something.
 //
 // This matters most for UserPromptSubmit, whose non-JSON stdout Claude Code
-// appends to the user's prompt. Half-written or malformed output would land in
-// their context as garbage, so it is emitted in one write or not at all.
-if let output = outcome.stdout {
-    ClaudeHookPublisher.writeStdout(output)
-}
+// appends to the user's prompt: an empty stdout is the one output that cannot
+// land in the user's context as garbage, and it is what every install has
+// produced by default since the title fallback shipped switched off.
 exit(0)
